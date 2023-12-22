@@ -294,8 +294,6 @@ static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, s
         remainder = length % 32;
 
         if(blocks > 0) {
-            uint64_t start_time = timer_ns_gettime64();
-
             __asm__ __volatile__ (
                 "fschg\n\t"
                 "clrs\n" 
@@ -322,10 +320,6 @@ static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, s
                 : [r0] "z" (remainder) /* inputs */
                 : "t", "memory" /* clobbers */
             );
-
-            uint64_t end_time = timer_ns_gettime64();
-
-            printf("Time: %llu\n", end_time-start_time);
         }
 
         while(remainder--) {
