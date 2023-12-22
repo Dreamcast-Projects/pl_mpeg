@@ -11,6 +11,7 @@ struct mpeg_player_t {
     int height;
     int snd_mod_start;
     int snd_mod_size;
+    int sample_rate;
     snd_stream_hnd_t snd_hnd;
     float audio_time;
     pvr_poly_hdr_t hdr;
@@ -225,7 +226,7 @@ static int setup_graphics(mpeg_player_t *player) {
     /* Divide texture width and texture height by 16 and subtract 1.
        The actual values to set are 1, 3, 7, 15, 31, 63. */
     PVR_SET(PVR_YUV_CFG, (((MPEG_TEXTURE_HEIGHT / 16) - 1) << 8) |
-                             ((MPEG_TEXTURE_WIDTH / 16) - 1));
+                          ((MPEG_TEXTURE_WIDTH / 16) - 1));
     PVR_GET(PVR_YUV_CFG);
 
     pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY,
@@ -339,6 +340,7 @@ static int setup_audio(mpeg_player_t *player) {
     player->snd_mod_size = 0;
     player->snd_mod_start = 0;
     player->audio_time = 0.0f;
+    player->sample_rate = plm_get_samplerate(player->decoder);
 
     player->snd_hnd = snd_stream_alloc(sound_callback, SOUND_BUFFER);
     if(player->snd_hnd == SND_STREAM_INVALID) {
@@ -355,7 +357,6 @@ int mpeg_play(mpeg_player_t *player, uint32_t buttons) {
     int cancel = 0;
     plm_frame_t *frame;
     int decoded;
-    int samplerate;
 
     if (!player || !player->decoder)
         return -1;
@@ -365,8 +366,7 @@ int mpeg_play(mpeg_player_t *player, uint32_t buttons) {
     decoded = 1;
 
     /* Init sound stream. */
-    samplerate = plm_get_samplerate(player->decoder);
-    snd_stream_start(player->snd_hnd, samplerate, 0);
+    snd_stream_start(player->snd_hnd, player->sample_rate, 0);
 
     while(!cancel) {
         /* Check cancel buttons. */
