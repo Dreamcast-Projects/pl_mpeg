@@ -3,119 +3,176 @@
 #include "pl_mpeg.h"
 #include "mpeg.h"
 
-static plm_t *plm;
+struct mpeg_player_t {
+    plm_t *decoder;
+    uint32_t *snd_buf;
+    pvr_ptr_t texture;
+    int width;
+    int height;
+    int snd_mod_start;
+    int snd_mod_size;
+    snd_stream_hnd_t snd_hnd;
+    float audio_time;
+    float audio_interval;
+    pvr_poly_hdr_t hdr;
+    pvr_vertex_t vert[4];
+};
 
-/* Textures */
-static pvr_poly_hdr_t hdr;
-static pvr_vertex_t vert[4];
-static pvr_ptr_t texture;
-
-static int width, height;
 /* Output texture width and height initial values
    You can choose from 32, 64, 128, 256, 512, 1024 */
 #define MPEG_TEXTURE_WIDTH 512
 #define MPEG_TEXTURE_HEIGHT 256
 
-float audio_time;
-float audio_interval;
-snd_stream_hnd_t snd_hnd;
+#define SOUND_BUFFER (64 * 1024)
 
-static int snd_mod_start = 0;
-static int snd_mod_size = 0;
+static int setup_graphics(mpeg_player_t *player);
+static int setup_audio(mpeg_player_t *player);
+static void fast_memcpy(void *dest, const void *src, size_t length);
 
-#define SOUND_BUFFER (16 * 1024)
-//65536
-uint32_t *snd_buf;
+mpeg_player_t *mpeg_player_create(const char *filename) {
+    mpeg_player_t *player = NULL;
+
+    if(!filename) {
+        fprintf(stderr, "Filename is NULL\n");
+        return NULL;
+    }
+
+    player = malloc(sizeof(mpeg_player_t));
+    if(!player) {
+        fprintf(stderr, "Out of memory for player\n");
+        return NULL;
+    }
+
+    player->decoder = plm_create_with_filename(filename);
+    if(!player->decoder) {
+        fprintf(stderr, "Out of memory for player->decoder\n");
+        mpeg_player_destroy(player);
+        return NULL;
+    }
+
+    player->snd_buf = memalign(32, SOUND_BUFFER);
+    if(!player->snd_buf) {
+        fprintf(stderr, "Out of memory for player->snd_buf\n");
+        mpeg_player_destroy(player);
+        return NULL;
+    }
+
+    if(setup_graphics(player) < 0) {
+        fprintf(stderr, "Setting up graphics failed\n");
+        mpeg_player_destroy(player);
+        return NULL;
+    }
+
+    if(setup_audio(player) < 0) {
+        fprintf(stderr, "Setting up audio failed\n");
+        mpeg_player_destroy(player);
+        return NULL;
+    }
+
+    return player;
+}
+
+mpeg_player_t *mpeg_player_create_memory(uint8_t *memory, const size_t length) {
+    mpeg_player_t *player = NULL;
+
+    if(!memory) {
+        fprintf(stderr, "memory is null");
+        return NULL;
+    }
+
+    player = malloc(sizeof(mpeg_player_t));
+    if(!player) {
+        fprintf(stderr, "Out of memory for player\n");
+        return NULL;
+    }
+
+    player->decoder = plm_create_with_memory(memory, length, 1);
+    if(!player->decoder) {
+        fprintf(stderr, "Out of memory for player->decoder\n");
+        mpeg_player_destroy(player);
+        return NULL;
+    }
+
+    player->snd_buf = memalign(32, SOUND_BUFFER);
+    if(!player->snd_buf) {
+        fprintf(stderr, "Out of memory for player->snd_buf\n");
+        mpeg_player_destroy(player);
+        return NULL;
+    }
+
+    if(setup_graphics(player) < 0) {
+        fprintf(stderr, "Setting up graphics failed\n");
+        mpeg_player_destroy(player);
+        return NULL;
+    }
+
+    if(setup_audio(player) < 0) {
+        fprintf(stderr, "Setting up audio failed\n");
+        mpeg_player_destroy(player);
+        return NULL;
+    }
+
+    return player;
+}
+
+void mpeg_player_destroy(mpeg_player_t *player) {
+    if(!player) {
+        printf("Player is NULL\n");
+        return;
+    }
+
+    if(player->decoder) {
+        printf("Freed decoder\n");
+        plm_destroy(player->decoder);
+    }
+
+    if(player->texture) {
+        printf("Freed texture memory\n");
+        pvr_mem_free(player->texture);
+    }
+
+    if(player->snd_buf) {
+        printf("Freed sound buffer\n");
+        free(player->snd_buf);
+    }
+
+    if(player->snd_hnd != SND_STREAM_INVALID) {
+        printf("Freed stream handle\n");
+        snd_stream_destroy(player->snd_hnd);
+    }
+
+    free(player);
+    player = NULL;
+    printf("Freed player\n");
+}
 
 static void *sound_callback(snd_stream_hnd_t hnd, int size, int *size_out) {
     plm_samples_t *sample;
-    uint32_t *dest = snd_buf;
-    uint32_t *src;
-    int i, out = 0;
+    mpeg_player_t *player = snd_stream_get_userdata(hnd);
+    uint32_t *dest = player->snd_buf;
 
-    src = snd_buf + snd_mod_start / 4;
-    for(i = 0; i < snd_mod_size / 4; i++)
-        *dest++ = *src++;
-    out += snd_mod_size;
+    if(player->snd_mod_size > 0) {
+        fast_memcpy(dest, player->snd_buf + player->snd_mod_start / 4, player->snd_mod_size);
+    }
+
+    int out = player->snd_mod_size;
 
     while(size > out) {
-        sample = plm_decode_audio(plm);
-        if(sample == NULL) {
-            audio_time += audio_interval;
+        sample = plm_decode_audio(player->decoder);
+        if (!sample) {
+            player->audio_time += player->audio_interval;
             break;
         }
-        audio_time = sample->time;
-
-        src = (uint32_t *)sample->pcm;
-        for(int i = 0; i < 1152 / 2; i++)
-            *dest++ = *src++;
+        player->audio_time = sample->time;
+        fast_memcpy(dest + out / 4, sample->pcm, 1152 * 2);
         out += 1152 * 2;
     }
 
-    snd_mod_start = size;
-    snd_mod_size = out - size;
+    player->snd_mod_start = size;
+    player->snd_mod_size = out - size;
     *size_out = size;
 
-    return (void *)snd_buf;
-}
-
-static int setup_graphics(void) {
-    pvr_poly_cxt_t cxt;
-    float u, v;
-
-    if(!(texture = pvr_mem_malloc(MPEG_TEXTURE_WIDTH * MPEG_TEXTURE_HEIGHT * 2))) {
-        fprintf(stderr, "Failed to allocate PVR memory!\n");
-        return -1;
-    }
-    
-    /* Set SQ to YUV converter. */
-    PVR_SET(PVR_YUV_ADDR, (((uint32_t)texture) & 0xffffff));
-    /* Divide texture width and texture height by 16 and subtract 1.
-       The actual values to set are 1, 3, 7, 15, 31, 63. */
-    PVR_SET(PVR_YUV_CFG, (((MPEG_TEXTURE_HEIGHT / 16) - 1) << 8) | 
-                         ((MPEG_TEXTURE_WIDTH / 16) - 1));
-    PVR_GET(PVR_YUV_CFG);
-
-    pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY, 
-                    PVR_TXRFMT_YUV422 | PVR_TXRFMT_NONTWIDDLED, 
-                    MPEG_TEXTURE_WIDTH, MPEG_TEXTURE_HEIGHT, 
-                    texture, 
-                    PVR_FILTER_BILINEAR);
-    pvr_poly_compile(&hdr, &cxt);
-
-    hdr.mode3 |= PVR_TXRFMT_STRIDE;
-
-    u = (float)width / MPEG_TEXTURE_WIDTH;
-    v = (float)height / MPEG_TEXTURE_HEIGHT;
-
-    vert[0].z     = vert[1].z     = vert[2].z     = vert[3].z     = 1.0f; 
-    vert[0].argb  = vert[1].argb  = vert[2].argb  = vert[3].argb  = 
-        PVR_PACK_COLOR(1.0f, 1.0f, 1.0f, 1.0f);    
-    vert[0].oargb = vert[1].oargb = vert[2].oargb = vert[3].oargb = 0;  
-    vert[0].flags = vert[1].flags = vert[2].flags = PVR_CMD_VERTEX;         
-    vert[3].flags = PVR_CMD_VERTEX_EOL;
-
-    vert[0].x = 0.0f;
-    vert[0].y = 0.0f;
-    vert[0].u = 0.0f;
-    vert[0].v = 0.0f;
-
-    vert[1].x = 640.0f;
-    vert[1].y = 0.0f;
-    vert[1].u = u;
-    vert[1].v = 0.0f;
-
-    vert[2].x = 0.0f;
-    vert[2].y = 480.0f;
-    vert[2].u = 0.0f;
-    vert[2].v = v;
-
-    vert[3].x = 640.0f;
-    vert[3].y = 480.0f;
-    vert[3].u = u;
-    vert[3].v = v;
-
-    return 0;
+    return player->snd_buf;
 }
 
 static void upload_frame(plm_frame_t *frame) {
@@ -131,7 +188,7 @@ static void upload_frame(plm_frame_t *frame) {
     w = frame->width >> 4;
     h = frame->height >> 4;
 
-    for(y = 0; y < h; y++){
+    for(y = 0; y < h; y++) {
         for(x = 0; x < w; x++, src += 96) {
             sq_cpy((void *)PVR_TA_YUV_CONV, (void *)src, 384);
         }
@@ -147,84 +204,207 @@ static void upload_frame(plm_frame_t *frame) {
     }
 }
 
-static void draw_frame(void) {
-    pvr_prim(&hdr, sizeof(pvr_poly_hdr_t));
-    pvr_prim(&vert[0], sizeof(pvr_vertex_t));
-    pvr_prim(&vert[1], sizeof(pvr_vertex_t));
-    pvr_prim(&vert[2], sizeof(pvr_vertex_t));
-    pvr_prim(&vert[3], sizeof(pvr_vertex_t));
+static void draw_frame(mpeg_player_t *player) {
+    pvr_prim(&player->hdr, sizeof(pvr_poly_hdr_t));
+    pvr_prim(&player->vert[0], sizeof(pvr_vertex_t));
+    pvr_prim(&player->vert[1], sizeof(pvr_vertex_t));
+    pvr_prim(&player->vert[2], sizeof(pvr_vertex_t));
+    pvr_prim(&player->vert[3], sizeof(pvr_vertex_t));
 }
 
-int mpeg_play(const char *filename, uint32_t buttons) {
+static int setup_graphics(mpeg_player_t *player) {
+    pvr_poly_cxt_t cxt;
+    float u, v;
+    int color = PVR_PACK_COLOR(1.0f, 1.0f, 1.0f, 1.0f);
+
+    if(!(player->texture = pvr_mem_malloc(MPEG_TEXTURE_WIDTH * MPEG_TEXTURE_HEIGHT * 2))) {
+        fprintf(stderr, "Failed to allocate PVR memory!\n");
+        return -1;
+    }
+
+    /* Set SQ to YUV converter. */
+    PVR_SET(PVR_YUV_ADDR, (((uint32_t)player->texture) & 0xffffff));
+    /* Divide texture width and texture height by 16 and subtract 1.
+       The actual values to set are 1, 3, 7, 15, 31, 63. */
+    PVR_SET(PVR_YUV_CFG, (((MPEG_TEXTURE_HEIGHT / 16) - 1) << 8) |
+                             ((MPEG_TEXTURE_WIDTH / 16) - 1));
+    PVR_GET(PVR_YUV_CFG);
+
+    pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY,
+                     PVR_TXRFMT_YUV422 | PVR_TXRFMT_NONTWIDDLED,
+                     MPEG_TEXTURE_WIDTH, MPEG_TEXTURE_HEIGHT,
+                     player->texture,
+                     PVR_FILTER_BILINEAR);
+    pvr_poly_compile(&player->hdr, &cxt);
+
+    player->hdr.mode3 |= PVR_TXRFMT_STRIDE;
+    player->width = plm_get_width(player->decoder);
+    player->height = plm_get_height(player->decoder);
+
+    u = (float)player->width / MPEG_TEXTURE_WIDTH;
+    v = (float)player->height / MPEG_TEXTURE_HEIGHT;
+
+    player->vert[0].x = 0.0f;
+    player->vert[0].y = 0.0f;
+    player->vert[0].z = 1.0f;
+    player->vert[0].u = 0.0f;
+    player->vert[0].v = 0.0f;
+    player->vert[0].argb = color;
+    player->vert[0].oargb = 0;
+    player->vert[0].flags = PVR_CMD_VERTEX;
+
+    player->vert[1].x = 640.0f;
+    player->vert[1].y = 0.0f;
+    player->vert[1].z = 1.0f;
+    player->vert[1].u = u;
+    player->vert[1].v = 0.0f;
+    player->vert[1].argb = color;
+    player->vert[1].oargb = 0;
+    player->vert[1].flags = PVR_CMD_VERTEX;
+
+    player->vert[2].x = 0.0f;
+    player->vert[2].y = 480.0f;
+    player->vert[2].z = 1.0f;
+    player->vert[2].u = 0.0f;
+    player->vert[2].v = v;
+    player->vert[2].argb = color;
+    player->vert[2].oargb = 0;
+    player->vert[2].flags = PVR_CMD_VERTEX;
+
+    player->vert[3].x = 640.0f;
+    player->vert[3].y = 480.0f;
+    player->vert[3].z = 1.0f;
+    player->vert[3].u = u;
+    player->vert[3].v = v;
+    player->vert[3].argb = color;
+    player->vert[3].oargb = 0;
+    player->vert[3].flags = PVR_CMD_VERTEX_EOL;
+
+    return 0;
+}
+
+static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, size_t length) {
+    int blocks;
+    int remainder;
+    char *char_dest = (char *)dest;
+    const char *char_src = (const char *)src;
+
+    _Complex float ds;
+    _Complex float ds2;
+    _Complex float ds3;
+    _Complex float ds4;
+
+    if (((uintptr_t)dest | (uintptr_t)src) & 7) {
+        memcpy(dest, src, length);
+    }
+    else { /* Fast Path */
+        blocks = length / 32;
+        remainder = length % 32;
+
+        if(blocks > 0) {
+            __asm__ __volatile__ (
+                "fschg\n\t"
+                "clrs\n" 
+                ".align 2\n"
+                "1:\n\t"
+                /* *dest++ = *src++ */
+                "fmov.d @%[in]+, %[scratch]\n\t"
+                "fmov.d @%[in]+, %[scratch2]\n\t"
+                "fmov.d @%[in]+, %[scratch3]\n\t"
+                "fmov.d @%[in]+, %[scratch4]\n\t"
+                "movca.l %[r0], @%[out]\n\t"
+                "add #32, %[out]\n\t"
+                "pref @%[in]\n\t"  /* Prefetch 32 bytes for next loop */
+                "dt %[blocks]\n\t"   /* while(blocks--) */
+                "fmov.d %[scratch4], @-%[out]\n\t"
+                "fmov.d %[scratch3], @-%[out]\n\t"
+                "fmov.d %[scratch2], @-%[out]\n\t"
+                "fmov.d %[scratch], @-%[out]\n\t"
+                "bf.s 1b\n\t"
+                "add #32, %[out]\n\t"
+                "fschg\n"
+                : [in] "+&r" ((uintptr_t)src), [out] "+&r" ((uintptr_t)dest), 
+                [blocks] "+&r" (blocks), [scratch] "=&d" (ds), [scratch2] "=&d" (ds2), 
+                [scratch3] "=&d" (ds3), [scratch4] "=&d" (ds4) /* outputs */
+                : [r0] "z" (remainder) /* inputs */
+                : "t", "memory" /* clobbers */
+            );
+        }
+
+        while(remainder--) {
+            *char_dest++ = *char_src++;
+        }
+    }
+}
+
+static int setup_audio(mpeg_player_t *player) {
+    player->snd_mod_size = 0;
+    player->snd_mod_start = 0;
+    player->audio_time = 0.0f;
+    player->audio_interval = player->audio_time;
+
+    player->snd_hnd = snd_stream_alloc(sound_callback, SOUND_BUFFER);
+    if(player->snd_hnd == SND_STREAM_INVALID) {
+        return -1;
+    }
+
+    snd_stream_volume(player->snd_hnd, 0xff);
+    snd_stream_set_userdata(player->snd_hnd, player);
+
+    return 0;
+}
+
+int mpeg_play(mpeg_player_t *player, uint32_t buttons) {
     int cancel = 0;
     plm_frame_t *frame;
     int decoded;
     int samplerate;
 
-    plm = plm_create_with_filename(filename);
-    if(!plm)
-        return -1;
-
-    snd_buf = memalign(32, SOUND_BUFFER);
-    if(snd_buf) {
-        printf("Shit happens\n");
-    }
-    
-    width = plm_get_width(plm);
-    height = plm_get_height(plm);
-
-    if(setup_graphics() < 0)
+    if (!player || !player->decoder)
         return -1;
 
     /* First frame */
-    frame = plm_decode_video(plm);
+    frame = plm_decode_video(player->decoder);
     decoded = 1;
 
     /* Init sound stream. */
-    samplerate = plm_get_samplerate(plm);
-    snd_mod_size = 0;
-    snd_mod_start = 0;
-    audio_time = 0.0f;
-    snd_hnd = snd_stream_alloc(sound_callback, 0x10000);
-    snd_stream_volume(snd_hnd, 0xff);
-    snd_stream_start(snd_hnd, samplerate, 0);
-    audio_interval = audio_time;
+    samplerate = plm_get_samplerate(player->decoder);
+    snd_stream_start(player->snd_hnd, samplerate, 0);
 
     while(!cancel) {
         /* Check cancel buttons. */
         MAPLE_FOREACH_BEGIN(MAPLE_FUNC_CONTROLLER, cont_state_t, st)
-        if(buttons && ((st->buttons & buttons) == buttons))
+        if (buttons && ((st->buttons & buttons) == buttons))
             cancel = 1; /* Push cancel buttons */
-        if(st->buttons == 0x60e)
+        if (st->buttons == 0x60e)
             cancel = 2; /* ABXY + START (Software reset) */
         MAPLE_FOREACH_END()
 
         /* Decode */
-        if((audio_time - audio_interval) >= frame->time) {
-            frame = plm_decode_video(plm);
+        if((player->audio_time - player->audio_interval) >= frame->time) {
+            frame = plm_decode_video(player->decoder);
             if(!frame)
                 break;
             decoded = 1;
         }
-        snd_stream_poll(snd_hnd);
+        snd_stream_poll(player->snd_hnd);
 
         /* Render */
         pvr_wait_ready();
         pvr_scene_begin();
+
         if(decoded) {
             upload_frame(frame);
             decoded = 0;
         }
+
         pvr_list_begin(PVR_LIST_OP_POLY);
-        draw_frame();
+
+        draw_frame(player);
+
         pvr_list_finish();
         pvr_scene_finish();
     }
-
-    free(snd_buf);
-    plm_destroy(plm);
-    pvr_mem_free(texture);
-    snd_stream_destroy(snd_hnd);
 
     return cancel;
 }
