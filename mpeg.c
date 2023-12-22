@@ -139,12 +139,11 @@ static void *sound_callback(snd_stream_hnd_t hnd, int size, int *size_out) {
     plm_samples_t *sample;
     mpeg_player_t *player = snd_stream_get_userdata(hnd);
     uint32_t *dest = player->snd_buf;
-
-    if(player->snd_mod_size > 0) {
-        fast_memcpy(dest, player->snd_buf + player->snd_mod_start / 4, player->snd_mod_size);
-    }
-
     int out = player->snd_mod_size;
+
+    if(out > 0) {
+        fast_memcpy(dest, player->snd_buf + player->snd_mod_start / 4, out);
+    }
 
     while(size > out) {
         sample = plm_decode_audio(player->decoder);

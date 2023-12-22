@@ -203,7 +203,7 @@ typedef void(*plm_video_decode_callback)
 typedef struct {
 	double time;
 	unsigned int count;
-	short pcm[PLM_AUDIO_SAMPLES_PER_FRAME];
+	short pcm[PLM_AUDIO_SAMPLES_PER_FRAME] __attribute__((aligned(32)));
 } plm_samples_t;
 
 
