@@ -33,7 +33,7 @@ mpeg_player_t *mpeg_player_create(const char *filename) {
     mpeg_player_t *player = NULL;
 
     if(!filename) {
-        fprintf(stderr, "Filename is NULL\n");
+        fprintf(stderr, "filename is NULL\n");
         return NULL;
     }
 
@@ -76,7 +76,7 @@ mpeg_player_t *mpeg_player_create_memory(uint8_t *memory, const size_t length) {
     mpeg_player_t *player = NULL;
 
     if(!memory) {
-        fprintf(stderr, "memory is null");
+        fprintf(stderr, "memory is null\n");
         return NULL;
     }
 
@@ -116,34 +116,23 @@ mpeg_player_t *mpeg_player_create_memory(uint8_t *memory, const size_t length) {
 }
 
 void mpeg_player_destroy(mpeg_player_t *player) {
-    if(!player) {
-        printf("Player is NULL\n");
+    if(!player)
         return;
-    }
 
-    if(player->decoder) {
-        printf("Freed decoder\n");
+    if(player->decoder)
         plm_destroy(player->decoder);
-    }
 
-    if(player->texture) {
-        printf("Freed texture memory\n");
+    if(player->texture)
         pvr_mem_free(player->texture);
-    }
 
-    if(player->snd_buf) {
-        printf("Freed sound buffer\n");
+    if(player->snd_buf)
         free(player->snd_buf);
-    }
 
-    if(player->snd_hnd != SND_STREAM_INVALID) {
-        printf("Freed stream handle\n");
+    if(player->snd_hnd != SND_STREAM_INVALID)
         snd_stream_destroy(player->snd_hnd);
-    }
 
     free(player);
     player = NULL;
-    printf("Freed player\n");
 }
 
 static void *sound_callback(snd_stream_hnd_t hnd, int size, int *size_out) {
@@ -198,9 +187,10 @@ static void upload_frame(plm_frame_t *frame) {
         }
     }
 
-    for(i = 0; i < 16 - h; i++) {
-        sq_set((void *)PVR_TA_YUV_CONV, 0, 384 * 32);
-    }
+    /* Doesnt seem to do anything but will keep it around */
+    /* for(i = 0; i < 16 - h; i++) {
+         sq_set((void *)PVR_TA_YUV_CONV, 0, 384 * 32);
+       } */
 }
 
 static void draw_frame(mpeg_player_t *player) {
@@ -228,6 +218,9 @@ static int setup_graphics(mpeg_player_t *player) {
     PVR_SET(PVR_YUV_CFG, (((MPEG_TEXTURE_HEIGHT / 16) - 1) << 8) |
                           ((MPEG_TEXTURE_WIDTH / 16) - 1));
     PVR_GET(PVR_YUV_CFG);
+
+    /* Clear texture to black */
+    sq_set(player->texture, 0, MPEG_TEXTURE_WIDTH * MPEG_TEXTURE_HEIGHT * 2);
 
     pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY,
                      PVR_TXRFMT_YUV422 | PVR_TXRFMT_NONTWIDDLED,
