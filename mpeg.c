@@ -403,7 +403,5 @@ int mpeg_play(mpeg_player_t *player, uint32_t buttons) {
         pvr_scene_finish();
     }
 
-    mpeg_player_destroy(player);
-
     return cancel;
 }

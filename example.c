@@ -11,5 +11,7 @@ int main(void) {
 
     mpeg_play(player, CONT_START);
 
+    mpeg_player_destroy(player);
+
     return 0;
 }
