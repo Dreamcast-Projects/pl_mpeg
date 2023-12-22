@@ -13,7 +13,6 @@ struct mpeg_player_t {
     int snd_mod_size;
     snd_stream_hnd_t snd_hnd;
     float audio_time;
-    float audio_interval;
     pvr_poly_hdr_t hdr;
     pvr_vertex_t vert[4];
 };
@@ -159,8 +158,7 @@ static void *sound_callback(snd_stream_hnd_t hnd, int size, int *size_out) {
 
     while(size > out) {
         sample = plm_decode_audio(player->decoder);
-        if (!sample) {
-            player->audio_time += player->audio_interval;
+        if(!sample) {
             break;
         }
         player->audio_time = sample->time;
@@ -341,7 +339,6 @@ static int setup_audio(mpeg_player_t *player) {
     player->snd_mod_size = 0;
     player->snd_mod_start = 0;
     player->audio_time = 0.0f;
-    player->audio_interval = player->audio_time;
 
     player->snd_hnd = snd_stream_alloc(sound_callback, SOUND_BUFFER);
     if(player->snd_hnd == SND_STREAM_INVALID) {
@@ -381,7 +378,7 @@ int mpeg_play(mpeg_player_t *player, uint32_t buttons) {
         MAPLE_FOREACH_END()
 
         /* Decode */
-        if((player->audio_time - player->audio_interval) >= frame->time) {
+        if(player->audio_time >= frame->time) {
             frame = plm_decode_video(player->decoder);
             if(!frame)
                 break;
@@ -405,6 +402,8 @@ int mpeg_play(mpeg_player_t *player, uint32_t buttons) {
         pvr_list_finish();
         pvr_scene_finish();
     }
+
+    mpeg_player_destroy(player);
 
     return cancel;
 }
