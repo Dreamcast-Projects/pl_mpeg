@@ -23,6 +23,7 @@ struct mpeg_player_t {
 #define MPEG_TEXTURE_WIDTH 512
 #define MPEG_TEXTURE_HEIGHT 256
 
+/* Size of the sound buffer for both the SH4 side and the AICA side */
 #define SOUND_BUFFER (64 * 1024)
 
 static int setup_graphics(mpeg_player_t *player);
@@ -344,7 +345,7 @@ static int setup_audio(mpeg_player_t *player) {
     return 0;
 }
 
-int mpeg_play(mpeg_player_t *player, uint32_t buttons) {
+int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
     int cancel = 0;
     plm_frame_t *frame;
     int decoded;
