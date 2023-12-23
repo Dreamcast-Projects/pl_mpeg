@@ -1,7 +1,7 @@
 /**
     MPEG1 Decode Library for Dreamcast - Version 0.8 (2023/09/19)
     Originally ported by Tashi (aka Twada)
-    Further works done by Ian Robinson and Andy Barajas
+    Further edits done by Ian Robinson and Andy Barajas
 
     Overview:
     This library facilitates the playback of MPEG1 videos on the Sega Dreamcast console.
