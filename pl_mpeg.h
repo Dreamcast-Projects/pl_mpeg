@@ -149,7 +149,7 @@ typedef struct plm_audio_t plm_audio_t;
 
 typedef struct {
 	int type;
-	double pts;
+	float pts;
 	size_t length;
 	uint8_t *data;
 } plm_packet_t;
@@ -175,7 +175,7 @@ typedef struct {
 // different from the internal size of the 3 planes.
 
 typedef struct {
-	double time;
+	float time;
 	unsigned int width;
 	unsigned int height;
 	plm_plane_t y;
@@ -201,7 +201,7 @@ typedef void(*plm_video_decode_callback)
 #define PLM_AUDIO_SAMPLES_PER_FRAME 1152
 
 typedef struct {
-	double time;
+	float time;
 	unsigned int count;
 	short pcm[PLM_AUDIO_SAMPLES_PER_FRAME] __attribute__((aligned(32)));
 } plm_samples_t;
@@ -285,7 +285,7 @@ int plm_get_height(plm_t *self);
 
 // Get the framerate of the video stream in frames per second.
 
-double plm_get_framerate(plm_t *self);
+float plm_get_framerate(plm_t *self);
 
 
 // Get or set whether audio decoding is enabled. Default TRUE.
@@ -314,18 +314,18 @@ int plm_get_samplerate(plm_t *self);
 // should be set to the duration of the buffer of the audio API that you use
 // for output. E.g. for SDL2: (SDL_AudioSpec.samples / samplerate)
 
-double plm_get_audio_lead_time(plm_t *self);
-void plm_set_audio_lead_time(plm_t *self, double lead_time);
+float plm_get_audio_lead_time(plm_t *self);
+void plm_set_audio_lead_time(plm_t *self, float lead_time);
 
 
 // Get the current internal time in seconds.
 
-double plm_get_time(plm_t *self);
+float plm_get_time(plm_t *self);
 
 
 // Get the video duration of the underlying source in seconds.
 
-double plm_get_duration(plm_t *self);
+float plm_get_duration(plm_t *self);
 
 
 // Rewind all buffers back to the beginning.
@@ -364,7 +364,7 @@ void plm_set_audio_decode_callback(plm_t *self, plm_audio_decode_callback fp, vo
 // of times. A frame-skip is not implemented, i.e. everything up to current time
 // will be decoded.
 
-void plm_decode(plm_t *self, double seconds);
+void plm_decode(plm_t *self, float seconds);
 
 
 // Decode and return one video frame. Returns NULL if no frame could be decoded
@@ -398,14 +398,14 @@ plm_samples_t *plm_decode_audio(plm_t *self);
 // satisfied.
 // Returns TRUE if seeking succeeded or FALSE if no frame could be found.
 
-int plm_seek(plm_t *self, double time, int seek_exact);
+int plm_seek(plm_t *self, float time, int seek_exact);
 
 
 // Similar to plm_seek(), but will not call the video_decode_callback,
 // audio_decode_callback or make any attempts to sync audio.
 // Returns the found frame or NULL if no frame could be found.
 
-plm_frame_t *plm_seek_frame(plm_t *self, double time, int seek_exact);
+plm_frame_t *plm_seek_frame(plm_t *self, float time, int seek_exact);
 
 
 
@@ -567,20 +567,20 @@ int plm_demux_has_ended(plm_demux_t *self);
 // Note that the specified time is considered 0-based, regardless of the first 
 // PTS in the data source.
 
-plm_packet_t *plm_demux_seek(plm_demux_t *self, double time, int type, int force_intra);
+plm_packet_t *plm_demux_seek(plm_demux_t *self, float time, int type, int force_intra);
 
 
 // Get the PTS of the first packet of this type. Returns PLM_PACKET_INVALID_TS
 // if not packet of this packet type can be found.
 
-double plm_demux_get_start_time(plm_demux_t *self, int type);
+float plm_demux_get_start_time(plm_demux_t *self, int type);
 
 
 // Get the duration for the specified packet type - i.e. the span between the
 // the first PTS and the last PTS in the data source. This only makes sense when
 // the underlying data source is a file or fixed memory.
 
-double plm_demux_get_duration(plm_demux_t *self, int type);
+float plm_demux_get_duration(plm_demux_t *self, int type);
 
 
 // Decode and return the next packet. The returned packet_t is valid until
@@ -613,7 +613,7 @@ int plm_video_has_header(plm_video_t *self);
 
 // Get the framerate in frames per second.
 
-double plm_video_get_framerate(plm_video_t *self);
+float plm_video_get_framerate(plm_video_t *self);
 
 
 // Get the display width/height.
@@ -631,14 +631,14 @@ void plm_video_set_no_delay(plm_video_t *self, int no_delay);
 
 // Get the current internal time in seconds.
 
-double plm_video_get_time(plm_video_t *self);
+float plm_video_get_time(plm_video_t *self);
 
 
 // Set the current internal time in seconds. This is only useful when you
 // manipulate the underlying video buffer and want to enforce a correct
 // timestamps.
 
-void plm_video_set_time(plm_video_t *self, double time);
+void plm_video_set_time(plm_video_t *self, float time);
 
 
 // Rewind the internal buffer. See plm_buffer_rewind().
@@ -701,14 +701,14 @@ int plm_audio_get_samplerate(plm_audio_t *self);
 
 // Get the current internal time in seconds.
 
-double plm_audio_get_time(plm_audio_t *self);
+float plm_audio_get_time(plm_audio_t *self);
 
 
 // Set the current internal time in seconds. This is only useful when you
 // manipulate the underlying video buffer and want to enforce a correct
 // timestamps.
 
-void plm_audio_set_time(plm_audio_t *self, double time);
+void plm_audio_set_time(plm_audio_t *self, float time);
 
 
 // Rewind the internal buffer. See plm_buffer_rewind().
@@ -876,7 +876,7 @@ void * memmove_co (void *dest, const void *src, size_t len)
 
 struct plm_t {
 	plm_demux_t *demux;
-	double time;
+	float time;
 	int has_ended;
 	int loop;
 	int has_decoders;
@@ -889,7 +889,7 @@ struct plm_t {
 	int audio_enabled;
 	int audio_stream_index;
 	int audio_packet_type;
-	double audio_lead_time;
+	float audio_lead_time;
 	plm_buffer_t *audio_buffer;
 	plm_audio_t *audio_decoder;
 
@@ -1065,7 +1065,7 @@ int plm_get_height(plm_t *self) {
 		: 0;
 }
 
-double plm_get_framerate(plm_t *self) {
+float plm_get_framerate(plm_t *self) {
 	return (plm_init_decoders(self) && self->video_decoder)
 		? plm_video_get_framerate(self->video_decoder)
 		: 0;
@@ -1081,19 +1081,19 @@ int plm_get_samplerate(plm_t *self) {
 		: 0;
 }
 
-double plm_get_audio_lead_time(plm_t *self) {
+float plm_get_audio_lead_time(plm_t *self) {
 	return self->audio_lead_time;
 }
 
-void plm_set_audio_lead_time(plm_t *self, double lead_time) {
+void plm_set_audio_lead_time(plm_t *self, float lead_time) {
 	self->audio_lead_time = lead_time;
 }
 
-double plm_get_time(plm_t *self) {
+float plm_get_time(plm_t *self) {
 	return self->time;
 }
 
-double plm_get_duration(plm_t *self) {
+float plm_get_duration(plm_t *self) {
 	return plm_demux_get_duration(self->demux, PLM_DEMUX_PACKET_VIDEO_1);
 }
 
@@ -1132,7 +1132,7 @@ void plm_set_audio_decode_callback(plm_t *self, plm_audio_decode_callback fp, vo
 	self->audio_decode_callback_user_data = user;
 }
 
-void plm_decode(plm_t *self, double tick) {
+void plm_decode(plm_t *self, float tick) {
 	if (!plm_init_decoders(self)) {
 		return;
 	}
@@ -1149,8 +1149,8 @@ void plm_decode(plm_t *self, double tick) {
 	int decode_video_failed = FALSE;
 	int decode_audio_failed = FALSE;
 
-	double video_target_time = self->time + tick;
-	double audio_target_time = self->time + tick + self->audio_lead_time;
+	float video_target_time = self->time + tick;
+	float audio_target_time = self->time + tick + self->audio_lead_time;
 
 	do {
 		did_decode = FALSE;
@@ -1275,7 +1275,7 @@ void plm_read_packets(plm_t *self, int requested_type) {
 	}
 }
 
-plm_frame_t *plm_seek_frame(plm_t *self, double time, int seek_exact) {
+plm_frame_t *plm_seek_frame(plm_t *self, float time, int seek_exact) {
 	if (!plm_init_decoders(self)) {
 		return NULL;
 	}
@@ -1286,8 +1286,8 @@ plm_frame_t *plm_seek_frame(plm_t *self, double time, int seek_exact) {
 
 	int type = self->video_packet_type;
 
-	double start_time = plm_demux_get_start_time(self->demux, type);
-	double duration = plm_demux_get_duration(self->demux, type);
+	float start_time = plm_demux_get_start_time(self->demux, type);
+	float duration = plm_demux_get_duration(self->demux, type);
 
 	if (time < 0) {
 		time = 0;
@@ -1330,7 +1330,7 @@ plm_frame_t *plm_seek_frame(plm_t *self, double time, int seek_exact) {
 	return frame;
 }
 
-int plm_seek(plm_t *self, double time, int seek_exact) {
+int plm_seek(plm_t *self, float time, int seek_exact) {
 	plm_frame_t *frame = plm_seek_frame(self, time, seek_exact);
 
 	if (!frame) {
@@ -1350,7 +1350,7 @@ int plm_seek(plm_t *self, double time, int seek_exact) {
 	// with a PTS greater than the current time is found. plm_decode() is then
 	// called to decode enough audio data to satisfy the audio_lead_time.
 
-	double start_time = plm_demux_get_start_time(self->demux, self->video_packet_type);
+	float start_time = plm_demux_get_start_time(self->demux, self->video_packet_type);
 	plm_audio_rewind(self->audio_decoder);
 
 	plm_packet_t *packet = NULL;
@@ -1767,12 +1767,12 @@ static const int PLM_START_SYSTEM = 0xBB;
 struct plm_demux_t {
 	plm_buffer_t *buffer;
 	int destroy_buffer_when_done;
-	double system_clock_ref;
+	float system_clock_ref;
 
 	size_t last_file_size;
-	double last_decoded_pts;
-	double start_time;
-	double duration;
+	float last_decoded_pts;
+	float start_time;
+	float duration;
 
 	int start_code;
 	int has_pack_header;
@@ -1787,7 +1787,7 @@ struct plm_demux_t {
 
 
 void plm_demux_buffer_seek(plm_demux_t *self, size_t pos);
-double plm_demux_decode_time(plm_demux_t *self);
+float plm_demux_decode_time(plm_demux_t *self);
 plm_packet_t *plm_demux_decode_packet(plm_demux_t *self, int type);
 plm_packet_t *plm_demux_get_packet(plm_demux_t *self);
 
@@ -1903,7 +1903,7 @@ void plm_demux_buffer_seek(plm_demux_t *self, size_t pos) {
 	self->start_code = -1;
 }
 
-double plm_demux_get_start_time(plm_demux_t *self, int type) {
+float plm_demux_get_start_time(plm_demux_t *self, int type) {
 	if (self->start_time != PLM_PACKET_INVALID_TS) {
 		return self->start_time;
 	}
@@ -1928,7 +1928,7 @@ double plm_demux_get_start_time(plm_demux_t *self, int type) {
 	return self->start_time;
 }
 
-double plm_demux_get_duration(plm_demux_t *self, int type) {
+float plm_demux_get_duration(plm_demux_t *self, int type) {
 	size_t file_size = plm_buffer_get_size(self->buffer);
 
 	if (
@@ -1954,7 +1954,7 @@ double plm_demux_get_duration(plm_demux_t *self, int type) {
 		plm_demux_buffer_seek(self, seek_pos);
 		self->current_packet.length = 0;
 
-		double last_pts = PLM_PACKET_INVALID_TS;
+		float last_pts = PLM_PACKET_INVALID_TS;
 		plm_packet_t *packet = NULL;
 		while ((packet = plm_demux_decode(self))) {
 			if (packet->pts != PLM_PACKET_INVALID_TS && packet->type == type) {
@@ -1973,7 +1973,7 @@ double plm_demux_get_duration(plm_demux_t *self, int type) {
 	return self->duration;
 }
 
-plm_packet_t *plm_demux_seek(plm_demux_t *self, double seek_time, int type, int force_intra) {
+plm_packet_t *plm_demux_seek(plm_demux_t *self, float seek_time, int type, int force_intra) {
 	if (!plm_demux_has_headers(self)) {
 		return NULL;
 	}
@@ -1994,12 +1994,12 @@ plm_packet_t *plm_demux_seek(plm_demux_t *self, double seek_time, int type, int 
 	// probably something wrong with the file and we just avoid getting into an
 	// infinite loop. 32 retries should be enough for anybody.
 
-	double duration = plm_demux_get_duration(self, type);
+	float duration = plm_demux_get_duration(self, type);
 	long file_size = plm_buffer_get_size(self->buffer);
 	long byterate = file_size / duration;
 
-	double cur_time = self->last_decoded_pts;
-	double scan_span = 1;
+	float cur_time = self->last_decoded_pts;
+	float scan_span = 1;
 
 	if (seek_time > duration) {
 		seek_time = duration;
@@ -2013,7 +2013,7 @@ plm_packet_t *plm_demux_seek(plm_demux_t *self, double seek_time, int type, int 
 		int found_packet_with_pts = FALSE;
 		int found_packet_in_range = FALSE;
 		long last_valid_packet_start = -1;
-		double first_packet_time = PLM_PACKET_INVALID_TS;
+		float first_packet_time = PLM_PACKET_INVALID_TS;
 
 		long cur_pos = plm_buffer_tell(self->buffer);
 
@@ -2156,14 +2156,14 @@ plm_packet_t *plm_demux_decode(plm_demux_t *self) {
 	return NULL;
 }
 
-double plm_demux_decode_time(plm_demux_t *self) {
+float plm_demux_decode_time(plm_demux_t *self) {
 	int64_t clock = plm_buffer_read(self->buffer, 3) << 30;
 	plm_buffer_skip(self->buffer, 1);
 	clock |= plm_buffer_read(self->buffer, 15) << 15;
 	plm_buffer_skip(self->buffer, 1);
 	clock |= plm_buffer_read(self->buffer, 15);
 	plm_buffer_skip(self->buffer, 1);
-	return (double)clock / 90000.0;
+	return (float)clock / 90000.0;
 }
 
 plm_packet_t *plm_demux_decode_packet(plm_demux_t *self, int type) {
@@ -2243,7 +2243,7 @@ static const int PLM_START_USER_DATA = 0xB2;
 #define PLM_START_IS_SLICE(c) \
 	(c >= PLM_START_SLICE_FIRST && c <= PLM_START_SLICE_LAST)
 
- __attribute__((aligned(32))) static const double PLM_VIDEO_PICTURE_RATE[] = {
+ __attribute__((aligned(32))) static const float PLM_VIDEO_PICTURE_RATE[] = {
 	0.000, 23.976, 24.000, 25.000, 29.970, 30.000, 50.000, 59.940,
 	60.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000
 };
@@ -2635,8 +2635,8 @@ typedef struct {
 } plm_video_motion_t;
 
 struct plm_video_t {
-	double framerate;
-	double time;
+	float framerate;
+	float time;
 	int frames_decoded;
 	int width;
 	int height;
@@ -2736,7 +2736,7 @@ void plm_video_destroy(plm_video_t *self) {
 	PLM_FREE(self);
 }
 
-double plm_video_get_framerate(plm_video_t *self) {
+float plm_video_get_framerate(plm_video_t *self) {
 	return plm_video_has_header(self)
 		? self->framerate
 		: 0;
@@ -2758,11 +2758,11 @@ void plm_video_set_no_delay(plm_video_t *self, int no_delay) {
 	self->assume_no_b_frames = no_delay;
 }
 
-double plm_video_get_time(plm_video_t *self) {
+float plm_video_get_time(plm_video_t *self) {
 	return self->time;
 }
 
-void plm_video_set_time(plm_video_t *self, double time) {
+void plm_video_set_time(plm_video_t *self, float time) {
 	self->frames_decoded = self->framerate * time;
 	self->time = time;
 }
@@ -2839,7 +2839,7 @@ plm_frame_t *plm_video_decode(plm_video_t *self) {
 
 	frame->time = self->time;
 	self->frames_decoded++;
-	self->time = (double)self->frames_decoded / self->framerate;
+	self->time = (float)self->frames_decoded / self->framerate;
 
 	return frame;
 }
@@ -3956,9 +3956,6 @@ void plm_video_idct(int *block) {
     }
 }
 
-
-
-
 // YCbCr conversion following the BT.601 standard:
 // https://infogalactic.com/info/YCbCr#ITU-R_BT.601_conversion
 
@@ -4215,7 +4212,7 @@ typedef struct plm_quantizer_spec_t {
 };
 
 struct plm_audio_t {	
-	double time;
+	float time;
 	int samples_decoded;
 	int samplerate_index;
 	int bitrate_index;
@@ -4313,13 +4310,13 @@ int plm_audio_get_samplerate(plm_audio_t *self) {
 		: 0;
 }
 
-double plm_audio_get_time(plm_audio_t *self) {
+float plm_audio_get_time(plm_audio_t *self) {
 	return self->time;
 }
 
-void plm_audio_set_time(plm_audio_t *self, double time) {
+void plm_audio_set_time(plm_audio_t *self, float time) {
 	self->samples_decoded = time *
-		(double)PLM_AUDIO_SAMPLE_RATE[self->samplerate_index];
+		(float)PLM_AUDIO_SAMPLE_RATE[self->samplerate_index];
 	self->time = time;
 }
 
@@ -4356,8 +4353,8 @@ plm_samples_t *plm_audio_decode(plm_audio_t *self) {
 	self->samples.time = self->time;
 
 	self->samples_decoded += PLM_AUDIO_SAMPLES_PER_FRAME;
-	self->time = (double)self->samples_decoded /
-		(double)PLM_AUDIO_SAMPLE_RATE[self->samplerate_index];
+	self->time = (float)self->samples_decoded /
+		(float)PLM_AUDIO_SAMPLE_RATE[self->samplerate_index];
 
 	return &self->samples;
 }
