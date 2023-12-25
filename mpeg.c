@@ -180,10 +180,6 @@ int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
     if (!player || !player->decoder)
         return -1;
 
-    /* First frame */
-    frame = plm_decode_video(player->decoder);
-    decoded = 1;
-
     /* Init sound stream. */
     snd_stream_start(player->snd_hnd, player->sample_rate, 0);
 
@@ -202,7 +198,10 @@ int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
 
         /* Decode */
         if(player->audio_time >= player->video_time) {
+            //uint64_t start = timer_ns_gettime64();
             frame = plm_decode_video(player->decoder);
+            //uint64_t end = timer_ns_gettime64();
+            //printf("%llu,", end-start);
             if(!frame) {
                 /* Are we looping? */
                 if(plm_get_loop(player->decoder)) {
