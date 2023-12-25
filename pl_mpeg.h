@@ -2163,7 +2163,7 @@ float plm_demux_decode_time(plm_demux_t *self) {
 	plm_buffer_skip(self->buffer, 1);
 	clock |= plm_buffer_read(self->buffer, 15);
 	plm_buffer_skip(self->buffer, 1);
-	return (float)clock / 90000.0;
+	return (float)clock / 90000.0f;
 }
 
 plm_packet_t *plm_demux_decode_packet(plm_demux_t *self, int type) {
