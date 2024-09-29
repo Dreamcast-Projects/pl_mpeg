@@ -1372,31 +1372,6 @@ int plm_seek(plm_t *self, float time, int seek_exact) {
 	return TRUE;
 }
 
-
-void *memsetsh4(void *dest, const uint8_t val, size_t len) {
-    uint8_t *ptr, *sq;
-    uint32_t nb;
-
-    ptr = (uint8_t *)dest;
-
-    ptr = (uint8_t *)(((uint32_t)ptr + 31) & ~(31)); /* Align dest to 32 bytes */
-
-    /* Fill in store queue */
-    sq = (uint8_t *)0xE0000000;
-    for (nb = 64; nb > 0; nb--) *sq++ = val;
-
-    /* Set dest image to store queue */
-    ptr = (uint8_t *)((((uint32_t)ptr) & 0x03FFFFFF) | 0xE0000000);
-
-    while (len >= 32) {
-        __builtin_prefetch(ptr);
-        len -= 32;
-        ptr += 32;
-    }
-
-    return dest;
-}
-
 // -----------------------------------------------------------------------------
 // plm_buffer implementation
 
@@ -1452,6 +1427,7 @@ inline uint16_t plm_buffer_read_vlc_uint(plm_buffer_t *self, const plm_vlc_uint_
 plm_buffer_t *plm_buffer_create_with_filename(const char *filename) {
 	unsigned int fh = fs_open(filename, 0);
 	if (fh == -1) {
+		fprintf(stderr, "Can not open file: %s\n", filename);
 		return NULL;
 	}
 	return plm_buffer_create_with_file(fh, TRUE);
@@ -1474,7 +1450,7 @@ plm_buffer_t *plm_buffer_create_with_file(unsigned int fh, int close_when_done) 
 
 plm_buffer_t *plm_buffer_create_with_memory(uint8_t *bytes, size_t length, int free_when_done) {
 	plm_buffer_t *self = (plm_buffer_t *)PLM_MALLOC(sizeof(plm_buffer_t));
-	memsetsh4(self, 0, sizeof(plm_buffer_t));
+	memset(self, 0, sizeof(plm_buffer_t));
 	self->capacity = length;
 	self->length = length;
 	self->total_size = length;

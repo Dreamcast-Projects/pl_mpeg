@@ -46,8 +46,8 @@ struct mpeg_player_t {
 
 /* Output texture width and height initial values
    You can choose from 32, 64, 128, 256, 512, 1024 */
-#define MPEG_TEXTURE_WIDTH 512
-#define MPEG_TEXTURE_HEIGHT 256
+static int mpeg_texture_width;
+static int mpeg_texture_height;
 
 /* Size of the sound buffer for both the SH4 side and the AICA side */
 #define SOUND_BUFFER (64 * 1024)
@@ -58,6 +58,21 @@ static int setup_graphics(mpeg_player_t *player);
 static int setup_audio(mpeg_player_t *player);
 static void fast_memcpy(void *dest, const void *src, size_t length);
 
+uint32_t next_power_of_two(uint32_t n) {
+    if(n == 0)
+        return 1;
+
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+
+    return n;
+}
+
 mpeg_player_t *mpeg_player_create(const char *filename) {
     mpeg_player_t *player = NULL;
 
@@ -66,7 +81,7 @@ mpeg_player_t *mpeg_player_create(const char *filename) {
         return NULL;
     }
 
-    player = malloc(sizeof(mpeg_player_t));
+    player = calloc(1, sizeof(mpeg_player_t));
     if(!player) {
         fprintf(stderr, "Out of memory for player\n");
         return NULL;
@@ -105,7 +120,7 @@ mpeg_player_t *mpeg_player_create_memory(uint8_t *memory, const size_t length) {
     mpeg_player_t *player = NULL;
 
     if(!memory) {
-        fprintf(stderr, "memory is null\n");
+        fprintf(stderr, "memory is NULL\n");
         return NULL;
     }
 
@@ -177,7 +192,7 @@ int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
     int cancel = 0;
     plm_frame_t *frame;
 
-    if (!player || !player->decoder)
+    if(!player || !player->decoder)
         return -1;
 
     /* Init sound stream. */
@@ -186,11 +201,11 @@ int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
     while(!cancel) {
         /* Check cancel buttons. */
         MAPLE_FOREACH_BEGIN(MAPLE_FUNC_CONTROLLER, cont_state_t, st)
-        if (cancel_buttons && ((st->buttons & cancel_buttons) == cancel_buttons)) {
+        if(cancel_buttons && ((st->buttons & cancel_buttons) == cancel_buttons)) {
             cancel = 1; /* Push cancel buttons */
             break;
         }
-        if (st->buttons == 0x60e) {
+        if(st->buttons == 0x60e) {
             cancel = 2; /* ABXY + START (Software reset) */
             break;
         }
@@ -258,25 +273,31 @@ static void upload_frame(plm_frame_t *frame) {
 
     src = frame->display;
 
-    /* Set frame size. */
+    /* Calculate number of megablocks based on frame size */
     w = frame->width >> 4;
     h = frame->height >> 4;
 
+    int const min_blocks_x = 32 * (frame->width / 320) - w;
+    //int const min_blocks_y = 16 * (frame->height / 240) - h;
+
+    /* For each row of megablocks */
     for(y = 0; y < h; y++) {
+
+        /* Copy one megablock from src to the YUV convertor */
         for(x = 0; x < w; x++, src += 96) {
             sq_cpy((void *)PVR_TA_YUV_CONV, (void *)src, 384);
         }
 
-        /* Send dummy mb */
-        for(i = 0; i < 32 - w; i++) {
+        /* Send a dummy megablock if required for padding */
+        for(i = 0; i < min_blocks_x; i++) {
             sq_set((void *)PVR_TA_YUV_CONV, 0, 384);
         }
     }
 
-    /* Doesnt seem to do anything but will keep it around */
-    /* for(i = 0; i < 16 - h; i++) {
-         sq_set((void *)PVR_TA_YUV_CONV, 0, 384 * 32);
-       } */
+    /* Send a row of dummy megablocks if required for padding */
+    // for(i = 0; i < min_blocks_y; i++) {
+    //      sq_set((void *)PVR_TA_YUV_CONV, 0, 384 * 32);
+    // }
 }
 
 static void draw_frame(mpeg_player_t *player) {
@@ -292,7 +313,13 @@ static int setup_graphics(mpeg_player_t *player) {
     float u, v;
     int color = PVR_PACK_COLOR(1.0f, 1.0f, 1.0f, 1.0f);
 
-    if(!(player->texture = pvr_mem_malloc(MPEG_TEXTURE_WIDTH * MPEG_TEXTURE_HEIGHT * 2))) {
+    player->width = plm_get_width(player->decoder);
+    player->height = plm_get_height(player->decoder);
+
+    mpeg_texture_width = next_power_of_two(player->width);
+    mpeg_texture_height = next_power_of_two(player->height);
+
+    if(!(player->texture = pvr_mem_malloc(mpeg_texture_width * mpeg_texture_height * 2))) {
         fprintf(stderr, "Failed to allocate PVR memory!\n");
         return -1;
     }
@@ -301,27 +328,25 @@ static int setup_graphics(mpeg_player_t *player) {
     PVR_SET(PVR_YUV_ADDR, (((uint32_t)player->texture) & 0xffffff));
     /* Divide texture width and texture height by 16 and subtract 1.
        The actual values to set are 1, 3, 7, 15, 31, 63. */
-    PVR_SET(PVR_YUV_CFG, (((MPEG_TEXTURE_HEIGHT / 16) - 1) << 8) |
-                          ((MPEG_TEXTURE_WIDTH / 16) - 1));
+    PVR_SET(PVR_YUV_CFG, (((mpeg_texture_height / 16) - 1) << 8) |
+                          ((mpeg_texture_width / 16) - 1));
     PVR_GET(PVR_YUV_CFG);
 
     /* Clear texture to black */
-    sq_set(player->texture, 0, MPEG_TEXTURE_WIDTH * MPEG_TEXTURE_HEIGHT * 2);
+    sq_set(player->texture, 0, mpeg_texture_width * mpeg_texture_height * 2);
 
     pvr_poly_cxt_txr(&cxt, PVR_LIST_OP_POLY,
                      PVR_TXRFMT_YUV422 | PVR_TXRFMT_NONTWIDDLED,
-                     MPEG_TEXTURE_WIDTH, MPEG_TEXTURE_HEIGHT,
+                     mpeg_texture_width, mpeg_texture_height,
                      player->texture,
                      PVR_FILTER_BILINEAR);
     pvr_poly_compile(&player->hdr, &cxt);
 
     player->hdr.mode3 |= PVR_TXRFMT_STRIDE;
-    player->width = plm_get_width(player->decoder);
-    player->height = plm_get_height(player->decoder);
     player->video_time = 0.0f;
 
-    u = (float)player->width / MPEG_TEXTURE_WIDTH;
-    v = (float)player->height / MPEG_TEXTURE_HEIGHT;
+    u = (float)player->width / mpeg_texture_width;
+    v = (float)player->height / mpeg_texture_height;
 
     player->vert[0].x = 0.0f;
     player->vert[0].y = 0.0f;
@@ -415,7 +440,7 @@ static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, s
     _Complex float ds3;
     _Complex float ds4;
 
-    if (((uintptr_t)dest | (uintptr_t)src) & 7) {
+    if(((uintptr_t)dest | (uintptr_t)src) & 7) {
         memcpy(dest, src, length);
     }
     else { /* Fast Path */
