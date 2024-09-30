@@ -279,7 +279,7 @@ static void upload_frame(plm_frame_t *frame) {
 
     int const min_blocks_x = 32 * (frame->width / 320) - w;
     //int const min_blocks_y = 16 * (frame->height / 240) - h;
-
+    
     /* For each row of megablocks */
     for(y = 0; y < h; y++) {
 
