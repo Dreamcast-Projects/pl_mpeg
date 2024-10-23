@@ -279,20 +279,26 @@ static void upload_frame(plm_frame_t *frame) {
 
     int const min_blocks_x = 32 * (frame->width / 320) - w;
     //int const min_blocks_y = 16 * (frame->height / 240) - h;
-    
+
+    uint32_t *d = SQ_MASK_DEST((void *)PVR_TA_YUV_CONV);
+    sq_lock((void *)PVR_TA_YUV_CONV);
+
     /* For each row of megablocks */
     for(y = 0; y < h; y++) {
-
         /* Copy one megablock from src to the YUV convertor */
         for(x = 0; x < w; x++, src += 96) {
-            sq_cpy((void *)PVR_TA_YUV_CONV, (void *)src, 384);
+            sq_fast_cpy(d, src, 384/32);
         }
 
         /* Send a dummy megablock if required for padding */
-        for(i = 0; i < min_blocks_x; i++) {
-            sq_set((void *)PVR_TA_YUV_CONV, 0, 384);
+        for(i = 0; i < min_blocks_x * 384/32; i++) {
+            //d[0] = d[1] = d[2] = d[3] = d[4] = d[5] = d[6] = d[7] = 0;
+            sq_flush(d);
+            //d += 8;
         }
     }
+
+    sq_unlock();
 
     /* Send a row of dummy megablocks if required for padding */
     // for(i = 0; i < min_blocks_y; i++) {
@@ -302,10 +308,10 @@ static void upload_frame(plm_frame_t *frame) {
 
 static void draw_frame(mpeg_player_t *player) {
     pvr_prim(&player->hdr, sizeof(pvr_poly_hdr_t));
-    pvr_prim(&player->vert[0], sizeof(pvr_vertex_t));
-    pvr_prim(&player->vert[1], sizeof(pvr_vertex_t));
-    pvr_prim(&player->vert[2], sizeof(pvr_vertex_t));
-    pvr_prim(&player->vert[3], sizeof(pvr_vertex_t));
+    
+    sq_lock((void *)PVR_TA_INPUT);
+    sq_fast_cpy(SQ_MASK_DEST(PVR_TA_INPUT), &player->vert, (sizeof(pvr_vertex_t) * 4)/32);
+    sq_unlock();
 }
 
 static int setup_graphics(mpeg_player_t *player) {
