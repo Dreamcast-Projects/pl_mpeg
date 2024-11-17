@@ -348,7 +348,6 @@ static int setup_graphics(mpeg_player_t *player) {
                      PVR_FILTER_BILINEAR);
     pvr_poly_compile(&player->hdr, &cxt);
 
-    player->hdr.mode3 |= PVR_TXRFMT_STRIDE;
     player->video_time = 0.0f;
 
     u = (float)player->width / mpeg_texture_width;
