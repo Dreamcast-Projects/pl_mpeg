@@ -73,6 +73,46 @@ uint32_t next_power_of_two(uint32_t n) {
     return n;
 }
 
+static int mpeg_check_cancel(const mpeg_cancel_options_t *opt) {
+    if(!opt) return 0;
+
+    /*   Controller Cancel   */
+    MAPLE_FOREACH_BEGIN(MAPLE_FUNC_CONTROLLER, cont_state_t, st)
+        if(opt->pad_button_any && (st->buttons & opt->pad_button_any))
+            return 1;
+
+        if(opt->pad_button_combo &&
+            (st->buttons & opt->pad_button_combo) == opt->pad_button_combo)
+            return 1;
+
+        /* Always cancel on reset combo */
+        if(st->buttons == CONT_RESET_BUTTONS)
+            return 2;
+    MAPLE_FOREACH_END()
+
+    /*   Keyboard Cancel   */
+    MAPLE_FOREACH_BEGIN(MAPLE_FUNC_KEYBOARD, kbd_state_t, kbd_st)
+        for(size_t i = 0; i < opt->kbd_keys_any_count; ++i) {
+            if(kbd_st->key_states[opt->kbd_keys_any[i]].is_down)
+                return 1;
+        }
+
+        int all_pressed = 1;
+        for(size_t i = 0; i < opt->kbd_keys_combo_count; ++i) {
+            if(!kbd_st->key_states[opt->kbd_keys_combo[i]].is_down) {
+                all_pressed = 0;
+                break;
+            }
+        }
+
+        if(opt->kbd_keys_combo_count && all_pressed)
+            return 1;
+
+    MAPLE_FOREACH_END()
+
+    return 0;
+}
+
 mpeg_player_t *mpeg_player_create(const char *filename) {
     mpeg_player_t *player = NULL;
 
@@ -187,7 +227,7 @@ void mpeg_player_destroy(mpeg_player_t *player) {
     player = NULL;
 }
 
-int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
+int mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options_t *cancel_options) {
     int decoded;
     int cancel = 0;
     plm_frame_t *frame;
@@ -199,17 +239,8 @@ int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
     snd_stream_start(player->snd_hnd, player->sample_rate, 0);
 
     while(!cancel) {
-        /* Check cancel buttons. */
-        MAPLE_FOREACH_BEGIN(MAPLE_FUNC_CONTROLLER, cont_state_t, st)
-        if(cancel_buttons && ((st->buttons & cancel_buttons) == cancel_buttons)) {
-            cancel = 1; /* Push cancel buttons */
-            break;
-        }
-        if(st->buttons == 0x60e) {
-            cancel = 2; /* ABXY + START (Software reset) */
-            break;
-        }
-        MAPLE_FOREACH_END()
+        /* Check cancel matching */
+        cancel = mpeg_check_cancel(cancel_options);
 
         /* Decode */
         if(player->audio_time >= player->video_time) {
@@ -264,6 +295,14 @@ int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
     return cancel;
 }
 
+int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
+    mpeg_cancel_options_t opts = {
+        .pad_button_any = cancel_buttons
+    };
+
+    return mpeg_play_ex(player, &opts);
+}
+
 static void upload_frame(plm_frame_t *frame) {
     uint32_t *src;
     int x, y, w, h, i;
@@ -308,7 +347,7 @@ static void upload_frame(plm_frame_t *frame) {
 
 static void draw_frame(mpeg_player_t *player) {
     pvr_prim(&player->hdr, sizeof(pvr_poly_hdr_t));
-    
+
     sq_lock((void *)PVR_TA_INPUT);
     sq_fast_cpy(SQ_MASK_DEST(PVR_TA_INPUT), &player->vert, (sizeof(pvr_vertex_t) * 4)/32);
     sq_unlock();
@@ -405,7 +444,7 @@ static void *sound_callback(snd_stream_hnd_t hnd, int size, int *size_out) {
         sample = plm_decode_audio(player->decoder);
         if(!sample)
             break;
-        
+
         player->audio_time = sample->time;
         fast_memcpy(dest + out / 4, sample->pcm, 1152 * 2);
         out += 1152 * 2;
@@ -455,7 +494,7 @@ static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, s
         if(blocks > 0) {
             __asm__ __volatile__ (
                 "fschg\n\t"
-                "clrs\n" 
+                "clrs\n"
                 ".align 2\n"
                 "1:\n\t"
                 /* *dest++ = *src++ */
@@ -473,8 +512,8 @@ static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, s
                 "bf.s 1b\n\t"
                 "add #32, %[out]\n\t"
                 "fschg\n"
-                : [in] "+&r" ((uintptr_t)src), [out] "+&r" ((uintptr_t)dest), 
-                [blocks] "+&r" (blocks), [scratch] "=&d" (ds), [scratch2] "=&d" (ds2), 
+                : [in] "+&r" ((uintptr_t)src), [out] "+&r" ((uintptr_t)dest),
+                [blocks] "+&r" (blocks), [scratch] "=&d" (ds), [scratch2] "=&d" (ds2),
                 [scratch3] "=&d" (ds3), [scratch4] "=&d" (ds4) /* outputs */
                 : [r0] "z" (remainder) /* inputs */
                 : "t", "memory" /* clobbers */
