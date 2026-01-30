@@ -187,7 +187,7 @@ void mpeg_player_destroy(mpeg_player_t *player) {
     player = NULL;
 }
 
-int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
+int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons, int (*extra_cancel_check)(void)) {
     int decoded;
     int cancel = 0;
     plm_frame_t *frame;
@@ -199,7 +199,13 @@ int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
     snd_stream_start(player->snd_hnd, player->sample_rate, 0);
 
     while(!cancel) {
-        /* Check cancel buttons. */
+
+        if (extra_cancel_check && extra_cancel_check()) {
+            cancel = 1;
+            break;
+        }
+
+        /* Check cancel buttons. */        
         MAPLE_FOREACH_BEGIN(MAPLE_FUNC_CONTROLLER, cont_state_t, st)
         if(cancel_buttons && ((st->buttons & cancel_buttons) == cancel_buttons)) {
             cancel = 1; /* Push cancel buttons */
@@ -208,8 +214,11 @@ int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
         if(st->buttons == 0x60e) {
             cancel = 2; /* ABXY + START (Software reset) */
             break;
-        }
+        }        
         MAPLE_FOREACH_END()
+
+        if(cancel)
+            break;        
 
         /* Decode */
         if(player->audio_time >= player->video_time) {

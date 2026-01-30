@@ -107,11 +107,13 @@ void mpeg_player_destroy(mpeg_player_t *player);
 
     \param  player          The MPEG player instance used for playback. Must be initialized.
     \param  cancel_buttons  A bit mask of controller buttons that can cancel the playback.
+    \param  extra_cancel_check  Optional callback function that returns non-zero
+                                 when playback should be canceled. Can be NULL.
     \return                 An integer indicating the reason for playback termination. 
                             Returns -1 if player or decoder is NULL. Returns a non-negative 
                             value representing cancellation status otherwise.
 */
-int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons);
+int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons, int (*extra_cancel_check)(void));
 
 #ifdef __cplusplus
 }
