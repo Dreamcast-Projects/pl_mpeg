@@ -13,7 +13,14 @@ int main(void) {
 
     mpeg_player_set_loop(player, 1);
 
-    mpeg_play(player, CONT_START);
+    const mpeg_cancel_options_t skip_opts = {
+        .pad_button_any = CONT_START,
+        .kbd_keys_any = (const uint16_t[]){ KBD_KEY_ENTER, KBD_KEY_SPACE },
+        .kbd_keys_any_count = 2
+    };
+    mpeg_play_ex(player, &skip_opts);
+
+    //mpeg_play(player, CONT_START);
 
     mpeg_player_destroy(player);
 
