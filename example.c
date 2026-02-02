@@ -15,7 +15,7 @@ int main(void) {
         .player_loop        = true
     };
 
-    player = mpeg_player_create_ex("/rd/sample.mpg", &default_options);
+    player = mpeg_player_create_ex("/rd/ManiaHP.mpg", &default_options);
     if(player == NULL)
         return -1;
 
@@ -28,26 +28,37 @@ int main(void) {
     // };
     // mpeg_play_ex(player, &skip_opts);
 
-    mpeg_play(player, CONT_START);
+    //mpeg_play(player, CONT_START);
 
-    // mpeg_snd_stream_start(player);
+    mpeg_snd_stream_start(player);
 
-    // while(1) {
-    //     mpeg_decode_step(player);
+    mpeg_decode_result_t decode_result = MPEG_DECODE_IDLE;
+    while(1) {
+        MAPLE_FOREACH_BEGIN(MAPLE_FUNC_CONTROLLER, cont_state_t, st)
+            if(CONT_START && ((st->buttons & CONT_START) == CONT_START)) {
+                /* Push cancel buttons */
+                break;
+            }
+            if(st->buttons == CONT_RESET_BUTTONS) {
+                /* ABXY + START (Software reset) */
+                break;
+            }
+        MAPLE_FOREACH_END()
 
-    //     /* Render */
-    //     pvr_wait_ready();
-    //     pvr_scene_begin();
+        decode_result = mpeg_decode_step(player);
 
-    //     mpeg_upload_frame(player);
+        /* Render */
+        pvr_scene_begin();
+        pvr_list_begin(PVR_LIST_TR_POLY);
 
-    //     pvr_list_begin(PVR_LIST_TR_POLY);
+        //if(decode_result == MPEG_DECODE_FRAME) {
+            mpeg_upload_frame(player);
+            mpeg_draw_frame(player);
+        //}
 
-    //     mpeg_draw_frame(player);
-
-    //     pvr_list_finish();
-    //     pvr_scene_finish();
-    // }
+        pvr_list_finish();
+        pvr_scene_finish();
+    }
 
     mpeg_player_destroy(player);
 

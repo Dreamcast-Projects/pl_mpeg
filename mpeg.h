@@ -240,6 +240,17 @@ void mpeg_player_set_volume(mpeg_player_t *player, uint8_t volume);
 */
 void mpeg_player_destroy(mpeg_player_t *player);
 
+/**
+    \brief   Return codes for MPEG playback result.
+    \ingroup mpeg_playback
+*/
+typedef enum {
+    MPEG_PLAY_ERROR         = -1, /**< The player or decoder was NULL */
+    MPEG_PLAY_NORMAL        =  0, /**< Playback finished normally */
+    MPEG_PLAY_CANCEL_INPUT  =  1, /**< Cancelled via controller or keyboard input */
+    MPEG_PLAY_CANCEL_RESET  =  2  /**< Cancelled via ABXY+START reset combo */
+} mpeg_play_result_t;
+
 /** \brief   Play an MPEG video using an MPEG player.
     \ingroup mpeg_playback
 
@@ -255,7 +266,7 @@ void mpeg_player_destroy(mpeg_player_t *player);
                             Returns 2 if cancelled via reset combo (ABXY+START).
                             Returns 0 if playback finished normally.
 */
-int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons);
+mpeg_play_result_t mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons);
 
 /** \brief   Input cancellation options for MPEG playback.
     \ingroup mpeg_playback
@@ -319,7 +330,18 @@ typedef struct mpeg_cancel_options_t {
                             Returns 2 if cancelled via reset combo (ABXY+START).
                             Returns 0 if playback finished normally.
 */
-int mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options_t *cancel_options);
+mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options_t *cancel_options);
+
+/**
+    \brief   Return codes for MPEG decode operations.
+    \ingroup mpeg_playback
+*/
+typedef enum {
+    MPEG_DECODE_ERROR        = -1, /**< Invalid input or decoder error */
+    MPEG_DECODE_EOF          = -2, /**< Reached end of stream and not looping */
+    MPEG_DECODE_IDLE         =  0, /**< No frame decoded (waiting on audio) */
+    MPEG_DECODE_FRAME        =  1  /**< Frame successfully decoded */
+} mpeg_decode_result_t;
 
 /** \brief   Decode the next video frame step (non-blocking).
     \ingroup mpeg_playback
@@ -335,8 +357,17 @@ int mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options_t *cancel_opti
     \return             0 if decoding succeeded or wasn't needed.
                         Returns -1 if the player or decoder is NULL.
                         Returns 0 if decoding reached the end of stream and not looping.
+    \return             A value from \ref mpeg_decode_result_t indicating the result:
+                        - `MPEG_DECODE_FRAME`:
+                            A video frame was successfully decoded.
+                        - `MPEG_DECODE_IDLE`:
+                            No frame was decoded (e.g., waiting for audio to catch up).
+                        - `MPEG_DECODE_EOF`:
+                            End of stream reached and looping is disabled.
+                        - `MPEG_DECODE_ERROR`:
+                            The player or decoder is NULL.
  */
-int mpeg_decode_step(mpeg_player_t *player);
+mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player);
 
 /** \brief   Upload the most recently decoded video frame to PVR YUV converter memory.
     \ingroup mpeg_playback
