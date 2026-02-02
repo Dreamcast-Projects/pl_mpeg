@@ -7,20 +7,46 @@ int main(void) {
 
     mpeg_player_t *player;
 
-    player = mpeg_player_create("/rd/orgface.mpg");
+    static const mpeg_player_options_t default_options = {
+        .player_list_type   = PVR_LIST_TR_POLY,
+        .player_filter_mode = PVR_FILTER_NONE,
+        .player_volume      = 127,
+        .player_loop        = true
+    };
+
+    player = mpeg_player_create_ex("/rd/sample.mpg", &default_options);
     if(player == NULL)
         return -1;
 
-    mpeg_player_set_loop(player, 1);
+    //mpeg_player_set_loop(player, 1);
 
-    const mpeg_cancel_options_t skip_opts = {
-        .pad_button_any = CONT_START,
-        .kbd_keys_any = (const uint16_t[]){ KBD_KEY_ENTER, KBD_KEY_SPACE },
-        .kbd_keys_any_count = 2
-    };
-    mpeg_play_ex(player, &skip_opts);
+    // const mpeg_cancel_options_t skip_opts = {
+    //     .pad_button_any = CONT_START,
+    //     .kbd_keys_any = (const uint16_t[]){ KBD_KEY_ENTER, KBD_KEY_SPACE },
+    //     .kbd_keys_any_count = 2
+    // };
+    // mpeg_play_ex(player, &skip_opts);
 
     //mpeg_play(player, CONT_START);
+
+    mpeg_snd_stream_start(player);
+
+    while(1) {
+        mpeg_decode_step(player);
+
+        /* Render */
+        pvr_wait_ready();
+        pvr_scene_begin();
+
+        mpeg_upload_frame(player);
+
+        pvr_list_begin(PVR_LIST_TR_POLY);
+
+        mpeg_draw_frame(player);
+
+        pvr_list_finish();
+        pvr_scene_finish();
+    }
 
     mpeg_player_destroy(player);
 
