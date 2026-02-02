@@ -260,11 +260,15 @@ typedef enum {
 
     \param  player          The MPEG player instance used for playback. Must be initialized.
     \param  cancel_buttons  A bit mask of controller buttons that can cancel the playback.
-    \return                 An integer indicating the reason for playback termination.
-                            Returns -1 if the player or decoder is NULL.
-                            Returns 1 if cancelled via controller or keyboard.
-                            Returns 2 if cancelled via reset combo (ABXY+START).
-                            Returns 0 if playback finished normally.
+    \return                 A value from \ref mpeg_play_result_t indicating the result:
+                            - `MPEG_PLAY_NORMAL` (0):
+                                Playback finished normally.
+                            - `MPEG_PLAY_CANCEL_INPUT` (1):
+                                Playback was cancelled via controller or keyboard input.
+                            - `MPEG_PLAY_CANCEL_RESET` (2):
+                                Playback was cancelled via the reset combo (ABXY + START).
+                            - `MPEG_PLAY_ERROR` (-1):
+                                The player or decoder was NULL.
 */
 mpeg_play_result_t mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons);
 
@@ -324,11 +328,15 @@ typedef struct mpeg_cancel_options_t {
     \param  cancel_options  A pointer to a mpeg_cancel_options_t struct describing
                             which controller and/or keyboard inputs should cancel playback.
                             May be NULL to disable cancel checks.
-    \return                 An integer indicating the reason for playback termination.
-                            Returns -1 if the player or decoder is NULL.
-                            Returns 1 if cancelled via controller or keyboard.
-                            Returns 2 if cancelled via reset combo (ABXY+START).
-                            Returns 0 if playback finished normally.
+    \return                 A value from \ref mpeg_play_result_t indicating the result:
+                            - `MPEG_PLAY_NORMAL` (0):
+                                Playback finished normally.
+                            - `MPEG_PLAY_CANCEL_INPUT` (1):
+                                Playback was cancelled via controller or keyboard input.
+                            - `MPEG_PLAY_CANCEL_RESET` (2):
+                                Playback was cancelled via the reset combo (ABXY + START).
+                            - `MPEG_PLAY_ERROR` (-1):
+                                The player or decoder was NULL.
 */
 mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options_t *cancel_options);
 
@@ -337,10 +345,10 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
     \ingroup mpeg_playback
 */
 typedef enum {
-    MPEG_DECODE_ERROR        = -1, /**< Invalid input or decoder error */
-    MPEG_DECODE_EOF          = -2, /**< Reached end of stream and not looping */
-    MPEG_DECODE_IDLE         =  0, /**< No frame decoded (waiting on audio) */
-    MPEG_DECODE_FRAME        =  1  /**< Frame successfully decoded */
+    MPEG_DECODE_ERROR    = -1, /**< Invalid input or decoder error */
+    MPEG_DECODE_EOF      = -2, /**< Reached end of stream and not looping */
+    MPEG_DECODE_IDLE     =  0, /**< No frame decoded (waiting on audio) */
+    MPEG_DECODE_FRAME    =  1  /**< Frame successfully decoded */
 } mpeg_decode_result_t;
 
 /** \brief   Decode the next video frame step (non-blocking).
@@ -354,9 +362,6 @@ typedef enum {
     This function is useful for use in a game loop or custom playback control logic.
 
     \param  player      The MPEG player instance. Must be initialized.
-    \return             0 if decoding succeeded or wasn't needed.
-                        Returns -1 if the player or decoder is NULL.
-                        Returns 0 if decoding reached the end of stream and not looping.
     \return             A value from \ref mpeg_decode_result_t indicating the result:
                         - `MPEG_DECODE_FRAME`:
                             A video frame was successfully decoded.

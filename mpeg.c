@@ -293,7 +293,6 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
         }
 
         if (decoded && player->frame) {
-            //pvr_wait_ready();
             pvr_scene_begin();
             pvr_list_begin(player->list_type);
 
@@ -381,12 +380,12 @@ mpeg_play_result_t mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons) {
 }
 
 mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
-    if (!player || !player->decoder)
+    if(!player || !player->decoder)
         return MPEG_DECODE_ERROR;
 
     static uint64_t start_time = 0;
-    if (start_time == 0) {
-        // Prime the first frame
+    if(start_time == 0) {
+        /* Prime the first frame */
         player->frame = plm_decode_video(player->decoder);
         if (!player->frame)
             return MPEG_DECODE_EOF;
@@ -399,38 +398,38 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
     uint64_t elapsed_ns = timer_ns_gettime64() - start_time;
     double last_time = elapsed_ns * 1e-9f;
 
-    // Poll audio regardless
-    if (player->video_time > player->audio_time && last_time > player->audio_time)
+    /* Poll audio regardless */
+    if(player->video_time > player->audio_time && last_time > player->audio_time)
         snd_stream_poll(player->snd_hnd);
 
-    // Check if it's time to decode the next frame
-    if (last_time >= player->video_time) {
+    /* Check if it's time to decode the next frame */
+    if(last_time >= player->video_time) {
         player->frame = plm_decode_video(player->decoder);
-
-        if (!player->frame) {
-            if (plm_get_loop(player->decoder)) {
-                // Reset and restart
-                player->snd_mod_size = 0;
-                player->snd_mod_start = 0;
-                player->audio_time = 0.0f;
-                player->video_time = 0.0f;
-
-                snd_stream_stop(player->snd_hnd);
-                snd_stream_start(player->snd_hnd, player->sample_rate, 0);
-
-                player->frame = plm_decode_video(player->decoder);
-                if (!player->frame)
-                    return MPEG_DECODE_EOF;
-
-                player->video_time = player->frame->time;
-                start_time = timer_ns_gettime64();
-                return MPEG_DECODE_FRAME;
-            } else {
-                return MPEG_DECODE_EOF;
-            }
+        if(player->frame) {
+            player->video_time = player->frame->time;
+            return MPEG_DECODE_FRAME;
         }
 
+        /* Are we looping? */
+        if(!plm_get_loop(player->decoder))
+            return MPEG_DECODE_EOF;
+
+        /* We are Looping. Reset and restart */
+        player->snd_mod_size = 0;
+        player->snd_mod_start = 0;
+        player->audio_time = 0.0f;
+        player->video_time = 0.0f;
+
+        snd_stream_stop(player->snd_hnd);
+        snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+
+        player->frame = plm_decode_video(player->decoder);
+        if(!player->frame)
+            return MPEG_DECODE_EOF;
+
         player->video_time = player->frame->time;
+        start_time = timer_ns_gettime64();
+
         return MPEG_DECODE_FRAME;
     }
 
