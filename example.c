@@ -1,4 +1,5 @@
 #include <kos.h>
+
 #include "mpeg.h"
 
 int main(void) {
@@ -27,26 +28,26 @@ int main(void) {
     // };
     // mpeg_play_ex(player, &skip_opts);
 
-    //mpeg_play(player, CONT_START);
+    mpeg_play(player, CONT_START);
 
-    mpeg_snd_stream_start(player);
+    // mpeg_snd_stream_start(player);
 
-    while(1) {
-        mpeg_decode_step(player);
+    // while(1) {
+    //     mpeg_decode_step(player);
 
-        /* Render */
-        pvr_wait_ready();
-        pvr_scene_begin();
+    //     /* Render */
+    //     pvr_wait_ready();
+    //     pvr_scene_begin();
 
-        mpeg_upload_frame(player);
+    //     mpeg_upload_frame(player);
 
-        pvr_list_begin(PVR_LIST_TR_POLY);
+    //     pvr_list_begin(PVR_LIST_TR_POLY);
 
-        mpeg_draw_frame(player);
+    //     mpeg_draw_frame(player);
 
-        pvr_list_finish();
-        pvr_scene_finish();
-    }
+    //     pvr_list_finish();
+    //     pvr_scene_finish();
+    // }
 
     mpeg_player_destroy(player);
 

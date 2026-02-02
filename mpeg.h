@@ -33,8 +33,71 @@ extern "C" {
 
 #include <dc/pvr/pvr_header.h>
 
-/* You can also define PLM_MALLOC, PLM_REALLOC and PLM_FREE to provide your own
-   memory management functions. */
+/**
+    \defgroup mpeg_memory_management Memory Management Customization
+    \ingroup mpeg_playback
+
+    This library allows the use of custom memory allocation routines by defining a
+    set of macros **before** including the MPEG header. This is useful for integrating
+    with custom allocators, memory tracking systems, or memory pools (e.g. in-game memory arenas).
+
+    If you wish to override **any** of the memory macros below, you **must define all of them** to ensure
+    consistent behavior and prevent mismatched allocation/free errors.
+    ---
+    ### General Memory Allocation
+
+    These macros control how memory is allocated for internal MPEG player structures,
+    decoder state, and temporary buffers allocated on the SH-4 side:
+
+    If not defined, the library will default to standard libc functions:
+    ```c
+    #define MPEG_MALLOC(sz)        malloc(sz)
+    #define MPEG_FREE(p)           free(p)
+    #define MPEG_REALLOC(p, sz)    realloc((p), (sz))
+    #define MPEG_MEMALIGN(a, sz)   memalign((a), (sz))
+    ```
+    ---
+    ### PVR (Video) Memory Allocation
+
+    These macros control how video frame textures are allocated in PVR (Video RAM):
+
+    If not defined, the library uses KallistiOS PVR memory functions:
+    ```c
+    #define MPEG_PVR_MALLOC(sz)    pvr_mem_malloc(sz)
+    #define MPEG_PVR_FREE(p)       pvr_mem_free(p)
+    ```
+    ---
+    ### Custom Usage Example
+
+    To use your own memory functions, define all of the following before including `mpeg.h`:
+
+    ```c
+    #define MPEG_MALLOC(sz)        my_malloc(sz)
+    #define MPEG_FREE(p)           my_free(p)
+    #define MPEG_REALLOC(p, sz)    my_realloc((p), (sz))
+    #define MPEG_MEMALIGN(a, sz)   my_memalign((a), (sz))
+
+    #define MPEG_PVR_MALLOC(sz)    my_pvr_alloc(sz)
+    #define MPEG_PVR_FREE(p)       my_pvr_free(p)
+
+    #include "mpeg.h"
+    ```
+
+    Failing to define the **full set** will result in compile error.
+*/
+
+/* --- Compile-time check for consistent memory macro overrides --- */
+#if defined(MPEG_MALLOC) || defined(MPEG_FREE) || defined(MPEG_REALLOC) || defined(MPEG_MEMALIGN)
+    #if !defined(MPEG_MALLOC) || !defined(MPEG_FREE) || !defined(MPEG_REALLOC) || !defined(MPEG_MEMALIGN)
+        #error "If you override any MPEG memory macros (MPEG_MALLOC, MPEG_FREE, etc), you must override ALL of them."
+    #endif
+#endif
+
+#if defined(MPEG_PVR_MALLOC) || defined(MPEG_PVR_FREE)
+    #if !defined(MPEG_PVR_MALLOC) || !defined(MPEG_PVR_FREE)
+        #error "If you override MPEG_PVR_MALLOC or MPEG_PVR_FREE, you must override BOTH."
+    #endif
+#endif
 
 #ifndef MPEG_MALLOC
 	#define MPEG_MALLOC(sz)      malloc(sz)
@@ -151,6 +214,19 @@ int mpeg_player_get_loop(mpeg_player_t *player);
  */
 void mpeg_player_set_loop(mpeg_player_t *player, int loop);
 
+/**
+    \brief   Sets the volume of the MPEG player's audio output.
+    \ingroup mpeg_playback
+
+    This function adjusts the playback volume for the MPEG player's audio stream.
+    The volume value should be in the range 0 (mute) to 255 (maximum volume).
+
+    \param   player  The MPEG player instance to configure.
+    \param   volume  An unsigned 8-bit integer specifying the desired volume level.
+                     A value of 0 mutes the audio; 255 is the maximum volume.
+ */
+void mpeg_player_set_volume(mpeg_player_t *player, uint8_t volume);
+
 /** \brief   Destroy an MPEG player instance.
     \ingroup mpeg_playback
 
@@ -174,8 +250,10 @@ void mpeg_player_destroy(mpeg_player_t *player);
     \param  player          The MPEG player instance used for playback. Must be initialized.
     \param  cancel_buttons  A bit mask of controller buttons that can cancel the playback.
     \return                 An integer indicating the reason for playback termination.
-                            Returns -1 if player or decoder is NULL. Returns a non-negative
-                            value representing cancellation status otherwise.
+                            Returns -1 if the player or decoder is NULL.
+                            Returns 1 if cancelled via controller or keyboard.
+                            Returns 2 if cancelled via reset combo (ABXY+START).
+                            Returns 0 if playback finished normally.
 */
 int mpeg_play(mpeg_player_t *player, uint32_t cancel_buttons);
 
@@ -212,7 +290,7 @@ typedef struct mpeg_cancel_options_t {
     uint32_t pad_button_combo;  /* All of these must be held to cancel */
 
     /* Keyboard */
-    const uint16_t *kbd_keys_any;   /* Array of keys - cancel if any pressed*/
+    const uint16_t *kbd_keys_any;   /* Array of keys - cancel if any pressed */
     size_t kbd_keys_any_count;
 
     const uint16_t *kbd_keys_combo; /* Array of keys - Cancel only if all of these keys are pressed */
@@ -292,8 +370,8 @@ void mpeg_draw_frame(mpeg_player_t *player);
     \ingroup mpeg_playback
 
     Starts the Dreamcast AICA sound streaming system for MPEG playback. This is
-    typically used when integrating MPEG decoding into custom loops, and may be
-    automatically called by `mpeg_play()` or `mpeg_play_ex()`.
+    typically used when integrating MPEG decoding into custom loops using
+    mpeg_decode_step().
 
     \param  player      The MPEG player instance. Must be initialized.
  */

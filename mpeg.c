@@ -112,7 +112,6 @@ static int mpeg_check_cancel(const mpeg_cancel_options_t *opt) {
 
         if(opt->kbd_keys_combo_count && all_pressed)
             return 1;
-
     MAPLE_FOREACH_END()
 
     return 0;
@@ -219,11 +218,11 @@ mpeg_player_t *mpeg_player_create_memory_ex(unsigned char *memory, const size_t 
 }
 
 mpeg_player_t *mpeg_player_create(const char *filename) {
-    return mpeg_player_create_ex(filename, &default_options);
+    return mpeg_player_create_ex(filename, NULL);
 }
 
 mpeg_player_t *mpeg_player_create_memory(uint8_t *memory, const size_t length) {
-    return mpeg_player_create_memory_ex(memory, length, &default_options);
+    return mpeg_player_create_memory_ex(memory, length, NULL);
 }
 
 int mpeg_player_get_loop(mpeg_player_t *player) {
@@ -232,6 +231,10 @@ int mpeg_player_get_loop(mpeg_player_t *player) {
 
 void mpeg_player_set_loop(mpeg_player_t *player, int loop) {
     plm_set_loop(player->decoder, loop);
+}
+
+void mpeg_player_set_volume(mpeg_player_t *player, uint8_t volume) {
+    snd_stream_volume(player->snd_hnd, volume);
 }
 
 void mpeg_player_destroy(mpeg_player_t *player) {
