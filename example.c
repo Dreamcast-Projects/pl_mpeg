@@ -31,10 +31,7 @@ int main(void) {
 
     //mpeg_play(player, CONT_START);
 
-    mpeg_snd_stream_start(player);
-
-    mpeg_decode_result_t decode_result = MPEG_DECODE_IDLE;
-    while(!done) {
+    while(1) {
         MAPLE_FOREACH_BEGIN(MAPLE_FUNC_CONTROLLER, cont_state_t, st)
             if(CONT_START && ((st->buttons & CONT_START) == CONT_START)) {
                 /* Push cancel buttons */
@@ -42,7 +39,10 @@ int main(void) {
             }
         MAPLE_FOREACH_END()
 
-        decode_result = mpeg_decode_step(player);
+        if(done)
+            break;
+
+        mpeg_decode_result_t decode_result = mpeg_decode_step(player);
         if(decode_result == MPEG_DECODE_EOF)
             break;
 

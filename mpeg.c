@@ -385,6 +385,9 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
 
     static uint64_t start_time = 0;
     if(start_time == 0) {
+        /* Init sound stream. */
+        snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+
         /* Prime the first frame */
         player->frame = plm_decode_video(player->decoder);
         if (!player->frame)
