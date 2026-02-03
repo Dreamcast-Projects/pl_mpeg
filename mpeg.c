@@ -272,14 +272,13 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
     snd_stream_stop(player->snd_hnd);
     snd_stream_start(player->snd_hnd, player->sample_rate, 0);
 
-    double last_time = -1.0f;
     player->frame = plm_decode_video(player->decoder);
     player->video_time = player->frame->time;
     uint64_t start = timer_ns_gettime64();
     uint64_t elapsed = timer_ns_gettime64() - start;
 
     while(true) {
-        last_time = elapsed * 1e-9f;
+        double playback_time = elapsed * 1e-9f;
 
         /* Check cancel matching */
         int cancel = mpeg_check_cancel(cancel_options);
@@ -291,7 +290,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
         /* Poll audio regardless */
         snd_stream_poll(player->snd_hnd);
 
-        if(last_time >= player->video_time) {
+        if(playback_time >= player->video_time) {
             /* Render the current frame */
             pvr_scene_begin();
             pvr_list_begin(player->list_type);
@@ -376,13 +375,13 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
     }
 
     uint64_t elapsed = timer_ns_gettime64() - start_time;
-    double last_time = elapsed * 1e-9f;
+    double playback_time = elapsed * 1e-9f;
 
     /* Poll audio regardless */
     snd_stream_poll(player->snd_hnd);
 
     /* Check if it's time to decode the next frame */
-    if(last_time >= player->video_time) {
+    if(playback_time >= player->video_time) {
         player->frame = plm_decode_video(player->decoder);
         if(player->frame) {
             player->video_time = player->frame->time;
