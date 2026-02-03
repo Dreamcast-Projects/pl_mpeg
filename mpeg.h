@@ -86,29 +86,49 @@ extern "C" {
     Failing to define the **full set** will result in compile error.
 */
 
-/* --- Compile-time check for consistent memory macro overrides --- */
-#if defined(MPEG_MALLOC) || defined(MPEG_FREE) || defined(MPEG_REALLOC) || defined(MPEG_MEMALIGN)
-    #if !defined(MPEG_MALLOC) || !defined(MPEG_FREE) || !defined(MPEG_REALLOC) || !defined(MPEG_MEMALIGN)
+/* --- Compile-time check for consistent macro overrides --- */
+#if defined(MPEG_MALLOC) || defined(MPEG_FREE) || defined(MPEG_REALLOC) || \
+    defined(MPEG_MEMALIGN) || defined(MPEG_MEMZERO)
+    #if !defined(MPEG_MALLOC) || !defined(MPEG_FREE) || !defined(MPEG_REALLOC) || \
+        !defined(MPEG_MEMALIGN) || !defined(MPEG_MEMZERO)
         #error "If you override any MPEG memory macros (MPEG_MALLOC, MPEG_FREE, etc), you must override ALL of them."
     #endif
+#else
+	#define MPEG_MALLOC(sz)      malloc(sz)
+	#define MPEG_FREE(p)         free(p)
+	#define MPEG_REALLOC(p, sz)  realloc((p), (sz))
+    #define MPEG_MEMALIGN(a, sz) memalign((a), (sz))
+    #define MPEG_MEMZERO(p, sz)  memset(p, 0, sz)
 #endif
 
 #if defined(MPEG_PVR_MALLOC) || defined(MPEG_PVR_FREE)
     #if !defined(MPEG_PVR_MALLOC) || !defined(MPEG_PVR_FREE)
         #error "If you override MPEG_PVR_MALLOC or MPEG_PVR_FREE, you must override BOTH."
     #endif
-#endif
-
-#ifndef MPEG_MALLOC
-	#define MPEG_MALLOC(sz)      malloc(sz)
-	#define MPEG_FREE(p)         free(p)
-	#define MPEG_REALLOC(p, sz)  realloc((p), (sz))
-    #define MPEG_MEMALIGN(a, sz) memalign((a), (sz))
-#endif
-
-#ifndef MPEG_PVR_MALLOC
+#else
 	#define MPEG_PVR_MALLOC(sz)  pvr_mem_malloc(sz)
 	#define MPEG_PVR_FREE(p)     pvr_mem_free(p)
+#endif
+
+#if defined(MPEG_FILE_TYPE) || defined(MPEG_FILE_INVALID_HANDLE) || \
+    defined(MPEG_FILE_OPEN) || defined(MPEG_FILE_CLOSE)          || \
+    defined(MPEG_FILE_SEEK) || defined(MPEG_FILE_READ)           || \
+    defined(MPEG_FILE_TELL)
+
+    #if !defined(MPEG_FILE_TYPE) || !defined(MPEG_FILE_INVALID_HANDLE) || \
+        !defined(MPEG_FILE_OPEN) || !defined(MPEG_FILE_CLOSE)          || \
+        !defined(MPEG_FILE_SEEK) || !defined(MPEG_FILE_READ)           || \
+        !defined(MPEG_FILE_TELL)
+        #error "If you override any MPEG_FILE_* macro, you must override all: TYPE, INVALID_HANDLE, OPEN, CLOSE, SEEK, READ, TELL."
+    #endif
+#else
+    #define MPEG_FILE_TYPE                 file_t
+    #define MPEG_FILE_INVALID_HANDLE       FILEHND_INVALID
+    #define MPEG_FILE_OPEN(fn)             fs_open((fn), O_RDONLY)
+    #define MPEG_FILE_CLOSE(fh)            fs_close((fh))
+    #define MPEG_FILE_SEEK(fh, off, st)    fs_seek((fh), (off), (st))
+    #define MPEG_FILE_READ(fh, buf, size)  fs_read((fh), (buf), (size))
+    #define MPEG_FILE_TELL(fh)             fs_tell((fh))
 #endif
 
 typedef struct mpeg_player_t mpeg_player_t;

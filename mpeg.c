@@ -42,6 +42,9 @@ struct mpeg_player_t {
 
     /* Vertices for rendering the video frame */
     pvr_vertex_t vert[4];
+
+    /* Start time for a/v sync */
+    uint64_t start_time;
 };
 
 /* Output texture width and height initial values
@@ -72,10 +75,12 @@ static uint32_t next_power_of_two(uint32_t n) {
 }
 
 static inline void sound_stream_reset(mpeg_player_t *player) {
-    if (!player)
+    if(!player)
         return;
 
-    snd_stream_stop(player->snd_hnd);
+    if(player->start_time != 0)
+        snd_stream_stop(player->snd_hnd);
+
     player->snd_mod_size = 0;
     player->snd_mod_start = 0;
 }
@@ -142,6 +147,8 @@ mpeg_player_t *mpeg_player_create_ex(const char *filename, const mpeg_player_opt
         return NULL;
     }
 
+    MPEG_MEMZERO(player, sizeof(mpeg_player_t));
+
     player->decoder = plm_create_with_filename(filename);
     if(!player->decoder) {
         fprintf(stderr, "Out of memory for player->decoder\n");
@@ -187,6 +194,8 @@ mpeg_player_t *mpeg_player_create_memory_ex(unsigned char *memory, const size_t 
         fprintf(stderr, "Out of memory for player\n");
         return NULL;
     }
+
+    MPEG_MEMZERO(player, sizeof(mpeg_player_t));
 
     player->decoder = plm_create_with_memory(memory, length, 1);
     if(!player->decoder) {
@@ -267,7 +276,6 @@ void mpeg_player_destroy(mpeg_player_t *player) {
 
 mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options_t *cancel_options) {
     mpeg_play_result_t result = MPEG_PLAY_NORMAL;
-    uint64_t start = 0;
 
     if(!player || !player->decoder)
         return MPEG_PLAY_ERROR;
@@ -278,10 +286,12 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
 
     player->frame = plm_decode_video(player->decoder);
     if(!player->frame) {
-        result = MPEG_PLAY_ERROR;
-        goto finish;
+        /* Reset some stuff */
+        sound_stream_reset(player);
+
+        return MPEG_PLAY_ERROR;
     }
-    start = timer_ns_gettime64();
+    uint64_t start = timer_ns_gettime64();
 
     while(true) {
         /* Get elapsed playback time */
@@ -351,8 +361,7 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
     if(!player || !player->decoder)
         return MPEG_DECODE_ERROR;
 
-    static uint64_t start_time = 0;
-    if(start_time == 0) {
+    if(player->start_time == 0) {
         /* Init sound stream. */
         sound_stream_reset(player);
         snd_stream_start(player->snd_hnd, player->sample_rate, 0);
@@ -362,12 +371,12 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
         if(!player->frame)
             return MPEG_DECODE_EOF;
 
-        start_time = timer_ns_gettime64();
+        player->start_time = timer_ns_gettime64();
         return MPEG_DECODE_FRAME;
     }
 
     /* Get elapsed playback time */
-    double playback_time = (timer_ns_gettime64() - start_time) * 1e-9f;
+    double playback_time = (timer_ns_gettime64() - player->start_time) * 1e-9f;
 
     /* Poll audio regardless */
     snd_stream_poll(player->snd_hnd);
@@ -394,7 +403,7 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
             return MPEG_DECODE_EOF;
         }
 
-        start_time = timer_ns_gettime64();
+        player->start_time = timer_ns_gettime64();
 
         return MPEG_DECODE_FRAME;
     }
