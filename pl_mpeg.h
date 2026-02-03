@@ -988,6 +988,7 @@ void plm_destroy(plm_t *self) {
 
 	plm_demux_destroy(self->demux);
 	PLM_FREE(self);
+	self = NULL;
 }
 
 int plm_get_audio_enabled(plm_t *self) {
@@ -1503,6 +1504,7 @@ void plm_buffer_destroy(plm_buffer_t *self) {
 	}
 	if (self->free_when_done) {
 		PLM_FREE(self->bytes);
+		self->bytes = NULL;
 	}
 	PLM_FREE(self);
 }
@@ -1815,6 +1817,7 @@ void plm_demux_destroy(plm_demux_t *self) {
 		plm_buffer_destroy(self->buffer);
 	}
 	PLM_FREE(self);
+	self = NULL;
 }
 
 int plm_demux_has_headers(plm_demux_t *self) {
@@ -2739,9 +2742,11 @@ void plm_video_destroy(plm_video_t *self) {
 
 	if (self->has_sequence_header) {
 		PLM_FREE(self->frames_data);
+		self->frames_data = NULL;
 	}
 
 	PLM_FREE(self);
+	self = NULL;
 }
 
 float plm_video_get_framerate(plm_video_t *self) {
@@ -4309,6 +4314,7 @@ void plm_audio_destroy(plm_audio_t *self) {
 		plm_buffer_destroy(self->buffer);
 	}
 	PLM_FREE(self);
+	self = NULL;
 }
 
 int plm_audio_has_header(plm_audio_t *self) {

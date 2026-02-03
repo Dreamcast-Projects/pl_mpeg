@@ -13,10 +13,10 @@ int main(void) {
         .player_list_type   = PVR_LIST_TR_POLY,
         .player_filter_mode = PVR_FILTER_BILINEAR,
         .player_volume      = 127,
-        .player_loop        = false
+        .player_loop        = true
     };
 
-    player = mpeg_player_create_ex("/rd/ManiaHP.mpg", &default_options);
+    player = mpeg_player_create_ex("/rd/sample.mpg", &default_options);
     if(player == NULL)
         return -1;
 

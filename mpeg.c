@@ -240,14 +240,20 @@ void mpeg_player_destroy(mpeg_player_t *player) {
     if(!player)
         return;
 
-    if(player->decoder)
+    if(player->decoder) {
         plm_destroy(player->decoder);
+        player->decoder = NULL;
+    }
 
-    if(player->texture)
+    if(player->texture) {
         MPEG_PVR_FREE(player->texture);
+        player->texture = NULL;
+    }
 
-    if(player->snd_buf)
+    if(player->snd_buf) {
         MPEG_FREE(player->snd_buf);
+        player->snd_buf = NULL;
+    }
 
     if(player->snd_hnd != SND_STREAM_INVALID)
         snd_stream_destroy(player->snd_hnd);
