@@ -402,27 +402,6 @@ void mpeg_upload_frame(mpeg_player_t *player);
  */
 void mpeg_draw_frame(mpeg_player_t *player);
 
-/** \brief   Start the audio stream for MPEG playback.
-    \ingroup mpeg_playback
-
-    Starts the Dreamcast AICA sound streaming system for MPEG playback. This is
-    typically used when integrating MPEG decoding into custom loops using
-    mpeg_decode_step().
-
-    \param  player      The MPEG player instance. Must be initialized.
- */
-void mpeg_snd_stream_start(mpeg_player_t *player);
-
-/** \brief   Stop the audio stream for MPEG playback.
-    \ingroup mpeg_playback
-
-    Stops the audio stream started with `mpeg_snd_stream_start()`. This function is
-    typically used in cleanup or when pausing playback externally.
-
-    \param  player      The MPEG player instance. Must be initialized.
- */
-void mpeg_snd_stream_stop(mpeg_player_t *player);
-
 #ifdef __cplusplus
 }
 #endif
