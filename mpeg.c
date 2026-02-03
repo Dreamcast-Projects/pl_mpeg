@@ -3,7 +3,6 @@
 #define PL_MPEG_IMPLEMENTATION
 #include "pl_mpeg.h"
 
-
 struct mpeg_player_t {
     /* MPEG decoder */
     plm_t *decoder;
@@ -270,15 +269,11 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
     double last_time = -1.0f;
     player->frame = plm_decode_video(player->decoder);
     player->video_time = player->frame->time;
-    int decoded = 1;
     uint64_t start = timer_ns_gettime64();
     uint64_t elapsed = timer_ns_gettime64() - start;
 
     while(true) {
         last_time = elapsed * 1e-9f;
-
-        if((player->video_time > player->audio_time) && last_time > player->audio_time)
-            snd_stream_poll(player->snd_hnd);
 
         /* Check cancel matching */
         int cancel = mpeg_check_cancel(cancel_options);
@@ -287,7 +282,11 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
             goto finish;
         }
 
-        if(decoded && player->frame) {
+        /* Poll audio regardless */
+        snd_stream_poll(player->snd_hnd);
+
+        if(last_time >= player->video_time) {
+            /* Render the current frame */
             pvr_scene_begin();
             pvr_list_begin(player->list_type);
 
@@ -296,13 +295,11 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
 
             pvr_list_finish();
             pvr_scene_finish();
-        }
 
-        if(last_time >= player->video_time) {
+            /* Decode the NEXT frame to have it ready */
             player->frame = plm_decode_video(player->decoder);
             if(player->frame) {
                 player->video_time = player->frame->time;
-                decoded = 1;
             } else {
                 /* Are we looping? */
                 if(!plm_get_loop(player->decoder)) {
@@ -310,7 +307,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
                     goto finish;
                 }
 
-                /* We are Looping. Reset and restart */
+                /* We are looping. Reset and restart */
                 player->snd_mod_size = 0;
                 player->snd_mod_start = 0;
                 player->audio_time = 0.0f;
@@ -325,18 +322,15 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
                     goto finish;
                 }
                 player->video_time = player->frame->time;
-                decoded = 1;
                 start = timer_ns_gettime64();
             }
-        } else {
-            decoded = 0;
         }
 
         elapsed = timer_ns_gettime64() - start;
     }
 
-    /* Reset some stuff */
 finish:
+    /* Reset some stuff */
     player->snd_mod_size = 0;
     player->snd_mod_start = 0;
     player->audio_time = 0.0f;
@@ -375,12 +369,11 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
         return MPEG_DECODE_FRAME;
     }
 
-    uint64_t elapsed_ns = timer_ns_gettime64() - start_time;
-    double last_time = elapsed_ns * 1e-9f;
+    uint64_t elapsed = timer_ns_gettime64() - start_time;
+    double last_time = elapsed * 1e-9f;
 
     /* Poll audio regardless */
-    if(player->video_time > player->audio_time && last_time > player->audio_time)
-        snd_stream_poll(player->snd_hnd);
+    snd_stream_poll(player->snd_hnd);
 
     /* Check if it's time to decode the next frame */
     if(last_time >= player->video_time) {
