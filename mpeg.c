@@ -267,6 +267,7 @@ void mpeg_player_destroy(mpeg_player_t *player) {
 
 mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options_t *cancel_options) {
     mpeg_play_result_t result = MPEG_PLAY_NORMAL;
+    uint64_t start = 0;
 
     if(!player || !player->decoder)
         return MPEG_PLAY_ERROR;
@@ -280,7 +281,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
         result = MPEG_PLAY_ERROR;
         goto finish;
     }
-    uint64_t start = timer_ns_gettime64();
+    start = timer_ns_gettime64();
 
     while(true) {
         /* Get elapsed playback time */
