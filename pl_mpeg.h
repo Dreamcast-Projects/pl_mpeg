@@ -988,6 +988,9 @@ int plm_init_decoders(plm_t *self) {
 }
 
 void plm_destroy(plm_t *self) {
+	if(!self)
+		return;
+
 	if (self->video_decoder) {
 		plm_video_destroy(self->video_decoder);
 	}
@@ -1508,6 +1511,9 @@ plm_buffer_t *plm_buffer_create_for_appending(size_t initial_capacity) {
 }
 
 void plm_buffer_destroy(plm_buffer_t *self) {
+	if(!self)
+		return;
+
 	if ((self->fh != PLM_FILE_INVALID_HANDLE) && self->close_when_done) {
 		PLM_FILE_CLOSE(self->fh);
 	}
@@ -1516,6 +1522,7 @@ void plm_buffer_destroy(plm_buffer_t *self) {
 		self->bytes = NULL;
 	}
 	PLM_FREE(self);
+	self = NULL;
 }
 
 size_t plm_buffer_get_size(plm_buffer_t *self) {
@@ -1822,6 +1829,9 @@ plm_demux_t *plm_demux_create(plm_buffer_t *buffer, int destroy_when_done) {
 }
 
 void plm_demux_destroy(plm_demux_t *self) {
+	if(!self)
+		return;
+
 	if (self->destroy_buffer_when_done) {
 		plm_buffer_destroy(self->buffer);
 	}
@@ -2745,6 +2755,9 @@ plm_video_t * plm_video_create_with_buffer(plm_buffer_t *buffer, int destroy_whe
 }
 
 void plm_video_destroy(plm_video_t *self) {
+	if(!self)
+		return;
+
 	if (self->destroy_buffer_when_done) {
 		plm_buffer_destroy(self->buffer);
 	}
@@ -4319,6 +4332,9 @@ plm_audio_t *plm_audio_create_with_buffer(plm_buffer_t *buffer, int destroy_when
 }
 
 void plm_audio_destroy(plm_audio_t *self) {
+	if(!self)
+		return;
+
 	if (self->destroy_buffer_when_done) {
 		plm_buffer_destroy(self->buffer);
 	}
@@ -4363,6 +4379,10 @@ int plm_audio_has_ended(plm_audio_t *self) {
 }
 
 plm_samples_t *plm_audio_decode(plm_audio_t *self) {
+	if (!self || !self->buffer) {
+		return NULL;
+	}
+
 	// Do we have at least enough information to decode the frame header?
 	if (!self->next_frame_data_size) {
 		if (!plm_buffer_has(self->buffer, 48)) {
