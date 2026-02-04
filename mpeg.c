@@ -288,7 +288,6 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
     if(!player->frame) {
         /* Reset some stuff */
         sound_stream_reset(player);
-
         return MPEG_PLAY_ERROR;
     }
     uint64_t start = timer_ns_gettime64();
@@ -372,6 +371,9 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
             return MPEG_DECODE_EOF;
 
         player->start_time = timer_ns_gettime64();
+
+        /* Poll first thing as well since we have a video frame ready */
+        snd_stream_poll(player->snd_hnd);
         return MPEG_DECODE_FRAME;
     }
 

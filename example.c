@@ -1,40 +1,93 @@
-#include <kos.h>
+/**
+ * \file example.c
+ * \brief MPEG Playback Example for Dreamcast
+ *
+ * This example demonstrates three ways to use the MPEG library:
+ * - Simple legacy usage
+ * - Recommended extended usage with cancel options
+ * - Manual control (decode + render loop)
+ *
+ * Only one example should be called from `main()`. Comment out others.
+ *
+ * ---
+ * ## 🔧 Custom Memory and File Handling
+ * You can override allocators or file ops by defining these macros **before** including mpeg.h:
+ *
+ * ```c
+ * #define MPEG_MALLOC(sz)           my_malloc(sz)
+ * #define MPEG_FREE(p)              my_free(p)
+ * #define MPEG_REALLOC(p, sz)       my_realloc(p, sz)
+ * #define MPEG_MEMALIGN(a, sz)      my_memalign(a, sz)
+ * #define MPEG_MEMZERO(p, sz)       my_memzero(p, sz)
+ *
+ * #define MPEG_PVR_MALLOC(sz)       my_pvr_malloc(sz)
+ * #define MPEG_PVR_FREE(p)          my_pvr_free(p)
+ *
+ * #define MPEG_FILE_TYPE            my_file_t
+ * #define MPEG_FILE_INVALID_HANDLE  MY_INVALID_HANDLE
+ * #define MPEG_FILE_OPEN(fn)        my_file_open(fn)
+ * #define MPEG_FILE_CLOSE(fh)       my_file_close(fh)
+ * #define MPEG_FILE_SEEK(...)       my_file_seek(...)
+ * #define MPEG_FILE_READ(...)       my_file_read(...)
+ * #define MPEG_FILE_TELL(fh)        my_file_tell(fh)
+ * ```
+ */
 
+#include <kos.h>
 #include "mpeg.h"
 
-int main(void) {
-    bool done = false;
-    pvr_init_defaults();
-    snd_stream_init();
+/* --- 1. Simple API (Legacy) --- */
+static void play_simple(void) {
+    mpeg_player_t *player = mpeg_player_create("/rd/sample.mpg");
+    if(!player)
+        return;
 
-    mpeg_player_t *player;
+    mpeg_player_set_loop(player, 1);
+    mpeg_play(player, CONT_START);
+    mpeg_player_destroy(player);
+}
 
-    static const mpeg_player_options_t default_options = {
-        .player_list_type   = PVR_LIST_TR_POLY,
+/* --- 2. Extended API (Recommended) --- */
+static void play_extended(void) {
+    static const mpeg_player_options_t options = {
+        .player_list_type   = PVR_LIST_OP_POLY,
         .player_filter_mode = PVR_FILTER_BILINEAR,
-        .player_volume      = 127,
+        .player_volume      = 255,
         .player_loop        = true
     };
+    mpeg_player_t *player = mpeg_player_create_ex("/rd/sample.mpg", &options);
+    if(!player)
+        return;
 
-    player = mpeg_player_create_ex("/rd/sample.mpg", &default_options);
-    if(player == NULL)
-        return -1;
+    const mpeg_cancel_options_t cancel_opts = {
+        .pad_button_any = CONT_START,
+        .pad_button_combo = CONT_A | CONT_B,
+        .kbd_keys_any = (const uint16_t[]){ KBD_KEY_ENTER },
+        .kbd_keys_any_count = 1
+    };
+    mpeg_play_ex(player, &cancel_opts);
+    mpeg_player_destroy(player);
+}
 
-    //mpeg_player_set_loop(player, 1);
+/* --- 3. Manual Frame Control (Advanced) --- */
+static void play_manual(void) {
+    static const mpeg_player_options_t options = {
+        .player_list_type   = PVR_LIST_OP_POLY,
+        .player_filter_mode = PVR_FILTER_BILINEAR,
+        .player_volume      = 255,
+        .player_loop        = true
+    };
+    mpeg_player_t *player = mpeg_player_create_ex("/rd/sample.mpg", &options);
+    if(!player)
+        return;
 
-    // const mpeg_cancel_options_t skip_opts = {
-    //     .pad_button_any = CONT_START,
-    //     .kbd_keys_any = (const uint16_t[]){ KBD_KEY_ENTER, KBD_KEY_SPACE },
-    //     .kbd_keys_any_count = 2
-    // };
-    // mpeg_play_ex(player, &skip_opts);
+    bool done = false;
 
-    //mpeg_play(player, CONT_START);
-
-    while(1) {
+    /* Game Loop */
+    while(!done) {
+        /* Handle input (cancel) */
         MAPLE_FOREACH_BEGIN(MAPLE_FUNC_CONTROLLER, cont_state_t, st)
-            if(CONT_START && ((st->buttons & CONT_START) == CONT_START)) {
-                /* Push cancel buttons */
+            if((st->buttons & CONT_START) == CONT_START) {
                 done = true;
             }
         MAPLE_FOREACH_END()
@@ -42,15 +95,14 @@ int main(void) {
         if(done)
             break;
 
-        mpeg_decode_result_t decode_result = mpeg_decode_step(player);
-        if(decode_result == MPEG_DECODE_EOF)
+        mpeg_decode_result_t result = mpeg_decode_step(player);
+        if(result == MPEG_DECODE_EOF)
             break;
 
-        /* Render */
         pvr_scene_begin();
         pvr_list_begin(PVR_LIST_TR_POLY);
 
-        if(decode_result == MPEG_DECODE_FRAME)
+        if(result == MPEG_DECODE_FRAME)
             mpeg_upload_frame(player);
 
         mpeg_draw_frame(player);
@@ -60,6 +112,17 @@ int main(void) {
     }
 
     mpeg_player_destroy(player);
+}
+
+int main(void) {
+    pvr_init_defaults();
+    snd_stream_init();
+
+    /* --- Select one of the following to test --- */
+
+    play_simple();
+    //play_extended();
+    //play_manual();
 
     return 0;
 }
