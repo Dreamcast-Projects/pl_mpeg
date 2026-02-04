@@ -252,9 +252,9 @@ void mpeg_player_destroy(mpeg_player_t *player) {
     if(!player)
         return;
 
-    if(player->decoder) {
-        plm_destroy(player->decoder);
-        player->decoder = NULL;
+    if(player->snd_hnd != SND_STREAM_INVALID) {
+        snd_stream_stop(player->snd_hnd);
+        snd_stream_destroy(player->snd_hnd);
     }
 
     if(player->texture) {
@@ -267,8 +267,10 @@ void mpeg_player_destroy(mpeg_player_t *player) {
         player->snd_buf = NULL;
     }
 
-    if(player->snd_hnd != SND_STREAM_INVALID)
-        snd_stream_destroy(player->snd_hnd);
+    if(player->decoder) {
+        plm_destroy(player->decoder);
+        player->decoder = NULL;
+    }
 
     MPEG_FREE(player);
     player = NULL;
@@ -406,7 +408,6 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
         }
 
         player->start_time = timer_ns_gettime64();
-
         return MPEG_DECODE_FRAME;
     }
 
@@ -414,36 +415,49 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
 }
 
 void mpeg_upload_frame(mpeg_player_t *player) {
-    uint32_t *src;
-    int x, y, w, h, i;
-
     if(!player || !player->frame)
         return;
 
-    src = player->frame->display;
+    uint32_t *src = player->frame->display;
 
-    /* Calculate number of megablocks based on frame size */
-    w = player->frame->width >> 4;
-    h = player->frame->height >> 4;
+    /* Video size in megablocks (16x16 pixels) */
+    const int video_blocks_w = player->frame->width  >> 4;
+    const int video_blocks_h = player->frame->height >> 4;
 
-    int const min_blocks_x = 32 * (player->frame->width / 320) - w;
-    //int const min_blocks_y = 16 * (player->frame->height / 240) - h;
+    /*
+     * Number of padding megablocks required at the end of each row.
+     *
+     * The PVR YUV converter expects rows to be aligned to a fixed block width.
+     * For 320-wide video, this corresponds to 32 megablocks.
+     *
+     * Example:
+     *   320px video → 20 blocks
+     *   Required    → 32 blocks
+     *   Padding     → 12 dummy blocks
+     */
+    const int min_blocks_x = 32 * (player->frame->width / 320) - video_blocks_w;
 
     uint32_t *d = SQ_MASK_DEST((void *)PVR_TA_YUV_CONV);
     sq_lock((void *)PVR_TA_YUV_CONV);
 
     /* For each row of megablocks */
-    for(y = 0; y < h; y++) {
-        /* Copy one megablock from src to the YUV convertor */
-        for(x = 0; x < w; x++, src += 96) {
+    for(int y = 0; y < video_blocks_h; y++) {
+        /* Upload actual video megablocks for this row */
+        for(int x = 0; x < video_blocks_w; x++, src += 96) {
+            /*
+             * Each megablock is 384 bytes (96 uint32_t values).
+             * sq_fast_cpy copies in 32-byte units, hence 384 / 32 iterations.
+             */
             sq_fast_cpy(d, src, 384/32);
         }
 
-        /* Send a dummy megablock if required for padding */
-        for(i = 0; i < min_blocks_x * 384/32; i++) {
-            //d[0] = d[1] = d[2] = d[3] = d[4] = d[5] = d[6] = d[7] = 0;
+        /* Pad the remainder of the row with dummy megablocks, if required */
+        for(int i = 0; i < min_blocks_x * 384/32; i++) {
+            /*
+             * sq_flush emits an empty Store Queue write, effectively advancing
+             * the PVR’s internal megablock position without writing video data.
+             */
             sq_flush(d);
-            //d += 8;
         }
     }
 
@@ -470,6 +484,8 @@ void mpeg_draw_frame(mpeg_player_t *player) {
 static int setup_graphics(mpeg_player_t *player, pvr_filter_mode_t filter_mode) {
     pvr_poly_cxt_t cxt;
     float u, v;
+    float screen_width = (float)vid_mode->width;
+    float screen_height = (float)vid_mode->height;
     int color = PVR_PACK_COLOR(1.0f, 1.0f, 1.0f, 1.0f);
 
     player->width = plm_get_width(player->decoder);
@@ -514,7 +530,7 @@ static int setup_graphics(mpeg_player_t *player, pvr_filter_mode_t filter_mode) 
     player->vert[0].oargb = 0;
     player->vert[0].flags = PVR_CMD_VERTEX;
 
-    player->vert[1].x = 640.0f;
+    player->vert[1].x = screen_width;
     player->vert[1].y = 0.0f;
     player->vert[1].z = 1.0f;
     player->vert[1].u = u;
@@ -524,7 +540,7 @@ static int setup_graphics(mpeg_player_t *player, pvr_filter_mode_t filter_mode) 
     player->vert[1].flags = PVR_CMD_VERTEX;
 
     player->vert[2].x = 0.0f;
-    player->vert[2].y = 480.0f;
+    player->vert[2].y = screen_height;
     player->vert[2].z = 1.0f;
     player->vert[2].u = 0.0f;
     player->vert[2].v = v;
@@ -532,8 +548,8 @@ static int setup_graphics(mpeg_player_t *player, pvr_filter_mode_t filter_mode) 
     player->vert[2].oargb = 0;
     player->vert[2].flags = PVR_CMD_VERTEX;
 
-    player->vert[3].x = 640.0f;
-    player->vert[3].y = 480.0f;
+    player->vert[3].x = screen_width;
+    player->vert[3].y = screen_height;
     player->vert[3].z = 1.0f;
     player->vert[3].u = u;
     player->vert[3].v = v;
