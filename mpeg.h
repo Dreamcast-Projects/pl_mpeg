@@ -34,56 +34,73 @@ extern "C" {
 #include <dc/pvr/pvr_header.h>
 
 /**
-    \defgroup mpeg_memory_management Memory Management Customization
+    \defgroup mpeg_customization Build-Time Customization
     \ingroup mpeg_playback
 
-    This library allows the use of custom memory allocation routines by defining a
-    set of macros **before** including the MPEG header. This is useful for integrating
-    with custom allocators, memory tracking systems, or memory pools (e.g. in-game memory arenas).
+    The MPEG playback library supports compile-time customization of memory allocation,
+    video RAM usage, and file I/O. This is done via a set of macros that must be defined
+    **before including `mpeg.h`**.
 
-    If you wish to override **any** of the memory macros below, you **must define all of them** to ensure
-    consistent behavior and prevent mismatched allocation/free errors.
     ---
-    ### General Memory Allocation
+    ## Memory Allocation (`MPEG_*` macros)
 
-    These macros control how memory is allocated for internal MPEG player structures,
-    decoder state, and temporary buffers allocated on the SH-4 side:
+    These control how memory is allocated on the SH-4 side for the MPEG player and decoder.
 
-    If not defined, the library will default to standard libc functions:
+    If you do not define them, the following defaults are used:
+
     ```c
     #define MPEG_MALLOC(sz)        malloc(sz)
     #define MPEG_FREE(p)           free(p)
     #define MPEG_REALLOC(p, sz)    realloc((p), (sz))
     #define MPEG_MEMALIGN(a, sz)   memalign((a), (sz))
+    #define MPEG_MEMZERO(p, sz)    memset((p), 0, (sz))
     ```
+
+    If you override **any** of these, you **must override all five**.
+
     ---
-    ### PVR (Video) Memory Allocation
+    ## PVR (Video RAM) Allocation (`MPEG_PVR_*` macros)
 
-    These macros control how video frame textures are allocated in PVR (Video RAM):
+    These control how textures (video frames) are allocated in VRAM.
 
-    If not defined, the library uses KallistiOS PVR memory functions:
+    Defaults:
+
     ```c
     #define MPEG_PVR_MALLOC(sz)    pvr_mem_malloc(sz)
     #define MPEG_PVR_FREE(p)       pvr_mem_free(p)
     ```
-    ---
-    ### Custom Usage Example
 
-    To use your own memory functions, define all of the following before including `mpeg.h`:
+    If you override one, you must override both.
+
+    ---
+    ## File I/O (`MPEG_FILE_*` macros)
+
+    These define how the MPEG decoder opens and reads MPEG files.
+
+    If none are defined, the library uses KallistiOS file I/O:
 
     ```c
-    #define MPEG_MALLOC(sz)        my_malloc(sz)
-    #define MPEG_FREE(p)           my_free(p)
-    #define MPEG_REALLOC(p, sz)    my_realloc((p), (sz))
-    #define MPEG_MEMALIGN(a, sz)   my_memalign((a), (sz))
-
-    #define MPEG_PVR_MALLOC(sz)    my_pvr_alloc(sz)
-    #define MPEG_PVR_FREE(p)       my_pvr_free(p)
-
-    #include "mpeg.h"
+    #define MPEG_FILE_TYPE                 file_t
+    #define MPEG_FILE_INVALID_HANDLE       FILEHND_INVALID
+    #define MPEG_FILE_OPEN(fn)             fs_open((fn), O_RDONLY)
+    #define MPEG_FILE_CLOSE(fh)            fs_close((fh))
+    #define MPEG_FILE_SEEK(fh, off, st)    fs_seek((fh), (off), (st))
+    #define MPEG_FILE_READ(fh, buf, size)  fs_read((fh), (buf), (size))
+    #define MPEG_FILE_TELL(fh)             fs_tell((fh))
     ```
 
-    Failing to define the **full set** will result in compile error.
+    If you override **any one** of these macros, you must override **all seven** to ensure compatibility and prevent undefined behavior.
+
+    ---
+    ## Compile-time Enforcement
+
+    If you attempt a partial override (e.g. redefine only one macro from a group), compilation will fail with an error message. This ensures:
+
+    - Proper pairing of allocation and free functions
+    - Consistent file handle semantics
+    - Prevention of subtle memory or I/O bugs
+
+    Always define the **entire macro group** when customizing behavior.
 */
 
 /* --- Compile-time check for consistent macro overrides --- */
@@ -162,13 +179,35 @@ mpeg_player_t *mpeg_player_create(const char *filename);
 */
 mpeg_player_t *mpeg_player_create_memory(unsigned char *memory, const size_t length);
 
+/**
+ * \struct mpeg_player_options_t
+ * Playback options for MPEG player.
+ */
 typedef struct mpeg_player_options_t {
-    pvr_list_type_t   player_list_type;
-    pvr_filter_mode_t player_filter_mode;
-
-    uint8_t player_volume;
-    bool    player_loop;
+    pvr_list_type_t     list_type;    /**< PVR polygon list type */
+    pvr_filter_mode_t   filter_mode;  /**< Texture filter mode */
+    uint8_t             volume;       /**< Volume (0–255) */
+    bool                loop;         /**< Enable looping */
 } mpeg_player_options_t;
+
+/**
+ * \def MPEG_PLAYER_OPTIONS_INITIALIZER
+ * Default initializer for `mpeg_player_options_t`.
+ *
+ * Defaults:
+ * - `list_type`   = `PVR_LIST_OP_POLY`
+ * - `filter_mode` = `PVR_FILTER_BILINEAR`
+ * - `volume`      = `255`
+ * - `loop`        = `false`
+ *
+ * Example:
+ * ```c
+ * mpeg_player_options_t opts = MPEG_PLAYER_OPTIONS_INITIALIZER;
+ * opts.loop = true;
+ * ```
+ */
+#define MPEG_PLAYER_OPTIONS_INITIALIZER \
+    { PVR_LIST_OP_POLY, PVR_FILTER_BILINEAR, 255, false }
 
 /** \brief   Create an MPEG player instance with custom options.
     \ingroup mpeg_playback

@@ -55,7 +55,7 @@ static int mpeg_texture_height;
 /* Size of the sound buffer for both the SH4 side and the AICA side */
 #define SOUND_BUFFER (64 * 1024)
 
-static int setup_graphics(mpeg_player_t *player, pvr_filter_mode_t filter_mode);
+static int setup_graphics(mpeg_player_t *player, const mpeg_player_options_t *options);
 static int setup_audio(mpeg_player_t *player, uint8_t volume);
 static void fast_memcpy(void *dest, const void *src, size_t length);
 
@@ -125,16 +125,11 @@ static int mpeg_check_cancel(const mpeg_cancel_options_t *opt) {
 }
 
 /** Default MPEG player options used when NULL is passed to *_ex() functions. */
-static const mpeg_player_options_t default_options = {
-    .player_list_type   = PVR_LIST_OP_POLY,
-    .player_filter_mode = PVR_FILTER_BILINEAR,
-    .player_volume      = 255,
-    .player_loop        = false
-};
+static const mpeg_player_options_t MPEG_PLAYER_OPTIONS_DEFAULT = MPEG_PLAYER_OPTIONS_INITIALIZER;
 
 mpeg_player_t *mpeg_player_create_ex(const char *filename, const mpeg_player_options_t *options) {
     mpeg_player_t *player = NULL;
-    const mpeg_player_options_t *opts = options ? options : &default_options;
+    const mpeg_player_options_t *opts = options ? options : &MPEG_PLAYER_OPTIONS_DEFAULT;
 
     if(!filename) {
         fprintf(stderr, "filename is NULL\n");
@@ -148,6 +143,7 @@ mpeg_player_t *mpeg_player_create_ex(const char *filename, const mpeg_player_opt
     }
 
     MPEG_MEMZERO(player, sizeof(mpeg_player_t));
+    player->snd_hnd = SND_STREAM_INVALID;
 
     player->decoder = plm_create_with_filename(filename);
     if(!player->decoder) {
@@ -155,7 +151,7 @@ mpeg_player_t *mpeg_player_create_ex(const char *filename, const mpeg_player_opt
         mpeg_player_destroy(player);
         return NULL;
     }
-    plm_set_loop(player->decoder, opts->player_loop);
+    plm_set_loop(player->decoder, opts->loop);
 
     player->snd_buf = (uint32_t *)MPEG_MEMALIGN(32, SOUND_BUFFER);
     if(!player->snd_buf) {
@@ -164,14 +160,14 @@ mpeg_player_t *mpeg_player_create_ex(const char *filename, const mpeg_player_opt
         return NULL;
     }
 
-    player->list_type = opts->player_list_type;
-    if(setup_graphics(player, opts->player_filter_mode) < 0) {
+    player->list_type = opts->list_type;
+    if(setup_graphics(player, opts) < 0) {
         fprintf(stderr, "Setting up graphics failed\n");
         mpeg_player_destroy(player);
         return NULL;
     }
 
-    if(setup_audio(player, opts->player_volume) < 0) {
+    if(setup_audio(player, opts->volume) < 0) {
         fprintf(stderr, "Setting up audio failed\n");
         mpeg_player_destroy(player);
         return NULL;
@@ -182,7 +178,7 @@ mpeg_player_t *mpeg_player_create_ex(const char *filename, const mpeg_player_opt
 
 mpeg_player_t *mpeg_player_create_memory_ex(unsigned char *memory, const size_t length, const mpeg_player_options_t *options) {
     mpeg_player_t *player = NULL;
-    const mpeg_player_options_t *opts = options ? options : &default_options;
+    const mpeg_player_options_t *opts = options ? options : &MPEG_PLAYER_OPTIONS_DEFAULT;
 
     if(!memory) {
         fprintf(stderr, "memory is NULL\n");
@@ -196,6 +192,7 @@ mpeg_player_t *mpeg_player_create_memory_ex(unsigned char *memory, const size_t 
     }
 
     MPEG_MEMZERO(player, sizeof(mpeg_player_t));
+    player->snd_hnd = SND_STREAM_INVALID;
 
     player->decoder = plm_create_with_memory(memory, length, 1);
     if(!player->decoder) {
@@ -203,7 +200,7 @@ mpeg_player_t *mpeg_player_create_memory_ex(unsigned char *memory, const size_t 
         mpeg_player_destroy(player);
         return NULL;
     }
-    plm_set_loop(player->decoder, opts->player_loop);
+    plm_set_loop(player->decoder, opts->loop);
 
     player->snd_buf = (uint32_t *)MPEG_MEMALIGN(32, SOUND_BUFFER);
     if(!player->snd_buf) {
@@ -212,14 +209,14 @@ mpeg_player_t *mpeg_player_create_memory_ex(unsigned char *memory, const size_t 
         return NULL;
     }
 
-    player->list_type = opts->player_list_type;
-    if(setup_graphics(player, opts->player_filter_mode) < 0) {
+    player->list_type = opts->list_type;
+    if(setup_graphics(player, opts) < 0) {
         fprintf(stderr, "Setting up graphics failed\n");
         mpeg_player_destroy(player);
         return NULL;
     }
 
-    if(setup_audio(player, opts->player_volume) < 0) {
+    if(setup_audio(player, opts->volume) < 0) {
         fprintf(stderr, "Setting up audio failed\n");
         mpeg_player_destroy(player);
         return NULL;
@@ -229,11 +226,11 @@ mpeg_player_t *mpeg_player_create_memory_ex(unsigned char *memory, const size_t 
 }
 
 mpeg_player_t *mpeg_player_create(const char *filename) {
-    return mpeg_player_create_ex(filename, NULL);
+    return mpeg_player_create_ex(filename, &MPEG_PLAYER_OPTIONS_DEFAULT);
 }
 
 mpeg_player_t *mpeg_player_create_memory(uint8_t *memory, const size_t length) {
-    return mpeg_player_create_memory_ex(memory, length, NULL);
+    return mpeg_player_create_memory_ex(memory, length, &MPEG_PLAYER_OPTIONS_DEFAULT);
 }
 
 int mpeg_player_get_loop(mpeg_player_t *player) {
@@ -481,12 +478,15 @@ void mpeg_draw_frame(mpeg_player_t *player) {
     pvr_prim(&player->vert[3], sizeof(pvr_vertex_t));
 }
 
-static int setup_graphics(mpeg_player_t *player, pvr_filter_mode_t filter_mode) {
+static int setup_graphics(mpeg_player_t *player, const mpeg_player_options_t *opts) {
     pvr_poly_cxt_t cxt;
     float u, v;
+    int color = PVR_PACK_COLOR(1.0f, 1.0f, 1.0f, 1.0f);
+
+    float screen_x = 0.0f;
+    float screen_y = 0.0f;
     float screen_width = (float)vid_mode->width;
     float screen_height = (float)vid_mode->height;
-    int color = PVR_PACK_COLOR(1.0f, 1.0f, 1.0f, 1.0f);
 
     player->width = plm_get_width(player->decoder);
     player->height = plm_get_height(player->decoder);
@@ -515,14 +515,14 @@ static int setup_graphics(mpeg_player_t *player, pvr_filter_mode_t filter_mode) 
                      PVR_TXRFMT_YUV422 | PVR_TXRFMT_NONTWIDDLED,
                      mpeg_texture_width, mpeg_texture_height,
                      player->texture,
-                     filter_mode);
+                     opts->filter_mode);
     pvr_poly_compile(&player->hdr, &cxt);
 
     u = (float)player->width / mpeg_texture_width;
     v = (float)player->height / mpeg_texture_height;
 
-    player->vert[0].x = 0.0f;
-    player->vert[0].y = 0.0f;
+    player->vert[0].x = screen_x;
+    player->vert[0].y = screen_y;
     player->vert[0].z = 1.0f;
     player->vert[0].u = 0.0f;
     player->vert[0].v = 0.0f;
@@ -531,7 +531,7 @@ static int setup_graphics(mpeg_player_t *player, pvr_filter_mode_t filter_mode) 
     player->vert[0].flags = PVR_CMD_VERTEX;
 
     player->vert[1].x = screen_width;
-    player->vert[1].y = 0.0f;
+    player->vert[1].y = screen_y;
     player->vert[1].z = 1.0f;
     player->vert[1].u = u;
     player->vert[1].v = 0.0f;
@@ -539,7 +539,7 @@ static int setup_graphics(mpeg_player_t *player, pvr_filter_mode_t filter_mode) 
     player->vert[1].oargb = 0;
     player->vert[1].flags = PVR_CMD_VERTEX;
 
-    player->vert[2].x = 0.0f;
+    player->vert[2].x = screen_x;
     player->vert[2].y = screen_height;
     player->vert[2].z = 1.0f;
     player->vert[2].u = 0.0f;
