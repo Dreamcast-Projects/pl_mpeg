@@ -36,6 +36,9 @@
 #include <kos.h>
 #include "mpeg.h"
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+
 /* --- 1. Simple API (Legacy) --- */
 static void play_simple(void) {
     mpeg_player_t *player = mpeg_player_create("/rd/sample.mpg");
@@ -49,12 +52,8 @@ static void play_simple(void) {
 
 /* --- 2. Extended API (Recommended) --- */
 static void play_extended(void) {
-    static const mpeg_player_options_t options = {
-        .player_list_type   = PVR_LIST_OP_POLY,
-        .player_filter_mode = PVR_FILTER_BILINEAR,
-        .player_volume      = 255,
-        .player_loop        = true
-    };
+    mpeg_player_options_t options = MPEG_PLAYER_OPTIONS_INITIALIZER;
+    options.loop = true;
     mpeg_player_t *player = mpeg_player_create_ex("/rd/sample.mpg", &options);
     if(!player)
         return;
@@ -71,12 +70,10 @@ static void play_extended(void) {
 
 /* --- 3. Manual Frame Control (Advanced) --- */
 static void play_manual(void) {
-    static const mpeg_player_options_t options = {
-        .player_list_type   = PVR_LIST_OP_POLY,
-        .player_filter_mode = PVR_FILTER_BILINEAR,
-        .player_volume      = 255,
-        .player_loop        = true
-    };
+    mpeg_player_options_t options = MPEG_PLAYER_OPTIONS_INITIALIZER;
+    options.list_type = PVR_LIST_TR_POLY;
+    options.loop = true;
+
     mpeg_player_t *player = mpeg_player_create_ex("/rd/sample.mpg", &options);
     if(!player)
         return;
@@ -100,10 +97,10 @@ static void play_manual(void) {
             break;
 
         pvr_scene_begin();
-        pvr_list_begin(PVR_LIST_TR_POLY);
-
         if(result == MPEG_DECODE_FRAME)
             mpeg_upload_frame(player);
+
+        pvr_list_begin(PVR_LIST_TR_POLY);
 
         mpeg_draw_frame(player);
 
@@ -113,6 +110,8 @@ static void play_manual(void) {
 
     mpeg_player_destroy(player);
 }
+
+#pragma GCC diagnostic pop
 
 int main(void) {
     pvr_init_defaults();
