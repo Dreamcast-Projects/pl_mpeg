@@ -1,73 +1,83 @@
 /*
 PL_MPEG - MPEG1 Video decoder, MP2 Audio decoder, MPEG-PS demuxer
+SPDX-License-Identifier: MIT
+
 Dominic Szablewski - https://phoboslab.org
--- LICENSE: The MIT License(MIT)
-Copyright(c) 2019 Dominic Szablewski
-Permission is hereby granted, free of charge, to any person obtaining a copy of
-this software and associated documentation files(the "Software"), to deal in
-the Software without restriction, including without limitation the rights to
-use, copy, modify, merge, publish, distribute, sublicense, and / or sell copies
-of the Software, and to permit persons to whom the Software is furnished to do
-so, subject to the following conditions :
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+
+
 -- Synopsis
+
 // Define `PL_MPEG_IMPLEMENTATION` in *one* C/C++ file before including this
 // library to create the implementation.
+
 #define PL_MPEG_IMPLEMENTATION
 #include "plmpeg.h"
+
 // This function gets called for each decoded video frame
 void my_video_callback(plm_t *plm, plm_frame_t *frame, void *user) {
 	// Do something with frame->y.data, frame->cr.data, frame->cb.data
 }
+
 // This function gets called for each decoded audio frame
 void my_audio_callback(plm_t *plm, plm_samples_t *frame, void *user) {
 	// Do something with samples->interleaved
 }
+
 // Load a .mpg (MPEG Program Stream) file
 plm_t *plm = plm_create_with_filename("some-file.mpg");
+
 // Install the video & audio decode callbacks
 plm_set_video_decode_callback(plm, my_video_callback, my_data);
 plm_set_audio_decode_callback(plm, my_audio_callback, my_data);
+
+
 // Decode
 do {
 	plm_decode(plm, time_since_last_call);
 } while (!plm_has_ended(plm));
+
 // All done
 plm_destroy(plm);
+
+
+
 -- Documentation
+
 This library provides several interfaces to load, demux and decode MPEG video
 and audio data. A high-level API combines the demuxer, video & audio decoders
 in an easy to use wrapper.
+
 Lower-level APIs for accessing the demuxer, video decoder and audio decoder,
 as well as providing different data sources are also available.
+
 Interfaces are written in an object oriented style, meaning you create object
 instances via various different constructor functions (plm_*create()),
 do some work on them and later dispose them via plm_*destroy().
+
 plm_* ......... the high-level interface, combining demuxer and decoders
 plm_buffer_* .. the data source used by all interfaces
 plm_demux_* ... the MPEG-PS demuxer
 plm_video_* ... the MPEG1 Video ("mpeg1") decoder
 plm_audio_* ... the MPEG1 Audio Layer II ("mp2") decoder
+
+
 With the high-level interface you have two options to decode video & audio:
+
  1. Use plm_decode() and just hand over the delta time since the last call.
     It will decode everything needed and call your callbacks (specified through
     plm_set_{video|audio}_decode_callback()) any number of times.
+
  2. Use plm_decode_video() and plm_decode_audio() to decode exactly one
     frame of video or audio data at a time. How you handle the synchronization
     of both streams is up to you.
+
 If you only want to decode video *or* audio through these functions, you should
 disable the other stream (plm_set_{video|audio}_enabled(FALSE))
+
 Video data is decoded into a struct with all 3 planes (Y, Cr, Cb) stored in
 separate buffers. You can either convert this to RGB on the CPU (slow) via the
 plm_frame_to_rgb() function or do it on the GPU with the following matrix:
+
 mat4 bt601 = mat4(
 	1.16438,  0.00000,  1.59603, -0.87079,
 	1.16438, -0.39176, -0.81297,  0.52959,
@@ -75,33 +85,45 @@ mat4 bt601 = mat4(
 	0, 0, 0, 1
 );
 gl_FragColor = vec4(y, cb, cr, 1.0) * bt601;
+
 Audio data is decoded into a struct with either one single float array with the
 samples for the left and right channel interleaved, or if the
 PLM_AUDIO_SEPARATE_CHANNELS is defined *before* including this library, into
 two separate float arrays - one for each channel.
+
+
 Data can be supplied to the high level interface, the demuxer and the decoders
 in three different ways:
+
  1. Using plm_create_from_filename() or with a file handle with
     plm_create_from_file().
+
  2. Using plm_create_with_memory() and supplying a pointer to memory that
     contains the whole file.
+
  3. Using plm_create_with_buffer(), supplying your own plm_buffer_t instance and
     periodically writing to this buffer.
+
 When using your own plm_buffer_t instance, you can fill this buffer using
 plm_buffer_write(). You can either monitor plm_buffer_get_remaining() and push
 data when appropriate, or install a callback on the buffer with
 plm_buffer_set_load_callback() that gets called whenever the buffer needs more
 data.
+
 A buffer created with plm_buffer_create_with_capacity() is treated as a ring
 buffer, meaning that data that has already been read, will be discarded. In
 contrast, a buffer created with plm_buffer_create_for_appending() will keep all
 data written to it in memory. This enables seeking in the already loaded data.
+
+
 There should be no need to use the lower level plm_demux_*, plm_video_* and
 plm_audio_* functions, if all you want to do is read/decode an MPEG-PS file.
 However, if you get raw mpeg1video data or raw mp2 audio data from a different
 source, these functions can be used to decode the raw data directly. Similarly,
 if you only want to analyze an MPEG-PS file or extract raw video or audio
 packets from it, you can use the plm_demux_* functions.
+
+
 This library uses malloc(), realloc() and free() to manage memory. Typically
 all allocation happens up-front when creating the interface. However, the
 default buffer size may be too small for certain inputs. In these cases plmpeg
@@ -112,9 +134,10 @@ including this library.
 You can also define PLM_MALLOC, PLM_REALLOC and PLM_FREE to provide your own
 memory management functions.
 
-See below for detailed the API documentation.
-*/
 
+See below for detailed the API documentation.
+
+*/
 
 #ifndef PL_MPEG_H
 #define PL_MPEG_H
@@ -143,9 +166,10 @@ extern "C" {
 #endif
 
 #ifndef PLM_MALLOC
-	#define PLM_MALLOC(sz)       MPEG_MALLOC(sz)
-	#define PLM_FREE(p)          MPEG_FREE(p)
-	#define PLM_REALLOC(p, sz)   MPEG_REALLOC((p), (sz))
+	#define PLM_MALLOC(sz)      MPEG_MALLOC(sz)
+	#define PLM_FREE(p)         MPEG_FREE(p)
+	#define PLM_REALLOC(p, sz)  MPEG_REALLOC((p), (sz))
+	#define PLM_MEMZERO(p, sz)  MPEG_MEMZERO((p), (sz))
 #endif
 
 #define PLM_UNUSED(expr) (void)(expr)
@@ -198,7 +222,7 @@ typedef struct {
 // different from the internal size of the 3 planes.
 
 typedef struct {
-	float time;
+	double time;
 	unsigned int width;
 	unsigned int height;
 	plm_plane_t y;
@@ -224,7 +248,7 @@ typedef void(*plm_video_decode_callback)
 #define PLM_AUDIO_SAMPLES_PER_FRAME 1152
 
 typedef struct {
-	float time;
+	double time;
 	unsigned int count;
 	short pcm[PLM_AUDIO_SAMPLES_PER_FRAME] __attribute__((aligned(32)));
 } plm_samples_t;
@@ -304,11 +328,11 @@ int plm_get_num_video_streams(plm_t *self);
 
 int plm_get_width(plm_t *self);
 int plm_get_height(plm_t *self);
-
+double plm_get_pixel_aspect_ratio(plm_t *self);
 
 // Get the framerate of the video stream in frames per second.
 
-float plm_get_framerate(plm_t *self);
+double plm_get_framerate(plm_t *self);
 
 
 // Get or set whether audio decoding is enabled. Default TRUE.
@@ -337,18 +361,18 @@ int plm_get_samplerate(plm_t *self);
 // should be set to the duration of the buffer of the audio API that you use
 // for output. E.g. for SDL2: (SDL_AudioSpec.samples / samplerate)
 
-float plm_get_audio_lead_time(plm_t *self);
-void plm_set_audio_lead_time(plm_t *self, float lead_time);
+double plm_get_audio_lead_time(plm_t *self);
+void plm_set_audio_lead_time(plm_t *self, double lead_time);
 
 
 // Get the current internal time in seconds.
 
-float plm_get_time(plm_t *self);
+double plm_get_time(plm_t *self);
 
 
 // Get the video duration of the underlying source in seconds.
 
-float plm_get_duration(plm_t *self);
+double plm_get_duration(plm_t *self);
 
 
 // Rewind all buffers back to the beginning.
@@ -387,7 +411,7 @@ void plm_set_audio_decode_callback(plm_t *self, plm_audio_decode_callback fp, vo
 // of times. A frame-skip is not implemented, i.e. everything up to current time
 // will be decoded.
 
-void plm_decode(plm_t *self, float seconds);
+void plm_decode(plm_t *self, double seconds);
 
 
 // Decode and return one video frame. Returns NULL if no frame could be decoded
@@ -421,14 +445,14 @@ plm_samples_t *plm_decode_audio(plm_t *self);
 // satisfied.
 // Returns TRUE if seeking succeeded or FALSE if no frame could be found.
 
-int plm_seek(plm_t *self, float time, int seek_exact);
+int plm_seek(plm_t *self, double time, int seek_exact);
 
 
 // Similar to plm_seek(), but will not call the video_decode_callback,
 // audio_decode_callback or make any attempts to sync audio.
 // Returns the found frame or NULL if no frame could be found.
 
-plm_frame_t *plm_seek_frame(plm_t *self, float time, int seek_exact);
+plm_frame_t *plm_seek_frame(plm_t *self, double time, int seek_exact);
 
 
 
@@ -541,7 +565,7 @@ static const int PLM_DEMUX_PACKET_PRIVATE = 0xBD;
 static const int PLM_DEMUX_PACKET_AUDIO_1 = 0xC0;
 static const int PLM_DEMUX_PACKET_AUDIO_2 = 0xC1;
 static const int PLM_DEMUX_PACKET_AUDIO_3 = 0xC2;
-static const int PLM_DEMUX_PACKET_AUDIO_4 = 0xC2;
+static const int PLM_DEMUX_PACKET_AUDIO_4 = 0xC3;
 static const int PLM_DEMUX_PACKET_VIDEO_1 = 0xE0;
 
 
@@ -590,20 +614,20 @@ int plm_demux_has_ended(plm_demux_t *self);
 // Note that the specified time is considered 0-based, regardless of the first
 // PTS in the data source.
 
-plm_packet_t *plm_demux_seek(plm_demux_t *self, float time, int type, int force_intra);
+plm_packet_t *plm_demux_seek(plm_demux_t *self, double time, int type, int force_intra);
 
 
 // Get the PTS of the first packet of this type. Returns PLM_PACKET_INVALID_TS
 // if not packet of this packet type can be found.
 
-float plm_demux_get_start_time(plm_demux_t *self, int type);
+double plm_demux_get_start_time(plm_demux_t *self, int type);
 
 
 // Get the duration for the specified packet type - i.e. the span between the
 // the first PTS and the last PTS in the data source. This only makes sense when
 // the underlying data source is a file or fixed memory.
 
-float plm_demux_get_duration(plm_demux_t *self, int type);
+double plm_demux_get_duration(plm_demux_t *self, int type);
 
 
 // Decode and return the next packet. The returned packet_t is valid until
@@ -636,7 +660,8 @@ int plm_video_has_header(plm_video_t *self);
 
 // Get the framerate in frames per second.
 
-float plm_video_get_framerate(plm_video_t *self);
+double plm_video_get_framerate(plm_video_t *self);
+double plm_video_get_pixel_aspect_ratio(plm_video_t *self);
 
 
 // Get the display width/height.
@@ -654,14 +679,14 @@ void plm_video_set_no_delay(plm_video_t *self, int no_delay);
 
 // Get the current internal time in seconds.
 
-float plm_video_get_time(plm_video_t *self);
+double plm_video_get_time(plm_video_t *self);
 
 
 // Set the current internal time in seconds. This is only useful when you
 // manipulate the underlying video buffer and want to enforce a correct
 // timestamps.
 
-void plm_video_set_time(plm_video_t *self, float time);
+void plm_video_set_time(plm_video_t *self, double time);
 
 
 // Rewind the internal buffer. See plm_buffer_rewind().
@@ -724,14 +749,14 @@ int plm_audio_get_samplerate(plm_audio_t *self);
 
 // Get the current internal time in seconds.
 
-float plm_audio_get_time(plm_audio_t *self);
+double plm_audio_get_time(plm_audio_t *self);
 
 
 // Set the current internal time in seconds. This is only useful when you
 // manipulate the underlying video buffer and want to enforce a correct
 // timestamps.
 
-void plm_audio_set_time(plm_audio_t *self, float time);
+void plm_audio_set_time(plm_audio_t *self, double time);
 
 
 // Rewind the internal buffer. See plm_buffer_rewind().
@@ -885,7 +910,7 @@ void * memmove_co (void *dest, const void *src, size_t len)
 
 struct plm_t {
 	plm_demux_t *demux;
-	float time;
+	double time;
 	int has_ended;
 	int loop;
 	int has_decoders;
@@ -898,7 +923,7 @@ struct plm_t {
 	int audio_enabled;
 	int audio_stream_index;
 	int audio_packet_type;
-	float audio_lead_time;
+	double audio_lead_time;
 	plm_buffer_t *audio_buffer;
 	plm_audio_t *audio_decoder;
 
@@ -939,7 +964,7 @@ plm_t *plm_create_with_buffer(plm_buffer_t *buffer, int destroy_when_done) {
 		fprintf(stderr, "Out of memory for self. [plm_create_with_buffer]\n");
 		return NULL;
 	}
-	memset(self, 0, sizeof(plm_t));
+	PLM_MEMZERO(self, sizeof(plm_t));
 
 
 	self->demux = plm_demux_create(buffer, destroy_when_done);
@@ -1082,9 +1107,15 @@ int plm_get_height(plm_t *self) {
 		: 0;
 }
 
-float plm_get_framerate(plm_t *self) {
+double plm_get_framerate(plm_t *self) {
 	return (plm_init_decoders(self) && self->video_decoder)
 		? plm_video_get_framerate(self->video_decoder)
+		: 0;
+}
+
+double plm_get_pixel_aspect_ratio(plm_t *self) {
+	return (plm_init_decoders(self) && self->video_decoder)
+		? plm_video_get_pixel_aspect_ratio(self->video_decoder)
 		: 0;
 }
 
@@ -1098,19 +1129,19 @@ int plm_get_samplerate(plm_t *self) {
 		: 0;
 }
 
-float plm_get_audio_lead_time(plm_t *self) {
+double plm_get_audio_lead_time(plm_t *self) {
 	return self->audio_lead_time;
 }
 
-void plm_set_audio_lead_time(plm_t *self, float lead_time) {
+void plm_set_audio_lead_time(plm_t *self, double lead_time) {
 	self->audio_lead_time = lead_time;
 }
 
-float plm_get_time(plm_t *self) {
+double plm_get_time(plm_t *self) {
 	return self->time;
 }
 
-float plm_get_duration(plm_t *self) {
+double plm_get_duration(plm_t *self) {
 	return plm_demux_get_duration(self->demux, PLM_DEMUX_PACKET_VIDEO_1);
 }
 
@@ -1125,6 +1156,7 @@ void plm_rewind(plm_t *self) {
 
 	plm_demux_rewind(self->demux);
 	self->time = 0;
+	self->has_ended = FALSE;
 }
 
 int plm_get_loop(plm_t *self) {
@@ -1149,7 +1181,7 @@ void plm_set_audio_decode_callback(plm_t *self, plm_audio_decode_callback fp, vo
 	self->audio_decode_callback_user_data = user;
 }
 
-void plm_decode(plm_t *self, float tick) {
+void plm_decode(plm_t *self, double tick) {
 	if (!plm_init_decoders(self)) {
 		return;
 	}
@@ -1166,8 +1198,8 @@ void plm_decode(plm_t *self, float tick) {
 	int decode_video_failed = FALSE;
 	int decode_audio_failed = FALSE;
 
-	float video_target_time = self->time + tick;
-	float audio_target_time = self->time + tick + self->audio_lead_time;
+	double video_target_time = self->time + tick;
+	double audio_target_time = self->time + tick + self->audio_lead_time;
 
 	do {
 		did_decode = FALSE;
@@ -1292,7 +1324,7 @@ void plm_read_packets(plm_t *self, int requested_type) {
 	}
 }
 
-plm_frame_t *plm_seek_frame(plm_t *self, float time, int seek_exact) {
+plm_frame_t *plm_seek_frame(plm_t *self, double time, int seek_exact) {
 	if (!plm_init_decoders(self)) {
 		return NULL;
 	}
@@ -1303,8 +1335,8 @@ plm_frame_t *plm_seek_frame(plm_t *self, float time, int seek_exact) {
 
 	int type = self->video_packet_type;
 
-	float start_time = plm_demux_get_start_time(self->demux, type);
-	float duration = plm_demux_get_duration(self->demux, type);
+	double start_time = plm_demux_get_start_time(self->demux, type);
+	double duration = plm_demux_get_duration(self->demux, type);
 
 	if (time < 0) {
 		time = 0;
@@ -1347,7 +1379,7 @@ plm_frame_t *plm_seek_frame(plm_t *self, float time, int seek_exact) {
 	return frame;
 }
 
-int plm_seek(plm_t *self, float time, int seek_exact) {
+int plm_seek(plm_t *self, double time, int seek_exact) {
 	plm_frame_t *frame = plm_seek_frame(self, time, seek_exact);
 
 	if (!frame) {
@@ -1367,7 +1399,7 @@ int plm_seek(plm_t *self, float time, int seek_exact) {
 	// with a PTS greater than the current time is found. plm_decode() is then
 	// called to decode enough audio data to satisfy the audio_lead_time.
 
-	float start_time = plm_demux_get_start_time(self->demux, self->video_packet_type);
+	double start_time = plm_demux_get_start_time(self->demux, self->video_packet_type);
 	plm_audio_rewind(self->audio_decoder);
 
 	plm_packet_t *packet = NULL;
@@ -1472,7 +1504,7 @@ plm_buffer_t *plm_buffer_create_with_memory(uint8_t *bytes, size_t length, int f
 		return NULL;
 	}
 
-	memset(self, 0, sizeof(plm_buffer_t));
+	PLM_MEMZERO(self, sizeof(plm_buffer_t));
 	self->capacity = length;
 	self->length = length;
 	self->total_size = length;
@@ -1490,7 +1522,7 @@ plm_buffer_t *plm_buffer_create_with_capacity(size_t capacity) {
 		return NULL;
 	}
 
-	memset(self, 0, sizeof(plm_buffer_t));
+	PLM_MEMZERO(self, sizeof(plm_buffer_t));
 	self->capacity = capacity;
 	self->free_when_done = TRUE;
 	self->bytes = (uint8_t *)PLM_MALLOC(capacity);
@@ -1595,6 +1627,12 @@ void plm_buffer_seek(plm_buffer_t *self, size_t pos) {
 		self->bit_index = 0;
 		self->length = 0;
 	}
+	// DCL DIFF
+	// if (self->seek_callback) {
+	// 	self->seek_callback(self, pos, self->load_callback_user_data);
+	// 	self->bit_index = 0;
+	// 	self->length = 0;
+	// }
 	else if (self->mode == PLM_BUFFER_MODE_RING) {
 		if (pos != 0) {
 			// Seeking to non-0 is forbidden for dynamic-mem buffers
@@ -1785,12 +1823,12 @@ static const int PLM_START_SYSTEM = 0xBB;
 struct plm_demux_t {
 	plm_buffer_t *buffer;
 	int destroy_buffer_when_done;
-	float system_clock_ref;
+	double system_clock_ref;
 
 	size_t last_file_size;
-	float last_decoded_pts;
-	float start_time;
-	float duration;
+	double last_decoded_pts;
+	double start_time;
+	double duration;
 
 	int start_code;
 	int has_pack_header;
@@ -1805,7 +1843,7 @@ struct plm_demux_t {
 
 
 void plm_demux_buffer_seek(plm_demux_t *self, size_t pos);
-float plm_demux_decode_time(plm_demux_t *self);
+double plm_demux_decode_time(plm_demux_t *self);
 plm_packet_t *plm_demux_decode_packet(plm_demux_t *self, int type);
 plm_packet_t *plm_demux_get_packet(plm_demux_t *self);
 
@@ -1815,7 +1853,7 @@ plm_demux_t *plm_demux_create(plm_buffer_t *buffer, int destroy_when_done) {
 		fprintf(stderr, "Out of memory for self. [plm_demux_create]\n");
 		return NULL;
 	}
-	memset(self, 0, sizeof(plm_demux_t));
+	PLM_MEMZERO(self, sizeof(plm_demux_t));
 
 	self->buffer = buffer;
 	self->destroy_buffer_when_done = destroy_when_done;
@@ -1929,7 +1967,7 @@ void plm_demux_buffer_seek(plm_demux_t *self, size_t pos) {
 	self->start_code = -1;
 }
 
-float plm_demux_get_start_time(plm_demux_t *self, int type) {
+double plm_demux_get_start_time(plm_demux_t *self, int type) {
 	if (self->start_time != PLM_PACKET_INVALID_TS) {
 		return self->start_time;
 	}
@@ -1954,7 +1992,7 @@ float plm_demux_get_start_time(plm_demux_t *self, int type) {
 	return self->start_time;
 }
 
-float plm_demux_get_duration(plm_demux_t *self, int type) {
+double plm_demux_get_duration(plm_demux_t *self, int type) {
 	size_t file_size = plm_buffer_get_size(self->buffer);
 
 	if (
@@ -1980,7 +2018,7 @@ float plm_demux_get_duration(plm_demux_t *self, int type) {
 		plm_demux_buffer_seek(self, seek_pos);
 		self->current_packet.length = 0;
 
-		float last_pts = PLM_PACKET_INVALID_TS;
+		double last_pts = PLM_PACKET_INVALID_TS;
 		plm_packet_t *packet = NULL;
 		while ((packet = plm_demux_decode(self))) {
 			if (packet->pts != PLM_PACKET_INVALID_TS && packet->type == type) {
@@ -1999,7 +2037,7 @@ float plm_demux_get_duration(plm_demux_t *self, int type) {
 	return self->duration;
 }
 
-plm_packet_t *plm_demux_seek(plm_demux_t *self, float seek_time, int type, int force_intra) {
+plm_packet_t *plm_demux_seek(plm_demux_t *self, double seek_time, int type, int force_intra) {
 	if (!plm_demux_has_headers(self)) {
 		return NULL;
 	}
@@ -2020,12 +2058,12 @@ plm_packet_t *plm_demux_seek(plm_demux_t *self, float seek_time, int type, int f
 	// probably something wrong with the file and we just avoid getting into an
 	// infinite loop. 32 retries should be enough for anybody.
 
-	float duration = plm_demux_get_duration(self, type);
+	double duration = plm_demux_get_duration(self, type);
 	long file_size = plm_buffer_get_size(self->buffer);
 	long byterate = file_size / duration;
 
-	float cur_time = self->last_decoded_pts;
-	float scan_span = 1;
+	double cur_time = self->last_decoded_pts;
+	double scan_span = 1;
 
 	if (seek_time > duration) {
 		seek_time = duration;
@@ -2039,7 +2077,7 @@ plm_packet_t *plm_demux_seek(plm_demux_t *self, float seek_time, int type, int f
 		int found_packet_with_pts = FALSE;
 		int found_packet_in_range = FALSE;
 		long last_valid_packet_start = -1;
-		float first_packet_time = PLM_PACKET_INVALID_TS;
+		double first_packet_time = PLM_PACKET_INVALID_TS;
 
 		long cur_pos = plm_buffer_tell(self->buffer);
 
@@ -2182,14 +2220,14 @@ plm_packet_t *plm_demux_decode(plm_demux_t *self) {
 	return NULL;
 }
 
-float plm_demux_decode_time(plm_demux_t *self) {
+double plm_demux_decode_time(plm_demux_t *self) {
 	int64_t clock = plm_buffer_read(self->buffer, 3) << 30;
 	plm_buffer_skip(self->buffer, 1);
 	clock |= plm_buffer_read(self->buffer, 15) << 15;
 	plm_buffer_skip(self->buffer, 1);
 	clock |= plm_buffer_read(self->buffer, 15);
 	plm_buffer_skip(self->buffer, 1);
-	return (float)clock / 90000.0f;
+	return (double)clock / 90000.0;
 }
 
 plm_packet_t *plm_demux_decode_packet(plm_demux_t *self, int type) {
@@ -2268,6 +2306,14 @@ static const int PLM_START_USER_DATA = 0xB2;
 
 #define PLM_START_IS_SLICE(c) \
 	(c >= PLM_START_SLICE_FIRST && c <= PLM_START_SLICE_LAST)
+
+static const float PLM_VIDEO_PIXEL_ASPECT_RATIO[] = {
+	1.0000, /* square pixels */
+	0.6735, /* 3:4? */
+	0.7031, /* MPEG-1 / MPEG-2 video encoding divergence? */
+	0.7615, 0.8055, 0.8437, 0.8935, 0.9157, 0.9815,
+	1.0255, 1.0695, 1.0950, 1.1575, 1.2051,
+};
 
  __attribute__((aligned(32))) static const float PLM_VIDEO_PICTURE_RATE[] = {
 	0.000, 23.976, 24.000, 25.000, 29.970, 30.000, 50.000, 59.940,
@@ -2661,8 +2707,9 @@ typedef struct {
 } plm_video_motion_t;
 
 struct plm_video_t {
-	float framerate;
-	float time;
+	double framerate;
+	double pixel_aspect_ratio;
+	double time;
 	int frames_decoded;
 	int width;
 	int height;
@@ -2741,7 +2788,7 @@ plm_video_t * plm_video_create_with_buffer(plm_buffer_t *buffer, int destroy_whe
 		fprintf(stderr, "Out of memory for self. [plm_video_create_with_buffer]\n");
 		return NULL;
 	}
-	memset(self, 0, sizeof(plm_video_t));
+	PLM_MEMZERO(self, sizeof(plm_video_t));
 
 	self->buffer = buffer;
 	self->destroy_buffer_when_done = destroy_when_done;
@@ -2771,9 +2818,15 @@ void plm_video_destroy(plm_video_t *self) {
 	self = NULL;
 }
 
-float plm_video_get_framerate(plm_video_t *self) {
+double plm_video_get_framerate(plm_video_t *self) {
 	return plm_video_has_header(self)
 		? self->framerate
+		: 0;
+}
+
+double plm_video_get_pixel_aspect_ratio(plm_video_t *self) {
+	return plm_video_has_header(self)
+		? self->pixel_aspect_ratio
 		: 0;
 }
 
@@ -2793,11 +2846,11 @@ void plm_video_set_no_delay(plm_video_t *self, int no_delay) {
 	self->assume_no_b_frames = no_delay;
 }
 
-float plm_video_get_time(plm_video_t *self) {
+double plm_video_get_time(plm_video_t *self) {
 	return self->time;
 }
 
-void plm_video_set_time(plm_video_t *self, float time) {
+void plm_video_set_time(plm_video_t *self, double time) {
 	self->frames_decoded = self->framerate * time;
 	self->time = time;
 }
@@ -2874,7 +2927,7 @@ plm_frame_t *plm_video_decode(plm_video_t *self) {
 
 	frame->time = self->time;
 	self->frames_decoded++;
-	self->time = (float)self->frames_decoded / self->framerate;
+	self->time = (double)self->frames_decoded / self->framerate;
 
 	return frame;
 }
@@ -2912,7 +2965,20 @@ int plm_video_decode_sequence_header(plm_video_t *self) {
 	}
 
 	// Skip pixel aspect ratio
-	plm_buffer_skip(self->buffer, 4);
+	// Get pixel aspect ratio
+	int pixel_aspect_ratio_code;
+	pixel_aspect_ratio_code = plm_buffer_read(self->buffer, 4);
+	pixel_aspect_ratio_code -= 1;
+	if (pixel_aspect_ratio_code < 0) {
+		pixel_aspect_ratio_code = 0;
+	}
+	int par_last = (sizeof(PLM_VIDEO_PIXEL_ASPECT_RATIO) /
+			sizeof(PLM_VIDEO_PIXEL_ASPECT_RATIO[0]) - 1);
+	if (pixel_aspect_ratio_code > par_last) {
+		pixel_aspect_ratio_code = par_last;
+	}
+	self->pixel_aspect_ratio =
+		PLM_VIDEO_PIXEL_ASPECT_RATIO[pixel_aspect_ratio_code];
 
 	self->framerate = PLM_VIDEO_PICTURE_RATE[plm_buffer_read(self->buffer, 4)];
 
@@ -2957,7 +3023,7 @@ int plm_video_decode_sequence_header(plm_video_t *self) {
 	size_t chroma_plane_size = self->chroma_width * self->chroma_height;
 	size_t frame_data_size = (luma_plane_size + 2 * chroma_plane_size);
 
-	// 32byte align
+	// 32byte align // DCL DIFF
 	self->frames_data = (uint8_t*)PLM_MALLOC(frame_data_size * 3 * 2 + 31);
 	if(!self->frames_data) {
 		fprintf(stderr, "Out of memory for self->frames_data. [plm_video_decode_sequence_header]\n");
@@ -2990,6 +3056,7 @@ void plm_video_init_frame(plm_video_t *self, plm_frame_t *frame, uint8_t *base) 
 	frame->cb.height = self->chroma_height;
 	frame->cb.data = base + luma_plane_size + chroma_plane_size;
 
+	// DCL DIFF
 	frame->display = (uint32_t *)(base + luma_plane_size + chroma_plane_size * 2);
 }
 
@@ -3054,7 +3121,7 @@ void plm_video_decode_picture(plm_video_t *self) {
 		self->start_code = plm_buffer_next_start_code(self->buffer);
 	}
 
-	// Set reference frames
+	// Set reference frames // DCL DIFF
 	if (self->picture_type == PLM_VIDEO_PICTURE_TYPE_INTRA ||
 		self->picture_type == PLM_VIDEO_PICTURE_TYPE_PREDICTIVE)
 	{
@@ -3214,6 +3281,7 @@ void plm_video_decode_macroblock(plm_video_t *self) {
 			self->mb_row = self->macroblock_address / self->mb_width;
 			self->mb_col = self->macroblock_address % self->mb_width;
 
+			// DCL DIFF
 			if(self->picture_type == PLM_VIDEO_PICTURE_TYPE_PREDICTIVE)
 			{
 				// Skipped macroblocks in P-pictures
@@ -3282,6 +3350,7 @@ void plm_video_decode_macroblock(plm_video_t *self) {
 	}
 }
 
+// DCL DIFF
 #define plm_video_decode_motion_vector(r_size, motion) do {	\
 	int fscale = 1 << r_size;	\
 	int m_code = plm_buffer_read_vlc(self->buffer, PLM_VIDEO_MOTION);	\
@@ -3328,6 +3397,7 @@ void plm_video_decode_motion_vectors(plm_video_t *self) {
 	}
 }
 
+// DCL DIFF
 void plm_video_predict_macroblock(plm_video_t *self) {
 	uint32_t *d = self->frame_current.display + self->macroblock_address * 96;
 	int fw_h = self->motion_forward.h;
@@ -3366,6 +3436,7 @@ void plm_video_predict_macroblock(plm_video_t *self) {
 	}
 }
 
+// DCL DIFF
 void plm_video_copy_macroblock(
 	uint32_t *dest, plm_frame_t *reference, int motion_h, int motion_v
 ) {
@@ -3705,7 +3776,7 @@ void plm_video_copy_macroblock(
 	}
 }
 
-
+// DCL DIFF
 void plm_video_interpolate_macroblock(
 	uint32_t *dest, plm_frame_t *reference, int motion_h, int motion_v
 ) {
@@ -4251,7 +4322,7 @@ typedef struct plm_quantizer_spec_t {
 };
 
 struct plm_audio_t {
-	float time;
+	double time;
 	int samples_decoded;
 	int samplerate_index;
 	int bitrate_index;
@@ -4274,6 +4345,8 @@ struct plm_audio_t {
 	plm_samples_t samples;
 	float D[1024];
 	float V[1024];
+	// DCL DIFF
+	float U[32];
 };
 
 int plm_audio_find_frame_sync(plm_audio_t *self);
@@ -4289,7 +4362,7 @@ plm_audio_t *plm_audio_create_with_buffer(plm_buffer_t *buffer, int destroy_when
 		fprintf(stderr, "Out of memory for self. [plm_audio_create_with_buffer]\n");
 		return NULL;
 	}
-	memset(self, 0, sizeof(plm_audio_t));
+	PLM_MEMZERO(self, sizeof(plm_audio_t));
 
 	self->samples.count = PLM_AUDIO_SAMPLES_PER_FRAME;
 	self->buffer = buffer;
@@ -4357,13 +4430,13 @@ int plm_audio_get_samplerate(plm_audio_t *self) {
 		: 0;
 }
 
-float plm_audio_get_time(plm_audio_t *self) {
+double plm_audio_get_time(plm_audio_t *self) {
 	return self->time;
 }
 
-void plm_audio_set_time(plm_audio_t *self, float time) {
+void plm_audio_set_time(plm_audio_t *self, double time) {
 	self->samples_decoded = time *
-		(float)PLM_AUDIO_SAMPLE_RATE[self->samplerate_index];
+		(double)PLM_AUDIO_SAMPLE_RATE[self->samplerate_index];
 	self->time = time;
 }
 
@@ -4404,8 +4477,8 @@ plm_samples_t *plm_audio_decode(plm_audio_t *self) {
 	self->samples.time = self->time;
 
 	self->samples_decoded += PLM_AUDIO_SAMPLES_PER_FRAME;
-	self->time = (float)self->samples_decoded /
-		(float)PLM_AUDIO_SAMPLE_RATE[self->samplerate_index];
+	self->time = (double)self->samples_decoded /
+		(double)PLM_AUDIO_SAMPLE_RATE[self->samplerate_index];
 
 	return &self->samples;
 }
@@ -4616,7 +4689,7 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 				// Shifting step
 				self->v_pos = (self->v_pos - 64) & 1023;
 
-				// !! Monoral only !!
+				// !! Monoral only !! // DCL DIFF
 				plm_audio_idct36(self->sample[0], p, self->V, self->v_pos);
 
 				int d_index = (512 - (self->v_pos >> 1)) >> 5;
