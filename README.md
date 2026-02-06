@@ -20,7 +20,11 @@ mpeg.c, mpeg.h - Public Domain
 
 #### THANKS TO ####
 Dominic Szablewski (https://phoboslab.org) - Great decoding engine.
-Ian Robinson & Andy Barajas & Jnmartin84(https://github.com/jnmartin84) - They provided advice and ideas.
+Provided advice and ideas:
+- Ian Robinson
+- Andy Barajas
+- Jnmartin84 (https://github.com/jnmartin84)
+- BitBank2 (https://github.com/bitbank2)
 
 with permission https://dcemulation.org/phpBB/viewtopic.php?p=1060259#p1060259
 
