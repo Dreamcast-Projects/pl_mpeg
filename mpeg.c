@@ -308,9 +308,10 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
         if(playback_time >= player->frame->time) {
             /* Render the current frame */
             pvr_scene_begin();
+            mpeg_upload_frame(player);
+
             pvr_list_begin(player->list_type);
 
-            mpeg_upload_frame(player);
             mpeg_draw_frame(player);
 
             pvr_list_finish();
@@ -414,6 +415,10 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
 void mpeg_upload_frame(mpeg_player_t *player) {
     if(!player || !player->frame)
         return;
+
+    /* HACK: Fix Flycast */
+    PVR_SET(PVR_YUV_CFG, (((mpeg_texture_height / 16) - 1) << 8) |
+                      ((mpeg_texture_width / 16) - 1));
 
     uint32_t *src = player->frame->display;
 
