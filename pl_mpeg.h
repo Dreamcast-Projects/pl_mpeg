@@ -1319,7 +1319,7 @@ void plm_read_packets(plm_t *self, int requested_type) {
 		else if (packet->type == self->audio_packet_type) {
 			plm_buffer_write(self->audio_buffer, packet->data0, packet->len0);
 			if(packet->data1)
-				plm_buffer_write(self->video_buffer, packet->data1, packet->len1);
+				plm_buffer_write(self->audio_buffer, packet->data1, packet->len1);
 		}
 
 		if (packet->type == requested_type) {
