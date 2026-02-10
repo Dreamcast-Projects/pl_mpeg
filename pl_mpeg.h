@@ -166,10 +166,11 @@ extern "C" {
 #endif
 
 #ifndef PLM_MALLOC
-	#define PLM_MALLOC(sz)      MPEG_MALLOC(sz)
-	#define PLM_FREE(p)         MPEG_FREE(p)
-	#define PLM_REALLOC(p, sz)  MPEG_REALLOC((p), (sz))
-	#define PLM_MEMZERO(p, sz)  MPEG_MEMZERO((p), (sz))
+	#define PLM_MALLOC(sz)       MPEG_MALLOC(sz)
+	#define PLM_FREE(p)          MPEG_FREE(p)
+	#define PLM_REALLOC(p, sz)   MPEG_REALLOC((p), (sz))
+	#define PLM_MEMZERO(p, sz)   MPEG_MEMZERO((p), (sz))
+	#define PLM_MEMALIGN(a, sz)  MPEG_MEMALIGN((a), (sz))
 #endif
 
 #define PLM_UNUSED(expr) (void)(expr)
@@ -195,11 +196,24 @@ typedef struct plm_audio_t plm_audio_t;
 #define PLM_PACKET_INVALID_TS -1
 
 typedef struct {
-	int type;
-	double pts;
-	size_t length;
-	uint8_t *data;
+    int type;
+    double pts;
+
+    size_t length;      /* total bytes (len0 + len1) */
+
+    uint8_t *data0;     /* first span */
+    size_t   len0;
+
+    uint8_t *data1;     /* second span (NULL if not wrapped) */
+    size_t   len1;
 } plm_packet_t;
+
+// typedef struct {
+// 	int type;
+// 	double pts;
+// 	size_t length;
+// 	uint8_t *data;
+// } plm_packet_t;
 
 
 // Decoded Video Plane
@@ -272,7 +286,14 @@ typedef void(*plm_audio_decode_callback)
 
 typedef void(*plm_buffer_load_callback)(plm_buffer_t *self, void *user);
 
+// Callback function for plm_buffer when it needs to seek
 
+typedef void(*plm_buffer_seek_callback)(plm_buffer_t *self, size_t offset, void *user);
+
+
+// Callback function for plm_buffer when it needs to tell the position
+
+typedef size_t(*plm_buffer_tell_callback)(plm_buffer_t *self, void *user);
 
 // -----------------------------------------------------------------------------
 // plm_* public API
@@ -483,11 +504,18 @@ plm_frame_t *plm_seek_frame(plm_t *self, double time, int seek_exact);
 
 
 // The default size for buffers created from files or by the high-level API
-// DCL (128 * 1024)
 #ifndef PLM_BUFFER_DEFAULT_SIZE
 #define PLM_BUFFER_DEFAULT_SIZE (32 * 1024)
 #endif
 
+#ifndef PLM_VID_BUFFER_DEFAULT_SIZE
+#define PLM_VID_BUFFER_DEFAULT_SIZE (128 * 1024)
+#endif
+
+// Bytes we keep available for fast “peek” reads.
+// We maintain a small mirrored/guard region so hot-path bit reads can grab
+// up to PLM_PEEK_SIZE bytes linearly without doing ring wrap math.
+#define PLM_PEEK_SIZE 4
 
 // Create a buffer instance with a filename. Returns NULL if the file could not
 // be opened.
@@ -876,61 +904,6 @@ static inline __attribute__((always_inline)) float pl_fipr(float x1, float x2, f
   return __y4;
 }
 
-// Default (8-bit, 1 byte at a time) DH`moop
-void * memmove_co (void *dest, const void *src, size_t len)
-{
-  if(!len)
-  {
-    return dest;
-  }
-
-  const uint8_t *s = (uint8_t *)src;
-  uint8_t *d = (uint8_t *)dest;
-
-  if (s > d)
-  {
-    uint32_t diff = (uint32_t)d - (uint32_t)(s + 1); // extra offset because input gets incremented before output is calculated
-    // This will underflow and be like adding a negative offset
-
-    // Can use 'd' as a scratch reg now
-    __asm__ __volatile__ (
-      "clrs\n" // Align for parallelism (CO) - SH4a use "stc SR, Rn" instead with a dummy Rn
-    ".align 2\n"
-    "0:\n\t"
-      "dt %[size]\n\t" // (--len) ? 0 -> T : 1 -> T (EX 1)
-      "mov.b @%[in]+, %[scratch]\n\t" // scratch = *(s++) (LS 1/2)
-      "bf.s 0b\n\t" // while(s != nexts) aka while(!T) (BR 1/2)
-      " mov.b %[scratch], @(%[offset], %[in])\n" // *(datatype_of_s*) ((char*)s + diff) = scratch, where src + diff = dest (LS)
-      : [in] "+&r" ((uint32_t)s), [scratch] "=&r" ((uint32_t)d), [size] "+&r" (len) // outputs
-      : [offset] "z" (diff) // inputs
-      : "t", "memory" // clobbers
-    );
-  }
-  else // s < d
-  {
-    uint8_t *nextd = d + len;
-
-    uint32_t diff = (uint32_t)s - (uint32_t)(d + 1); // extra offset because input calculation occurs before output is decremented
-    // This will underflow and be like adding a negative offset
-
-    // Can use 's' as a scratch reg now
-    __asm__ __volatile__ (
-      "clrs\n" // Align for parallelism (CO) - SH4a use "stc SR, Rn" instead with a dummy Rn
-    ".align 2\n"
-    "0:\n\t"
-      "dt %[size]\n\t" // (--len) ? 0 -> T : 1 -> T (EX 1)
-      "mov.b @(%[offset], %[out_end]), %[scratch]\n\t" // scratch = *(--nexts) where --nexts is nextd + underflow result (LS 2)
-      "bf.s 0b\n\t" // while(nextd != d) aka while(!T) (BR 1/2)
-      " mov.b %[scratch], @-%[out_end]\n" // *(--nextd) = scratch (LS 1/1)
-      : [out_end] "+&r" ((uint32_t)nextd), [scratch] "=&r" ((uint32_t)s), [size] "+&r" (len) // outputs
-      : [offset] "z" (diff) // inputs
-      : "t", "memory" // clobbers
-    );
-  }
-
-  return dest;
-}
-
 // -----------------------------------------------------------------------------
 // plm (high-level interface) implementation
 
@@ -992,7 +965,6 @@ plm_t *plm_create_with_buffer(plm_buffer_t *buffer, int destroy_when_done) {
 	}
 	PLM_MEMZERO(self, sizeof(plm_t));
 
-
 	self->demux = plm_demux_create(buffer, destroy_when_done);
 	self->video_enabled = TRUE;
 	self->audio_enabled = TRUE;
@@ -1015,7 +987,7 @@ int plm_init_decoders(plm_t *self) {
 			self->video_packet_type = PLM_DEMUX_PACKET_VIDEO_1;
 		}
 		if (!self->video_decoder) {
-			self->video_buffer = plm_buffer_create_with_capacity(PLM_BUFFER_DEFAULT_SIZE);
+			self->video_buffer = plm_buffer_create_with_capacity(PLM_VID_BUFFER_DEFAULT_SIZE);
 			plm_buffer_set_load_callback(self->video_buffer, plm_read_video_packet, self);
 			self->video_decoder = plm_video_create_with_buffer(self->video_buffer, TRUE);
 		}
@@ -1340,10 +1312,14 @@ void plm_read_packets(plm_t *self, int requested_type) {
 	plm_packet_t *packet;
 	while ((packet = plm_demux_decode(self->demux))) {
 		if (packet->type == self->video_packet_type) {
-			plm_buffer_write(self->video_buffer, packet->data, packet->length);
+			plm_buffer_write(self->video_buffer, packet->data0, packet->len0);
+			if(packet->data1)
+				plm_buffer_write(self->video_buffer, packet->data1, packet->len1);
 		}
 		else if (packet->type == self->audio_packet_type) {
-			plm_buffer_write(self->audio_buffer, packet->data, packet->length);
+			plm_buffer_write(self->audio_buffer, packet->data0, packet->len0);
+			if(packet->data1)
+				plm_buffer_write(self->video_buffer, packet->data1, packet->len1);
 		}
 
 		if (packet->type == requested_type) {
@@ -1394,7 +1370,9 @@ plm_frame_t *plm_seek_frame(plm_t *self, double time, int seek_exact) {
 	// Clear video buffer and decode the found packet
 	plm_video_rewind(self->video_decoder);
 	plm_video_set_time(self->video_decoder, packet->pts - start_time);
-	plm_buffer_write(self->video_buffer, packet->data, packet->length);
+	plm_buffer_write(self->video_buffer, packet->data0, packet->len0);
+	if(packet->data1)
+		plm_buffer_write(self->video_buffer, packet->data1, packet->len1);
 	plm_frame_t *frame = plm_video_decode(self->video_decoder);
 
 	// If we want to seek to an exact frame, we have to decode all frames
@@ -1442,14 +1420,18 @@ int plm_seek(plm_t *self, double time, int seek_exact) {
 	plm_packet_t *packet = NULL;
 	while ((packet = plm_demux_decode(self->demux))) {
 		if (packet->type == self->video_packet_type) {
-			plm_buffer_write(self->video_buffer, packet->data, packet->length);
+			plm_buffer_write(self->video_buffer, packet->data0, packet->len0);
+			if(packet->data1)
+				plm_buffer_write(self->video_buffer, packet->data1, packet->len1);
 		}
 		else if (
 			packet->type == self->audio_packet_type &&
 			packet->pts - start_time > self->time
 		) {
 			plm_audio_set_time(self->audio_decoder, packet->pts - start_time);
-			plm_buffer_write(self->audio_buffer, packet->data, packet->length);
+			plm_buffer_write(self->audio_buffer, packet->data0, packet->len0);
+			if(packet->data1)
+				plm_buffer_write(self->audio_buffer, packet->data1, packet->len1);
 			plm_decode(self, 0);
 			break;
 		}
@@ -1473,12 +1455,18 @@ struct plm_buffer_t {
 	size_t capacity;
 	size_t length;
 	size_t total_size;
+	size_t read_byte_pos;     /* byte index of first unread byte */
+    size_t write_byte_pos;    /* byte index one past last written byte */
 	int discard_read_bytes;
 	int has_ended;
 	int free_when_done;
 	int close_when_done;
 	PLM_FILE_TYPE fh;
+
 	plm_buffer_load_callback load_callback;
+	plm_buffer_seek_callback seek_callback;
+	plm_buffer_tell_callback tell_callback;
+
 	void *load_callback_user_data;
 	uint8_t *bytes;
 	enum plm_buffer_mode mode;
@@ -1498,7 +1486,10 @@ typedef struct {
 void plm_buffer_seek(plm_buffer_t *self, size_t pos);
 size_t plm_buffer_tell(plm_buffer_t *self);
 void plm_buffer_discard_read_bytes(plm_buffer_t *self);
+
 void plm_buffer_load_file_callback(plm_buffer_t *self, void *user);
+void plm_buffer_seek_file_callback(plm_buffer_t *self, size_t offset, void *user);
+size_t plm_buffer_tell_file_callback(plm_buffer_t *self, void *user);
 
 inline int plm_buffer_has(plm_buffer_t *self, size_t count);
 inline uint32_t plm_buffer_read(plm_buffer_t *self, int count);
@@ -1530,7 +1521,10 @@ plm_buffer_t *plm_buffer_create_with_file(PLM_FILE_TYPE fh, int close_when_done)
 	self->total_size = PLM_FILE_TELL(self->fh);
 	PLM_FILE_SEEK(self->fh, 0, SEEK_SET);
 
-	plm_buffer_set_load_callback(self, plm_buffer_load_file_callback, NULL);
+	self->load_callback = plm_buffer_load_file_callback;
+	self->seek_callback = plm_buffer_seek_file_callback;
+	self->tell_callback = plm_buffer_tell_file_callback;
+
 	return self;
 }
 
@@ -1562,7 +1556,7 @@ plm_buffer_t *plm_buffer_create_with_capacity(size_t capacity) {
 	PLM_MEMZERO(self, sizeof(plm_buffer_t));
 	self->capacity = capacity;
 	self->free_when_done = TRUE;
-	self->bytes = (uint8_t *)PLM_MALLOC(capacity);
+	self->bytes = (uint8_t *)PLM_MALLOC(capacity + PLM_PEEK_SIZE); // TODO: PLM_MEMALIGN(32, capacity)
 	if(!self->bytes) {
 		fprintf(stderr, "Out of memory for bytes. [plm_buffer_create_with_capacity]\n");
 		return NULL;
@@ -1604,16 +1598,155 @@ size_t plm_buffer_get_remaining(plm_buffer_t *self) {
 	return self->length - (self->bit_index >> 3);
 }
 
+inline size_t plm_buffer_get_space(plm_buffer_t *self) {
+    return self->capacity - self->length;
+}
+
+#define RB_MIN(a,b) ((a) < (b) ? (a) : (b))
+
+/* Advance by n with wrap; requires n <= capacity */
+inline size_t plm_buffer_ring_advance(plm_buffer_t *self, size_t pos, size_t n) {
+    pos += n;
+    if (pos >= self->capacity) // TODO or mod % ? Which is faster? return (pos + n) % self->capacity;
+		pos -= self->capacity;
+    return pos;
+}
+
+/* how many bytes are contiguous from pos until end of buffer */
+inline size_t plm_buffer_bytes_until_wrap(plm_buffer_t *self, size_t pos) {
+    return self->capacity - pos;
+}
+
+inline uint8_t *plm_buffer_ptr_from_read(const plm_buffer_t *self, size_t byte_off) {
+    size_t pos = (self->read_byte_pos + byte_off) & (self->capacity - 1);
+    return &self->bytes[pos]; /* safe for s[0..3] because of guard bytes */
+}
+
+/* Keep a 4-byte guard at the end of the allocation in sync with bytes[0..3].
+   This lets hot-path bit reads grab a 32-bit window (s[0..3]) without needing
+   any ring wrap checks when the read crosses the end of the buffer. */
+inline void plm_buffer_ring_sync_guard4(plm_buffer_t *self) {
+    self->bytes[self->capacity + 0] = self->bytes[0];
+    self->bytes[self->capacity + 1] = self->bytes[1];
+    self->bytes[self->capacity + 2] = self->bytes[2];
+    self->bytes[self->capacity + 3] = self->bytes[3];
+}
+
+/* Copy up to len bytes into plm_buffer_t. Returns bytes written. */
+inline size_t plm_buffer_ring_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
+    size_t first = RB_MIN(length, plm_buffer_bytes_until_wrap(self, self->write_byte_pos));
+    memcpy(&self->bytes[self->write_byte_pos], bytes, first);
+	self->write_byte_pos += first;
+	if (self->write_byte_pos == self->capacity) {
+        self->write_byte_pos = 0;
+    }
+
+    size_t remaining = length - first;
+    if (remaining) {
+        memcpy(&self->bytes[0], bytes + first, remaining);
+		self->write_byte_pos = remaining;
+    }
+
+    self->length += length;
+	self->has_ended = FALSE;
+
+	plm_buffer_ring_sync_guard4(self);
+
+    return length;
+}
+
+// int plm_buffer_ring_grow_memalign(plm_buffer_t *self, size_t new_capacity) {
+//     uint8_t *new_bytes = (uint8_t *)PLM_MEMALIGN(32, new_capacity); /* or malloc if no alignment need */
+//     if (!new_bytes) return -1;
+
+//     /* Copy unread data in order into new_bytes[0..length-1] */
+//     size_t first = RB_MIN(self->length, self->capacity - self->read_byte_pos);
+//     memcpy(new_bytes, self->bytes + self->read_byte_pos, first);
+//     if (self->length > first) {
+//         memcpy(new_bytes + first, self->bytes, self->length - first);
+//     }
+
+//     PLM_FREE(self->bytes);          /* or your aligned_free */
+//     self->bytes = new_bytes;
+//     self->capacity = new_capacity;
+//     self->read_byte_pos = 0;
+//     self->write_byte_pos = self->length;
+
+//     return 0;
+// }
+
+int plm_buffer_ring_grow_realloc(plm_buffer_t *self, size_t new_capacity) {
+    size_t old_capacity = self->capacity;
+    size_t old_write = self->write_byte_pos;
+
+    uint8_t *new_bytes = (uint8_t *)PLM_REALLOC(self->bytes, new_capacity + PLM_PEEK_SIZE);
+    if (!new_bytes) {
+        fprintf(stderr,
+            "PLM_REALLOC failed when trying to resize to %zu bytes [plm_buffer_ring_grow_realloc]\n",
+            new_capacity);
+        return -1;
+    }
+
+    self->bytes = new_bytes;
+
+    /* Wrapped unread data: [read..old_capacity) + [0..old_write) */
+    if (old_write < self->read_byte_pos) {
+        memcpy(self->bytes + old_capacity, self->bytes, old_write);
+        self->write_byte_pos = old_capacity + old_write;
+    }
+
+    self->capacity = new_capacity;
+
+    return 0;
+}
+
+inline int plm_buffer_ring_fs_read_into(plm_buffer_t *self, size_t want) {
+    /* One contiguous span until we wrap */
+    size_t contig = self->capacity - self->write_byte_pos;
+    size_t n1_want = (want < contig) ? want : contig;
+
+    int n1 = PLM_FILE_READ(self->fh, self->bytes + self->write_byte_pos, n1_want);
+    if (n1 <= 0) {
+		self->has_ended = TRUE;
+        return n1; /* 0 = EOF, <0 = error */
+    }
+
+    /* Commit first chunk */
+    self->write_byte_pos += (size_t)n1;
+    if (self->write_byte_pos >= self->capacity) {
+        self->write_byte_pos -= self->capacity;
+    }
+    self->length += (size_t)n1;
+
+    size_t remaining = want - (size_t)n1;
+    if (remaining == 0) {
+        return n1;
+    }
+
+    /* Wrapped chunk (write_byte_pos is now at start) */
+    int n2 = PLM_FILE_READ(self->fh, self->bytes + self->write_byte_pos, remaining);
+    if (n2 <= 0) {
+        return n1; /* keep what we got */
+    }
+
+    /* Commit second chunk */
+    self->write_byte_pos += (size_t)n2;
+    if (self->write_byte_pos >= self->capacity) {
+        self->write_byte_pos -= self->capacity;
+    }
+    self->length += (size_t)n2;
+
+	plm_buffer_ring_sync_guard4(self);
+
+    return n1 + n2;
+}
+
 size_t plm_buffer_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
 	if (self->mode == PLM_BUFFER_MODE_FIXED_MEM) {
 		return 0;
 	}
 
 	if (self->discard_read_bytes) {
-		// This should be a ring buffer, but instead it just shifts all unread
-		// data to the beginning of the buffer and appends new data at the end.
-		// Seems to be good enough.
-
 		plm_buffer_discard_read_bytes(self);
 		if (self->mode == PLM_BUFFER_MODE_RING) {
 			self->total_size = 0;
@@ -1621,25 +1754,20 @@ size_t plm_buffer_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
 	}
 
 	// Do we have to resize to fit the new data?
-	size_t bytes_available = self->capacity - self->length;
+	size_t bytes_available = plm_buffer_get_space(self);
 	if (bytes_available < length) {
 		size_t new_size = self->capacity;
 		do {
 			new_size *= 2;
 		} while (new_size - self->length < length);
-		uint8_t *new_bytes = (uint8_t *)PLM_REALLOC(self->bytes, new_size);
-		if (!new_bytes) {
-			// Handle failure: keep self->bytes as-is, or clean up
-			fprintf(stderr, "PLM_REALLOC failed when trying to resize to %zu bytes [plm_buffer_write]\n", new_size);
+
+		int result = plm_buffer_ring_grow_realloc(self, new_size);
+		if (result < 0)
 			return -1;
-		}
-		self->bytes = new_bytes;
-		self->capacity = new_size;
 	}
 
-	memcpy(self->bytes + self->length, bytes, length);
-	self->length += length;
-	self->has_ended = FALSE;
+	plm_buffer_ring_write(self, bytes, length);
+
 	return length;
 }
 
@@ -1659,17 +1787,11 @@ void plm_buffer_rewind(plm_buffer_t *self) {
 void plm_buffer_seek(plm_buffer_t *self, size_t pos) {
 	self->has_ended = FALSE;
 
-	if (self->mode == PLM_BUFFER_MODE_FILE) {
-		PLM_FILE_SEEK(self->fh, pos, SEEK_SET);
+	if (self->seek_callback) {
+		self->seek_callback(self, pos, self->load_callback_user_data);
 		self->bit_index = 0;
 		self->length = 0;
 	}
-	// DCL DIFF
-	// if (self->seek_callback) {
-	// 	self->seek_callback(self, pos, self->load_callback_user_data);
-	// 	self->bit_index = 0;
-	// 	self->length = 0;
-	// }
 	else if (self->mode == PLM_BUFFER_MODE_RING) {
 		if (pos != 0) {
 			// Seeking to non-0 is forbidden for dynamic-mem buffers
@@ -1685,22 +1807,33 @@ void plm_buffer_seek(plm_buffer_t *self, size_t pos) {
 }
 
 size_t plm_buffer_tell(plm_buffer_t *self) {
-	return self->mode == PLM_BUFFER_MODE_FILE
-		? PLM_FILE_TELL(self->fh) + (self->bit_index >> 3) - self->length
+	return self->tell_callback
+		? self->tell_callback(self, self->load_callback_user_data) + (self->bit_index >> 3) - self->length
 		: self->bit_index >> 3;
 }
 
 void plm_buffer_discard_read_bytes(plm_buffer_t *self) {
-	size_t byte_pos = self->bit_index >> 3;
-	if (byte_pos == self->length) {
-		self->bit_index = 0;
-		self->length = 0;
-	}
-	else if (byte_pos > 0) {
-		memmove_co(self->bytes, self->bytes + byte_pos, self->length - byte_pos);
-		self->bit_index -= byte_pos << 3;
-		self->length -= byte_pos;
-	}
+    size_t byte_pos = self->bit_index >> 3;
+    if (byte_pos == 0) return;
+
+    /* Advance read position with wrap */
+    self->read_byte_pos += byte_pos;
+    if (self->read_byte_pos >= self->capacity) {
+        self->read_byte_pos %= self->capacity;
+    }
+
+    /* Decrease buffered length */
+    self->length -= byte_pos;
+
+    /* Keep only remaining bit offset within current byte */
+    self->bit_index &= 7;
+
+    /* If empty, normalize (optional) */
+    if (self->length == 0) {
+        self->bit_index = 0;
+        self->read_byte_pos = 0;
+        self->write_byte_pos = 0;
+    }
 }
 
 void plm_buffer_load_file_callback(plm_buffer_t *self, void *user) {
@@ -1711,12 +1844,21 @@ void plm_buffer_load_file_callback(plm_buffer_t *self, void *user) {
 	}
 
 	size_t bytes_available = self->capacity - self->length;
-	size_t bytes_read = PLM_FILE_READ(self->fh, self->bytes + self->length, bytes_available);
-	self->length += bytes_read;
+	size_t bytes_read = plm_buffer_ring_fs_read_into(self, bytes_available);
 
 	if (bytes_read == 0) {
 		self->has_ended = TRUE;
 	}
+}
+
+void plm_buffer_seek_file_callback(plm_buffer_t *self, size_t offset, void *user) {
+	PLM_UNUSED(user);
+	PLM_FILE_SEEK(self->fh, offset, SEEK_SET);
+}
+
+size_t plm_buffer_tell_file_callback(plm_buffer_t *self, void *user) {
+	PLM_UNUSED(user);
+	return PLM_FILE_TELL(self->fh);
 }
 
 inline int plm_buffer_has_ended(plm_buffer_t *self) {
@@ -1745,19 +1887,20 @@ inline int plm_buffer_has(plm_buffer_t *self, size_t count) {
 // Gain 12%: https://github.com/bitbank2/pl_mpeg/blob/master/pl_mpeg.h
 inline uint32_t plm_buffer_read(plm_buffer_t *self, int count) {
 	uint32_t value = 0;
-    uint32_t bit_index = self->bit_index;
-    const uint8_t *s = &self->bytes[bit_index >> 3];
+    uint32_t bit_index = (uint32_t)self->bit_index;
+    size_t byte_off = (size_t)(bit_index >> 3);
+    const uint8_t *s = plm_buffer_ptr_from_read(self, byte_off);
 
-    /* Safe unaligned load (big-endian) */
-    uint32_t u32 =
+	/* Safe unaligned load (big-endian) */
+    uint32_t word_be =
         ((uint32_t)s[0] << 24) |
         ((uint32_t)s[1] << 16) |
         ((uint32_t)s[2] <<  8) |
         ((uint32_t)s[3] <<  0);
 
-    value = u32 << (bit_index & 7);
-    bit_index += count;
-    value >>= (32 - count);
+    value = word_be << (bit_index & 7);
+    bit_index += (uint32_t)count;
+    value >>= (32 - (uint32_t)count);
 
     self->bit_index = bit_index;
     return value;
@@ -1784,21 +1927,22 @@ inline int plm_buffer_skip_bytes(plm_buffer_t *self, uint8_t v) {
 }
 
 inline int plm_buffer_next_start_code(plm_buffer_t *self) {
-	plm_buffer_align(self);
+    plm_buffer_align(self);
 
-	while (plm_buffer_has(self, (5 << 3))) {
-		size_t byte_index = (self->bit_index) >> 3;
-		if (
-			self->bytes[byte_index] == 0x00 &&
-			self->bytes[byte_index + 1] == 0x00 &&
-			self->bytes[byte_index + 2] == 0x01
-		) {
-			self->bit_index = (byte_index + 4) << 3;
-			return self->bytes[byte_index + 3];
-		}
-		self->bit_index += 8;
-	}
-	return -1;
+    while (plm_buffer_has(self, (5u << 3))) {
+        size_t byte_index = (self->bit_index >> 3);
+        const uint8_t *s = plm_buffer_ptr_from_read(self, byte_index);
+
+        /* Thanks to the 4-byte guard, s[0..3] is always safe here */
+        if (s[0] == 0x00 && s[1] == 0x00 && s[2] == 0x01) {
+            self->bit_index = (uint32_t)((byte_index + 4) << 3);
+            return s[3];
+        }
+
+        self->bit_index += 8;
+    }
+
+    return -1;
 }
 
 inline int plm_buffer_find_start_code(plm_buffer_t *self, int code) {
@@ -2197,23 +2341,63 @@ plm_packet_t *plm_demux_seek(plm_demux_t *self, double seek_time, int type, int 
 			// position of the start of this packet. We want to jump back to it
 			// later, when we know it's the last intra frame before desired
 			// seek time.
+			//
 			if (force_intra) {
-				for (size_t i = 0; i < packet->length - 6; i++) {
-					// Find the START_PICTURE code
-					if (
-						packet->data[i] == 0x00 &&
-						packet->data[i + 1] == 0x00 &&
-						packet->data[i + 2] == 0x01 &&
-						packet->data[i + 3] == 0x00
-					) {
-						// Bits 11--13 in the picture header contain the frame
-						// type, where 1=Intra
-						if ((packet->data[i + 5] & 0x38) == 8) {
+				const uint8_t *a = packet->data0;
+				size_t a_len = packet->len0;
+
+				const uint8_t *b = packet->data1;
+				size_t b_len = packet->len1;
+
+				/* total bytes == a_len + b_len */
+				size_t total = packet->length;
+
+				/* --- 1) Scan windows fully inside span 0 --- */
+				for (size_t i = 0; i + 6 <= a_len; i++) {
+					if (a[i] == 0x00 && a[i + 1] == 0x00 && a[i + 2] == 0x01 && a[i + 3] == 0x00) {
+						if ((a[i + 5] & 0x38) == 0x08) {
 							last_valid_packet_start = packet_start;
 						}
-						break;
+						goto found_picture;
 					}
 				}
+
+				/* --- 2) Scan windows that cross the span boundary (at most 5 starts) --- */
+				if (b_len) {
+					size_t start = (a_len >= 5) ? (a_len - 5) : 0;
+					for (size_t i = start; i < a_len; i++) {
+						if (i + 6 > total) break; /* not enough bytes left in packet */
+
+						/* Pull the 6-byte window across the boundary (small loop, not hot) */
+						uint8_t w0 = a[i + 0];
+						uint8_t w1 = (i + 1 < a_len) ? a[i + 1] : b[(i + 1) - a_len];
+						uint8_t w2 = (i + 2 < a_len) ? a[i + 2] : b[(i + 2) - a_len];
+						uint8_t w3 = (i + 3 < a_len) ? a[i + 3] : b[(i + 3) - a_len];
+
+						if (w0 == 0x00 && w1 == 0x00 && w2 == 0x01 && w3 == 0x00) {
+							uint8_t w5 = (i + 5 < a_len) ? a[i + 5] : b[(i + 5) - a_len];
+							if ((w5 & 0x38) == 0x08) {
+								last_valid_packet_start = packet_start;
+							}
+							goto found_picture;
+						}
+					}
+				}
+
+				/* --- 3) Scan windows fully inside span 1 --- */
+				if (b_len) {
+					for (size_t j = 0; j + 6 <= b_len; j++) {
+						if (b[j] == 0x00 && b[j + 1] == 0x00 && b[j + 2] == 0x01 && b[j + 3] == 0x00) {
+							if ((b[j + 5] & 0x38) == 0x08) {
+								last_valid_packet_start = packet_start;
+							}
+							goto found_picture;
+						}
+					}
+				}
+
+			found_picture:
+				;
 			}
 
 			// If we don't want intra frames, just use the last PTS found.
@@ -2340,17 +2524,39 @@ plm_packet_t *plm_demux_decode_packet(plm_demux_t *self, int type) {
 }
 
 plm_packet_t *plm_demux_get_packet(plm_demux_t *self) {
-	if (!plm_buffer_has(self->buffer, self->next_packet.length << 3)) {
-		return NULL;
-	}
+    plm_buffer_t *b = self->buffer;
+    size_t need_bytes = self->next_packet.length;
 
-	self->current_packet.data = self->buffer->bytes + (self->buffer->bit_index >> 3);
-	self->current_packet.length = self->next_packet.length;
-	self->current_packet.type = self->next_packet.type;
-	self->current_packet.pts = self->next_packet.pts;
+    if (!plm_buffer_has(b, need_bytes << 3)) {
+        return NULL;
+    }
 
-	self->next_packet.length = 0;
-	return &self->current_packet;
+    size_t byte_off = (size_t)(b->bit_index >> 3);
+    uint8_t *p = plm_buffer_ptr_from_read(b, byte_off);
+
+    size_t pos = (size_t)(p - b->bytes);
+    size_t contig = plm_buffer_bytes_until_wrap(b, pos);
+
+    self->current_packet.type = self->next_packet.type;
+    self->current_packet.pts = self->next_packet.pts;
+    self->current_packet.length = need_bytes;
+
+    if (need_bytes <= contig) {
+        /* Not wrapped: single span */
+        self->current_packet.data0 = p;
+        self->current_packet.len0  = need_bytes;
+        self->current_packet.data1 = NULL;
+        self->current_packet.len1  = 0;
+    } else {
+        /* Wrapped: two spans */
+        self->current_packet.data0 = p;
+        self->current_packet.len0  = contig;
+        self->current_packet.data1 = b->bytes;              /* wraps to start */
+        self->current_packet.len1  = need_bytes - contig;
+    }
+
+    self->next_packet.length = 0;
+    return &self->current_packet;
 }
 
 
@@ -2821,8 +3027,8 @@ struct plm_video_t {
 	uint8_t *frames_data;
 
 	int block_data[64];
-	uint8_t intra_quant_matrix[64];
-	uint8_t non_intra_quant_matrix[64];
+	uint8_t intra_quant_matrix[64]; // TODO Align to 32 Bytes
+	uint8_t non_intra_quant_matrix[64]; // TODO Align to 32 Bytes
 
 	int has_reference_frame;
 	int assume_no_b_frames;
@@ -3078,6 +3284,7 @@ int plm_video_decode_sequence_header(plm_video_t *self) {
 		}
 	}
 	else {
+		// TODO Replace with special memcpy since both arrays will be 32 byte aligned
 		memcpy(self->intra_quant_matrix, PLM_VIDEO_INTRA_QUANT_MATRIX, 64);
 	}
 
@@ -3089,6 +3296,7 @@ int plm_video_decode_sequence_header(plm_video_t *self) {
 		}
 	}
 	else {
+		// TODO Replace with special memcpy since both arrays will be 32 byte aligned
 		memcpy(self->non_intra_quant_matrix, PLM_VIDEO_NON_INTRA_QUANT_MATRIX, 64);
 	}
 
@@ -3188,7 +3396,6 @@ void plm_video_decode_picture(plm_video_t *self) {
 		self->frame_forward = self->frame_backward;
 	}
 
-
 	// Find first slice start code; skip extension and user data
 	do {
 		self->start_code = plm_buffer_next_start_code(self->buffer);
@@ -3282,7 +3489,6 @@ void plm_video_decode_picture(plm_video_t *self) {
 			d_y += scan * 15;
 		}
 	}
-
 
 	// If this is a reference picture rotate the prediction pointers
 	if (
@@ -4462,6 +4668,10 @@ plm_audio_t *plm_audio_create_with_buffer(plm_buffer_t *buffer, int destroy_when
 	//memcpy(self->D, PLM_AUDIO_SYNTHESIS_WINDOW, 512 * sizeof(float));
 	//memcpy(self->D + 512, PLM_AUDIO_SYNTHESIS_WINDOW, 512 * sizeof(float));
 
+	/* Build a window table in a layout that's faster for the Dreamcast.
+	   We write the synthesis window into self->D in the exact order the
+	   decoder will read it (grab every 32nd value), and we write each chunk
+	   twice so later code can read straight through without wrap-around. */
 	float *d = self->D;
 	float *s = (float *)PLM_AUDIO_SYNTHESIS_WINDOW;
 	for (int i = 0; i < 32; i++)
@@ -4574,18 +4784,34 @@ plm_samples_t *plm_audio_decode(plm_audio_t *self) {
 }
 
 int plm_audio_find_frame_sync(plm_audio_t *self) {
-	size_t i;
-	for (i = self->buffer->bit_index >> 3; i < self->buffer->length-1; i++) {
-		if (
-			self->buffer->bytes[i] == 0xFF &&
-			(self->buffer->bytes[i+1] & 0xFE) == 0xFC
-		) {
-			self->buffer->bit_index = ((i+1) << 3) + 3;
-			return TRUE;
-		}
-	}
-	self->buffer->bit_index = (i + 1) << 3;
-	return FALSE;
+    plm_buffer_t *b = self->buffer;
+
+    size_t start = (size_t)(b->bit_index >> 3);
+    if (b->length < 2 || start > b->length - 2) {
+        b->bit_index = (uint32_t)(b->length << 3);
+        return FALSE;
+    }
+
+    size_t i = start;
+    const uint8_t *p = plm_buffer_ptr_from_read(b, start);
+
+    /* Scan pairs up to (length-2, length-1) */
+    for (; i < b->length - 1; i++) {
+        /* p[1] is always safe because of the 4-byte mirror at end */
+        if (p[0] == 0xFF && (p[1] & 0xFE) == 0xFC) {
+            b->bit_index = (uint32_t)(((i + 1) << 3) + 3);
+            return TRUE;
+        }
+
+        /* Advance one byte with wrap */
+        p++;
+        if (p == b->bytes + b->capacity) {
+            p = b->bytes; /* wrap to start */
+        }
+    }
+
+    b->bit_index = (uint32_t)((i + 1) << 3);
+    return FALSE;
 }
 
 int plm_audio_decode_header(plm_audio_t *self) {
