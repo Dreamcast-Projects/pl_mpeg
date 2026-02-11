@@ -96,6 +96,7 @@ static void play_manual(void) {
         if(result == MPEG_DECODE_EOF)
             break;
 
+        pvr_wait_ready();
         pvr_scene_begin();
         if(result == MPEG_DECODE_FRAME)
             mpeg_upload_frame(player);

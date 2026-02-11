@@ -10,11 +10,14 @@ struct mpeg_player_t {
     /* Pointer to a decoded video frame */
     plm_frame_t *frame;
 
+    /* Pointer to a decoded video frame */
+    plm_samples_t *sample;
+
     /* PVR list type the video frame will be rendered to */
     pvr_list_type_t list_type;
 
     /* SH4 side sound buffer */
-    uint32_t *snd_buf;
+    uint8_t *snd_buf;
 
     /* Texture that holds decoded data */
     pvr_ptr_t texture;
@@ -26,10 +29,13 @@ struct mpeg_player_t {
     int height;
 
     /* Start position for sound module playback */
-    int snd_mod_start;
+    int snd_pcm_offset;
 
     /* Size of the sound module data */
-    int snd_mod_size;
+    int snd_pcm_leftovers;
+
+    /* Volume */
+    int snd_volume;
 
     /* Audio sample rate */
     int sample_rate;
@@ -56,7 +62,7 @@ static int mpeg_texture_height;
 #define SOUND_BUFFER (64 * 1024)
 
 static int setup_graphics(mpeg_player_t *player, const mpeg_player_options_t *options);
-static int setup_audio(mpeg_player_t *player, uint8_t volume);
+static int setup_audio(mpeg_player_t *player);
 static void fast_memcpy(void *dest, const void *src, size_t length);
 
 static uint32_t next_power_of_two(uint32_t n) {
@@ -81,8 +87,8 @@ static inline void sound_stream_reset(mpeg_player_t *player) {
     if(player->start_time != 0)
         snd_stream_stop(player->snd_hnd);
 
-    player->snd_mod_size = 0;
-    player->snd_mod_start = 0;
+    player->snd_pcm_leftovers = 0;
+    player->snd_pcm_offset = 0;
 }
 
 static int mpeg_check_cancel(const mpeg_cancel_options_t *opt) {
@@ -127,6 +133,33 @@ static int mpeg_check_cancel(const mpeg_cancel_options_t *opt) {
 /** Default MPEG player options used when NULL is passed to *_ex() functions. */
 static const mpeg_player_options_t MPEG_PLAYER_OPTIONS_DEFAULT = MPEG_PLAYER_OPTIONS_INITIALIZER;
 
+static bool mpeg_player_init(mpeg_player_t *player, const mpeg_player_options_t *opts) {
+    plm_set_loop(player->decoder, opts->loop);
+
+    player->snd_buf = (uint8_t *)MPEG_MEMALIGN(32, SOUND_BUFFER);
+    if(!player->snd_buf) {
+        fprintf(stderr, "Out of memory for player->snd_buf\n");
+        mpeg_player_destroy(player);
+        return false;
+    }
+
+    player->list_type = opts->list_type;
+    player->snd_volume = opts->volume;
+    if(setup_graphics(player, opts) < 0) {
+        fprintf(stderr, "Setting up graphics failed\n");
+        mpeg_player_destroy(player);
+        return false;
+    }
+
+    if(setup_audio(player) < 0) {
+        fprintf(stderr, "Setting up audio failed\n");
+        mpeg_player_destroy(player);
+        return false;
+    }
+
+    return true;
+}
+
 mpeg_player_t *mpeg_player_create_ex(const char *filename, const mpeg_player_options_t *options) {
     mpeg_player_t *player = NULL;
     const mpeg_player_options_t *opts = options ? options : &MPEG_PLAYER_OPTIONS_DEFAULT;
@@ -151,27 +184,9 @@ mpeg_player_t *mpeg_player_create_ex(const char *filename, const mpeg_player_opt
         mpeg_player_destroy(player);
         return NULL;
     }
-    plm_set_loop(player->decoder, opts->loop);
 
-    player->snd_buf = (uint32_t *)MPEG_MEMALIGN(32, SOUND_BUFFER);
-    if(!player->snd_buf) {
-        fprintf(stderr, "Out of memory for player->snd_buf\n");
-        mpeg_player_destroy(player);
+    if(!mpeg_player_init(player, opts))
         return NULL;
-    }
-
-    player->list_type = opts->list_type;
-    if(setup_graphics(player, opts) < 0) {
-        fprintf(stderr, "Setting up graphics failed\n");
-        mpeg_player_destroy(player);
-        return NULL;
-    }
-
-    if(setup_audio(player, opts->volume) < 0) {
-        fprintf(stderr, "Setting up audio failed\n");
-        mpeg_player_destroy(player);
-        return NULL;
-    }
 
     return player;
 }
@@ -200,27 +215,9 @@ mpeg_player_t *mpeg_player_create_memory_ex(unsigned char *memory, const size_t 
         mpeg_player_destroy(player);
         return NULL;
     }
-    plm_set_loop(player->decoder, opts->loop);
 
-    player->snd_buf = (uint32_t *)MPEG_MEMALIGN(32, SOUND_BUFFER);
-    if(!player->snd_buf) {
-        fprintf(stderr, "Out of memory for player->snd_buf\n");
-        mpeg_player_destroy(player);
+    if(!mpeg_player_init(player, opts))
         return NULL;
-    }
-
-    player->list_type = opts->list_type;
-    if(setup_graphics(player, opts) < 0) {
-        fprintf(stderr, "Setting up graphics failed\n");
-        mpeg_player_destroy(player);
-        return NULL;
-    }
-
-    if(setup_audio(player, opts->volume) < 0) {
-        fprintf(stderr, "Setting up audio failed\n");
-        mpeg_player_destroy(player);
-        return NULL;
-    }
 
     return player;
 }
@@ -234,14 +231,24 @@ mpeg_player_t *mpeg_player_create_memory(uint8_t *memory, const size_t length) {
 }
 
 int mpeg_player_get_loop(mpeg_player_t *player) {
+    if(!player)
+        return -1;
+
     return plm_get_loop(player->decoder);
 }
 
 void mpeg_player_set_loop(mpeg_player_t *player, int loop) {
+    if(!player)
+        return;
+
     plm_set_loop(player->decoder, loop);
 }
 
 void mpeg_player_set_volume(mpeg_player_t *player, uint8_t volume) {
+    if(!player)
+        return;
+
+    player->snd_volume = volume;
     snd_stream_volume(player->snd_hnd, volume);
 }
 
@@ -249,18 +256,14 @@ void mpeg_player_destroy(mpeg_player_t *player) {
     if(!player)
         return;
 
-    if(player->snd_hnd != SND_STREAM_INVALID) {
-        snd_stream_stop(player->snd_hnd);
-        snd_stream_destroy(player->snd_hnd);
-    }
-
     if(player->texture) {
         MPEG_PVR_FREE(player->texture);
         player->texture = NULL;
     }
 
-    if(player->snd_buf) {
-        MPEG_FREE(player->snd_buf);
+    if(player->snd_hnd != SND_STREAM_INVALID) {
+        snd_stream_destroy(player->snd_hnd);
+        player->snd_hnd = SND_STREAM_INVALID;
         player->snd_buf = NULL;
     }
 
@@ -282,6 +285,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
     /* Init sound stream. */
     sound_stream_reset(player);
     snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+    snd_stream_volume(player->snd_hnd, player->snd_volume);
 
     player->frame = plm_decode_video(player->decoder);
     if(!player->frame) {
@@ -289,11 +293,11 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
         sound_stream_reset(player);
         return MPEG_PLAY_ERROR;
     }
-    uint64_t start = timer_ns_gettime64();
+    player->start_time = timer_ns_gettime64();
 
     while(true) {
         /* Get elapsed playback time */
-        double playback_time = (timer_ns_gettime64() - start) * 1e-9f;
+        double playback_time = (timer_ns_gettime64() - player->start_time) * 1e-9f;
 
         /* Check cancel matching */
         int cancel = mpeg_check_cancel(cancel_options);
@@ -307,17 +311,23 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
 
         if(playback_time >= player->frame->time) {
             /* Render the current frame */
+            pvr_wait_ready();
             pvr_scene_begin();
+            mpeg_upload_frame(player);
+
             pvr_list_begin(player->list_type);
 
-            mpeg_upload_frame(player);
             mpeg_draw_frame(player);
 
             pvr_list_finish();
             pvr_scene_finish();
 
             /* Decode the NEXT frame to have it ready */
+            //uint64_t startd_time = timer_ns_gettime64();
             player->frame = plm_decode_video(player->decoder);
+            //uint64_t decode_time = timer_ns_gettime64() - startd_time;
+            //printf("%" PRIu64 "\n", decode_time);
+
             if(!player->frame) {
                 /* Are we looping? */
                 if(!plm_get_loop(player->decoder)) {
@@ -328,6 +338,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
                 /* We are looping. Reset and restart */
                 sound_stream_reset(player);
                 snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+                snd_stream_volume(player->snd_hnd, player->snd_volume);
 
                 player->frame = plm_decode_video(player->decoder);
                 if(!player->frame) {
@@ -335,7 +346,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
                     goto finish;
                 }
 
-                start = timer_ns_gettime64();
+                player->start_time = timer_ns_gettime64();
             }
         }
     }
@@ -343,6 +354,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
 finish:
     /* Reset some stuff */
     sound_stream_reset(player);
+    player->start_time = 0;
 
     return result;
 }
@@ -363,6 +375,7 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
         /* Init sound stream. */
         sound_stream_reset(player);
         snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+        snd_stream_volume(player->snd_hnd, player->snd_volume);
 
         /* Prime the first frame */
         player->frame = plm_decode_video(player->decoder);
@@ -397,6 +410,7 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
         /* We are Looping. Reset and restart */
         sound_stream_reset(player);
         snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+        snd_stream_volume(player->snd_hnd, player->snd_volume);
 
         player->frame = plm_decode_video(player->decoder);
         if(!player->frame) {
@@ -415,6 +429,10 @@ void mpeg_upload_frame(mpeg_player_t *player) {
     if(!player || !player->frame)
         return;
 
+    /* HACK: Fix Flycast */
+    PVR_SET(PVR_YUV_CFG, (((mpeg_texture_height / 16) - 1) << 8) |
+                      ((mpeg_texture_width / 16) - 1));
+
     uint32_t *src = player->frame->display;
 
     /* Video size in macroblocks (16x16) */
@@ -432,14 +450,14 @@ void mpeg_upload_frame(mpeg_player_t *player) {
     const int pvr_blocks_per_row = mpeg_texture_width >> 4;
     const int pad_blocks_x = pvr_blocks_per_row - video_blocks_w;
 
-    uint32_t *d = SQ_MASK_DEST((void *)PVR_TA_YUV_CONV);
-    sq_lock((void *)PVR_TA_YUV_CONV);
-
     /*
      * Each macroblock is 384 bytes = 96 uint32_t
      * sq_fast_cpy works in 32-byte chunks → 384 / 32 = 12 iterations
      */
     const int mb_sq_iters = 384 / 32;
+
+    uint32_t *d = SQ_MASK_DEST((void *)PVR_TA_YUV_CONV);
+    sq_lock((void *)PVR_TA_YUV_CONV);
 
     for(int y = 0; y < video_blocks_h; y++) {
         /* Upload real macroblocks */
@@ -568,68 +586,65 @@ static int setup_graphics(mpeg_player_t *player, const mpeg_player_options_t *op
     return 0;
 }
 
-static void *sound_callback(snd_stream_hnd_t hnd, int size, int *size_out) {
-    plm_samples_t *sample;
+static void *sound_callback(snd_stream_hnd_t hnd, int request_size, int *size_out) {
     mpeg_player_t *player = (mpeg_player_t *)snd_stream_get_userdata(hnd);
-    uint32_t *dest = player->snd_buf;
-    int out = player->snd_mod_size;
+    uint8_t *dest = player->snd_buf;
+    int out = player->snd_pcm_leftovers;
 
     if(out > 0)
-        fast_memcpy(dest, player->snd_buf + player->snd_mod_start / 4, out);
+        fast_memcpy(dest, (uint8_t *)player->sample->pcm + player->snd_pcm_offset, out);
 
-    while(size > out) {
-        sample = plm_decode_audio(player->decoder);
-        if(!sample)
+    while(request_size > out) {
+        player->sample = plm_decode_audio(player->decoder);
+        if(!player->sample)
             break;
 
-        fast_memcpy(dest + out / 4, sample->pcm, 1152 * 2);
+        /* We decode this many bytes every sample */
+        int chunk = 1152 * 2;
+        if(out + chunk > request_size)
+            chunk = request_size - out;
+
+        fast_memcpy(dest + out, player->sample->pcm, chunk);
         out += 1152 * 2;
     }
 
-    player->snd_mod_start = size;
-    player->snd_mod_size = out - size;
-    *size_out = size;
+    player->snd_pcm_offset = request_size;
+    player->snd_pcm_leftovers = out - request_size;
+    *size_out = request_size;
 
     return player->snd_buf;
 }
 
-static int setup_audio(mpeg_player_t *player, uint8_t volume) {
-    player->snd_mod_size = 0;
-    player->snd_mod_start = 0;
+static int setup_audio(mpeg_player_t *player) {
+    player->snd_pcm_leftovers = 0;
+    player->snd_pcm_offset = 0;
     player->sample_rate = plm_get_samplerate(player->decoder);
 
     player->snd_hnd = snd_stream_alloc(sound_callback, SOUND_BUFFER);
     if(player->snd_hnd == SND_STREAM_INVALID)
         return -1;
 
-    snd_stream_volume(player->snd_hnd, volume);
     snd_stream_set_userdata(player->snd_hnd, player);
 
     return 0;
 }
 
 static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, size_t length) {
-    int blocks;
-    int remainder;
-    char *char_dest = (char *)dest;
-    const char *char_src = (const char *)src;
+    uintptr_t dest_ptr = (uintptr_t)dest;
+    uintptr_t src_ptr = (uintptr_t)src;
 
-    _Complex float ds;
-    _Complex float ds2;
-    _Complex float ds3;
-    _Complex float ds4;
+    _Complex float ds, ds2, ds3, ds4;
 
-    if(((uintptr_t)dest | (uintptr_t)src) & 7) {
+    if(((dest_ptr | src_ptr) & 7) || length < 32) {
         memcpy(dest, src, length);
     }
     else { /* Fast Path */
-        blocks = length / 32;
-        remainder = length % 32;
+        int blocks = (int)(length >> 5);
+        int remainder = (int)(length & 31);
 
         if(blocks > 0) {
             __asm__ __volatile__ (
                 "fschg\n\t"
-                "clrs\n"
                 ".align 2\n"
                 "1:\n\t"
                 /* *dest++ = *src++ */
@@ -647,13 +662,20 @@ static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, s
                 "bf.s 1b\n\t"
                 "add #32, %[out]\n\t"
                 "fschg\n"
-                : [in] "+&r" ((uintptr_t)src), [out] "+&r" ((uintptr_t)dest),
-                [blocks] "+&r" (blocks), [scratch] "=&d" (ds), [scratch2] "=&d" (ds2),
-                [scratch3] "=&d" (ds3), [scratch4] "=&d" (ds4) /* outputs */
-                : [r0] "z" (remainder) /* inputs */
+                : [in] "+&r" (src_ptr),
+                  [out] "+&r" (dest_ptr),
+                  [blocks] "+&r" (blocks),
+                  [scratch] "=&d" (ds),
+                  [scratch2] "=&d" (ds2),
+                  [scratch3] "=&d" (ds3),
+                  [scratch4] "=&d" (ds4) /* outputs */
+                : [r0] "z" (0) /* inputs */
                 : "t", "memory" /* clobbers */
             );
         }
+
+        char *char_dest = (char *)dest_ptr;
+        const char *char_src = (const char *)src_ptr;
 
         while(remainder--)
             *char_dest++ = *char_src++;
