@@ -308,6 +308,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
 
         if(playback_time >= player->frame->time) {
             /* Render the current frame */
+            pvr_wait_ready();
             pvr_scene_begin();
             mpeg_upload_frame(player);
 
