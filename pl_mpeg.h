@@ -175,6 +175,8 @@ extern "C" {
 
 #define PLM_UNUSED(expr) (void)(expr)
 
+#define PLM_MIN(a,b) ((a) < (b) ? (a) : (b))
+
 // -----------------------------------------------------------------------------
 // Public Data Types
 
@@ -199,12 +201,12 @@ typedef struct {
     int type;
     double pts;
 
-    size_t length;      /* total bytes (len0 + len1) */
+    size_t length;      // Total bytes (len0 + len1)
 
-    uint8_t *data0;     /* first span */
+    uint8_t *data0;     // Ring buffer: first span
     size_t   len0;
 
-    uint8_t *data1;     /* second span (NULL if not wrapped) */
+    uint8_t *data1;     // Ring buffer: second span (NULL if not wrapped)
     size_t   len1;
 } plm_packet_t;
 
@@ -501,6 +503,8 @@ plm_frame_t *plm_seek_frame(plm_t *self, double time, int seek_exact);
 #define PLM_BUFFER_DEFAULT_SIZE (32 * 1024)
 #endif
 
+// The default size for vid buffers to save ourselves from many reallocations.
+// At minimum should be 128 * 1024 because that is what 320x240 videos require.
 #ifndef PLM_VID_BUFFER_DEFAULT_SIZE
 #define PLM_VID_BUFFER_DEFAULT_SIZE (128 * 1024)
 #endif
@@ -1448,8 +1452,8 @@ struct plm_buffer_t {
 	size_t capacity;
 	size_t length;
 	size_t total_size;
-	size_t read_byte_pos;     /* byte index of first unread byte */
-    size_t write_byte_pos;    /* byte index one past last written byte */
+	size_t read_byte_pos;     // Byte index of first unread byte
+    size_t write_byte_pos;    // Byte index one past last written byte
 	int discard_read_bytes;
 	int has_ended;
 	int free_when_done;
@@ -1596,71 +1600,45 @@ inline size_t plm_buffer_get_space(plm_buffer_t *self) {
     return self->capacity - self->length;
 }
 
-#define RB_MIN(a,b) ((a) < (b) ? (a) : (b))
-
-/* Advance by n with wrap; requires n <= capacity */
-inline size_t plm_buffer_ring_advance(plm_buffer_t *self, size_t pos, size_t n) {
-    pos += n;
-    if (pos >= self->capacity) // TODO or mod % ? Which is faster? return (pos + n) % self->capacity;
-		pos -= self->capacity;
-    return pos;
-}
-
-/* how many bytes are contiguous from pos until end of buffer */
+// How many bytes are contiguous from pos until end of buffer
 inline size_t plm_buffer_bytes_until_wrap(plm_buffer_t *self, size_t pos) {
     return self->capacity - pos;
 }
 
+// (self->capacity - 1) is mod[%] trick that can only be used with capacity that are
+// powers of 2.
 inline uint8_t *plm_buffer_ptr_from_read(const plm_buffer_t *self, size_t byte_off) {
     size_t pos = (self->read_byte_pos + byte_off) & (self->capacity - 1);
-    return &self->bytes[pos]; /* safe for s[0..3] because of guard bytes */
+    return &self->bytes[pos]; // Safe for bytes[0..3] because of guard bytes
 }
 
-/* Keep a 4-byte guard at the end of the allocation in sync with bytes[0..3].
-   This lets hot-path bit reads grab a 32-bit window (s[0..3]) without needing
-   any ring wrap checks when the read crosses the end of the buffer. */
-inline void plm_buffer_ring_sync_guard4(plm_buffer_t *self) {
+// Keep a 4-byte guard at the end of the allocation in sync with bytes[0..3].
+// This lets hot-path bit reads grab a 32-bit window (s[0..3]) without needing
+// any ring wrap checks when the read crosses the end of the buffer.
+inline void plm_buffer_ring_sync_guard(plm_buffer_t *self) {
     self->bytes[self->capacity + 0] = self->bytes[0];
     self->bytes[self->capacity + 1] = self->bytes[1];
     self->bytes[self->capacity + 2] = self->bytes[2];
     self->bytes[self->capacity + 3] = self->bytes[3];
 }
 
-/* Copy up to len bytes into plm_buffer_t. Returns bytes written. */
-inline size_t plm_buffer_ring_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
-    size_t first = RB_MIN(length, plm_buffer_bytes_until_wrap(self, self->write_byte_pos));
-    memcpy(&self->bytes[self->write_byte_pos], bytes, first);
-	self->write_byte_pos += first;
-	if (self->write_byte_pos == self->capacity) {
-        self->write_byte_pos = 0;
-    }
-
-    size_t remaining = length - first;
-    if (remaining) {
-        memcpy(&self->bytes[0], bytes + first, remaining);
-		self->write_byte_pos = remaining;
-    }
-
-    self->length += length;
-	self->has_ended = FALSE;
-
-	plm_buffer_ring_sync_guard4(self);
-
-    return length;
-}
-
 // int plm_buffer_ring_grow_memalign(plm_buffer_t *self, size_t new_capacity) {
-//     uint8_t *new_bytes = (uint8_t *)PLM_MEMALIGN(32, new_capacity); /* or malloc if no alignment need */
-//     if (!new_bytes) return -1;
+//     uint8_t *new_bytes = (uint8_t *)PLM_MEMALIGN(32, new_capacity); // or malloc if no alignment need
+// 	if (!new_bytes) {
+//         fprintf(stderr,
+//             "PLM_MEMALIGN failed when trying to resize to %zu bytes [plm_buffer_ring_grow_memalign]\n",
+//             new_capacity);
+//         return -1;
+//     }
 
-//     /* Copy unread data in order into new_bytes[0..length-1] */
-//     size_t first = RB_MIN(self->length, self->capacity - self->read_byte_pos);
+//     // Copy unread data in order into new_bytes[0..length-1]
+//     size_t first = PLM_MIN(self->length, self->capacity - self->read_byte_pos);
 //     memcpy(new_bytes, self->bytes + self->read_byte_pos, first);
 //     if (self->length > first) {
 //         memcpy(new_bytes + first, self->bytes, self->length - first);
 //     }
 
-//     PLM_FREE(self->bytes);          /* or your aligned_free */
+//     PLM_FREE(self->bytes);          // or your aligned_free
 //     self->bytes = new_bytes;
 //     self->capacity = new_capacity;
 //     self->read_byte_pos = 0;
@@ -1683,7 +1661,7 @@ int plm_buffer_ring_grow_realloc(plm_buffer_t *self, size_t new_capacity) {
 
     self->bytes = new_bytes;
 
-    /* Wrapped unread data: [read..old_capacity) + [0..old_write) */
+    // Wrapped unread data: [read..old_capacity) + [0..old_write)
     if (old_write < self->read_byte_pos) {
         memcpy(self->bytes + old_capacity, self->bytes, old_write);
         self->write_byte_pos = old_capacity + old_write;
@@ -1694,45 +1672,65 @@ int plm_buffer_ring_grow_realloc(plm_buffer_t *self, size_t new_capacity) {
     return 0;
 }
 
+// Copy up to len bytes into plm_buffer_t. Returns bytes written.
+inline size_t plm_buffer_ring_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
+    size_t first = PLM_MIN(length, plm_buffer_bytes_until_wrap(self, self->write_byte_pos));
+    memcpy(&self->bytes[self->write_byte_pos], bytes, first);
+	self->write_byte_pos += first;
+	if (self->write_byte_pos == self->capacity) {
+        self->write_byte_pos = 0;
+    }
+
+    size_t remaining = length - first;
+    if (remaining) {
+        memcpy(&self->bytes[0], bytes + first, remaining);
+		self->write_byte_pos = remaining;
+    }
+
+    self->length += length;
+	self->has_ended = FALSE;
+
+	plm_buffer_ring_sync_guard(self);
+
+    return length;
+}
+
 inline int plm_buffer_ring_fs_read_into(plm_buffer_t *self, size_t want) {
-    /* One contiguous span until we wrap */
-    size_t contig = self->capacity - self->write_byte_pos;
-    size_t n1_want = (want < contig) ? want : contig;
+    // One contiguous span until we wrap
+    size_t bytes_until_wrap = plm_buffer_bytes_until_wrap(self, self->write_byte_pos);
+    size_t first_chunk_want = (want < bytes_until_wrap) ? want : bytes_until_wrap;
 
-    int n1 = PLM_FILE_READ(self->fh, self->bytes + self->write_byte_pos, n1_want);
-    if (n1 <= 0) {
-		self->has_ended = TRUE;
-        return n1; /* 0 = EOF, <0 = error */
+    int first_chunk_read = PLM_FILE_READ(self->fh, self->bytes + self->write_byte_pos, first_chunk_want);
+    if (first_chunk_read <= 0) {
+        self->has_ended = TRUE;
+        return first_chunk_read; // 0 = EOF, <0 = error
     }
 
-    /* Commit first chunk */
-    self->write_byte_pos += (size_t)n1;
+    // Commit first chunk
+    self->write_byte_pos += (size_t)first_chunk_read;
     if (self->write_byte_pos >= self->capacity) {
         self->write_byte_pos -= self->capacity;
     }
-    self->length += (size_t)n1;
+    self->length += (size_t)first_chunk_read;
 
-    size_t remaining = want - (size_t)n1;
-    if (remaining == 0) {
-        return n1;
+    size_t second_chunk_want = want - (size_t)first_chunk_read;
+    if (second_chunk_want == 0) {
+        return first_chunk_read;
     }
 
-    /* Wrapped chunk (write_byte_pos is now at start) */
-    int n2 = PLM_FILE_READ(self->fh, self->bytes + self->write_byte_pos, remaining);
-    if (n2 <= 0) {
-        return n1; /* keep what we got */
+    // Wrapped chunk
+    int second_chunk_read = PLM_FILE_READ(self->fh, self->bytes, second_chunk_want);
+    if (second_chunk_read <= 0) {
+        return first_chunk_read; // keep what we got
     }
 
-    /* Commit second chunk */
-    self->write_byte_pos += (size_t)n2;
-    if (self->write_byte_pos >= self->capacity) {
-        self->write_byte_pos -= self->capacity;
-    }
-    self->length += (size_t)n2;
+    // Commit second chunk
+    self->write_byte_pos = (size_t)second_chunk_read;
+    self->length += (size_t)second_chunk_read;
 
-	plm_buffer_ring_sync_guard4(self);
+    plm_buffer_ring_sync_guard(self);
 
-    return n1 + n2;
+    return first_chunk_read + second_chunk_read;
 }
 
 size_t plm_buffer_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
@@ -1814,16 +1812,16 @@ void plm_buffer_discard_read_bytes(plm_buffer_t *self) {
     size_t byte_pos = self->bit_index >> 3;
     if (byte_pos == 0) return;
 
-    /* Advance read position with wrap */
+    // Advance read position with wrap
 	self->read_byte_pos = (self->read_byte_pos + byte_pos) & (self->capacity - 1);
 
-    /* Decrease buffered length */
+    // Decrease buffered length
     self->length -= byte_pos;
 
-    /* Keep only remaining bit offset within current byte */
+    // Keep only remaining bit offset within current byte
     self->bit_index &= 7;
 
-    /* If empty, normalize */
+    // If empty, normalize
     if (self->length == 0) {
         self->bit_index = 0;
         self->read_byte_pos = 0;
@@ -1886,7 +1884,7 @@ inline uint32_t plm_buffer_read(plm_buffer_t *self, int count) {
     size_t byte_off = (size_t)(bit_index >> 3);
     const uint8_t *s = plm_buffer_ptr_from_read(self, byte_off);
 
-	/* Safe unaligned load (big-endian) */
+	// Safe unaligned load (big-endian)
     uint32_t word_be =
         ((uint32_t)s[0] << 24) |
         ((uint32_t)s[1] << 16) |
@@ -1912,26 +1910,34 @@ inline void plm_buffer_skip(plm_buffer_t *self, size_t count) {
 }
 
 inline int plm_buffer_skip_bytes(plm_buffer_t *self, uint8_t v) {
-	plm_buffer_align(self);
-	int skipped = 0;
-	while (plm_buffer_has(self, 8) && self->bytes[self->bit_index >> 3] == v) {
-		self->bit_index += 8;
-		skipped++;
-	}
-	return skipped;
+    plm_buffer_align(self);
+
+    int skipped = 0;
+    while (plm_buffer_has(self, 8)) {
+        size_t byte_off = (size_t)(self->bit_index >> 3);
+        const uint8_t *p = plm_buffer_ptr_from_read(self, byte_off);
+
+        if (*p != v)
+            break;
+
+        self->bit_index += 8;
+        skipped++;
+    }
+
+    return skipped;
 }
 
 inline int plm_buffer_next_start_code(plm_buffer_t *self) {
     plm_buffer_align(self);
 
     while (plm_buffer_has(self, (5u << 3))) {
-        size_t byte_index = (self->bit_index >> 3);
-        const uint8_t *s = plm_buffer_ptr_from_read(self, byte_index);
+        size_t byte_off = (size_t)(self->bit_index >> 3);
+        const uint8_t *p = plm_buffer_ptr_from_read(self, byte_off);
 
-        /* Thanks to the 4-byte guard, s[0..3] is always safe here */
-        if (s[0] == 0x00 && s[1] == 0x00 && s[2] == 0x01) {
-            self->bit_index = (uint32_t)((byte_index + 4) << 3);
-            return s[3];
+        // Thanks to the 4-byte guard, p[0..3] is always safe here
+        if (p[0] == 0x00 && p[1] == 0x00 && p[2] == 0x01) {
+            self->bit_index = (uint32_t)((byte_off + 4) << 3);
+            return p[3];
         }
 
         self->bit_index += 8;
@@ -2344,10 +2350,10 @@ plm_packet_t *plm_demux_seek(plm_demux_t *self, double seek_time, int type, int 
 				const uint8_t *b = packet->data1;
 				size_t b_len = packet->len1;
 
-				/* total bytes == a_len + b_len */
+				// total bytes == a_len + b_len
 				size_t total = packet->length;
 
-				/* --- 1) Scan windows fully inside span 0 --- */
+				// --- 1) Scan windows fully inside span 0 ---
 				for (size_t i = 0; i + 6 <= a_len; i++) {
 					if (a[i] == 0x00 && a[i + 1] == 0x00 && a[i + 2] == 0x01 && a[i + 3] == 0x00) {
 						if ((a[i + 5] & 0x38) == 0x08) {
@@ -2357,13 +2363,13 @@ plm_packet_t *plm_demux_seek(plm_demux_t *self, double seek_time, int type, int 
 					}
 				}
 
-				/* --- 2) Scan windows that cross the span boundary (at most 5 starts) --- */
+				// --- 2) Scan windows that cross the span boundary (at most 5 starts) ---
 				if (b_len) {
 					size_t start = (a_len >= 5) ? (a_len - 5) : 0;
 					for (size_t i = start; i < a_len; i++) {
-						if (i + 6 > total) break; /* not enough bytes left in packet */
+						if (i + 6 > total) break; // not enough bytes left in packet
 
-						/* Pull the 6-byte window across the boundary (small loop, not hot) */
+						// Pull the 6-byte window across the boundary (small loop, not hot)
 						uint8_t w0 = a[i + 0];
 						uint8_t w1 = (i + 1 < a_len) ? a[i + 1] : b[(i + 1) - a_len];
 						uint8_t w2 = (i + 2 < a_len) ? a[i + 2] : b[(i + 2) - a_len];
@@ -2379,7 +2385,7 @@ plm_packet_t *plm_demux_seek(plm_demux_t *self, double seek_time, int type, int 
 					}
 				}
 
-				/* --- 3) Scan windows fully inside span 1 --- */
+				// --- 3) Scan windows fully inside span 1 ---
 				if (b_len) {
 					for (size_t j = 0; j + 6 <= b_len; j++) {
 						if (b[j] == 0x00 && b[j + 1] == 0x00 && b[j + 2] == 0x01 && b[j + 3] == 0x00) {
@@ -2537,16 +2543,16 @@ plm_packet_t *plm_demux_get_packet(plm_demux_t *self) {
     self->current_packet.length = need_bytes;
 
     if (need_bytes <= contig) {
-        /* Not wrapped: single span */
+        // Not wrapped: single span
         self->current_packet.data0 = p;
         self->current_packet.len0  = need_bytes;
         self->current_packet.data1 = NULL;
         self->current_packet.len1  = 0;
     } else {
-        /* Wrapped: two spans */
+        // Wrapped: two spans
         self->current_packet.data0 = p;
         self->current_packet.len0  = contig;
-        self->current_packet.data1 = b->bytes;              /* wraps to start */
+        self->current_packet.data1 = b->bytes;              // wraps to start
         self->current_packet.len1  = need_bytes - contig;
     }
 
@@ -2577,9 +2583,9 @@ static const int PLM_START_USER_DATA = 0xB2;
 	(c >= PLM_START_SLICE_FIRST && c <= PLM_START_SLICE_LAST)
 
 static const float PLM_VIDEO_PIXEL_ASPECT_RATIO[] = {
-	1.0000, /* square pixels */
-	0.6735, /* 3:4? */
-	0.7031, /* MPEG-1 / MPEG-2 video encoding divergence? */
+	1.0000, // square pixels
+	0.6735, // 3:4?
+	0.7031, // MPEG-1 / MPEG-2 video encoding divergence?
 	0.7615, 0.8055, 0.8437, 0.8935, 0.9157, 0.9815,
 	1.0255, 1.0695, 1.0950, 1.1575, 1.2051,
 };
@@ -3739,7 +3745,7 @@ void plm_video_copy_macroblock(
 	uint8_t *src = reference->y.data;
 	unsigned int si = vp * dw + hp;
 
-	/* Y block */
+	// Y block
 	dest += 32;
 	__asm__("pref @%0" : : "r"(dest));
 
@@ -3925,7 +3931,7 @@ void plm_video_copy_macroblock(
 		}
 	}
 
-	/* Cb, Cr blocks */
+	// Cb, Cr blocks
 	dest -= 32;
 	__asm__("pref @%0" : : "r"(dest));
 	src = reference->cb.data;
@@ -4663,10 +4669,10 @@ plm_audio_t *plm_audio_create_with_buffer(plm_buffer_t *buffer, int destroy_when
 	//memcpy(self->D, PLM_AUDIO_SYNTHESIS_WINDOW, 512 * sizeof(float));
 	//memcpy(self->D + 512, PLM_AUDIO_SYNTHESIS_WINDOW, 512 * sizeof(float));
 
-	/* Build a window table in a layout that's faster for the Dreamcast.
-	   We write the synthesis window into self->D in the exact order the
-	   decoder will read it (grab every 32nd value), and we write each chunk
-	   twice so later code can read straight through without wrap-around. */
+	// Build a window table in a layout that's faster for the Dreamcast.
+	// We write the synthesis window into self->D in the exact order the
+	// decoder will read it (grab every 32nd value), and we write each chunk
+	// twice so later code can read straight through without wrap-around.
 	float *d = self->D;
 	float *s = (float *)PLM_AUDIO_SYNTHESIS_WINDOW;
 	for (int i = 0; i < 32; i++)
@@ -4790,18 +4796,18 @@ int plm_audio_find_frame_sync(plm_audio_t *self) {
     size_t i = start;
     const uint8_t *p = plm_buffer_ptr_from_read(b, start);
 
-    /* Scan pairs up to (length-2, length-1) */
+    // Scan pairs up to (length-2, length-1)
     for (; i < b->length - 1; i++) {
-        /* p[1] is always safe because of the 4-byte mirror at end */
+        // p[1] is always safe because of the 4-byte mirror at end
         if (p[0] == 0xFF && (p[1] & 0xFE) == 0xFC) {
             b->bit_index = (uint32_t)(((i + 1) << 3) + 3);
             return TRUE;
         }
 
-        /* Advance one byte with wrap */
+        // Advance one byte with wrap
         p++;
         if (p == b->bytes + b->capacity) {
-            p = b->bytes; /* wrap to start */
+            p = b->bytes; // wrap to start
         }
     }
 

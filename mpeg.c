@@ -450,14 +450,14 @@ void mpeg_upload_frame(mpeg_player_t *player) {
     const int pvr_blocks_per_row = mpeg_texture_width >> 4;
     const int pad_blocks_x = pvr_blocks_per_row - video_blocks_w;
 
-    uint32_t *d = SQ_MASK_DEST((void *)PVR_TA_YUV_CONV);
-    sq_lock((void *)PVR_TA_YUV_CONV);
-
     /*
      * Each macroblock is 384 bytes = 96 uint32_t
      * sq_fast_cpy works in 32-byte chunks → 384 / 32 = 12 iterations
      */
     const int mb_sq_iters = 384 / 32;
+
+    uint32_t *d = SQ_MASK_DEST((void *)PVR_TA_YUV_CONV);
+    sq_lock((void *)PVR_TA_YUV_CONV);
 
     for(int y = 0; y < video_blocks_h; y++) {
         /* Upload real macroblocks */
@@ -599,6 +599,7 @@ static void *sound_callback(snd_stream_hnd_t hnd, int request_size, int *size_ou
         if(!player->sample)
             break;
 
+        /* We decode this many bytes every sample */
         int chunk = 1152 * 2;
         if(out + chunk > request_size)
             chunk = request_size - out;
@@ -638,8 +639,8 @@ static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, s
         memcpy(dest, src, length);
     }
     else { /* Fast Path */
-        int blocks = (int)length / 32;
-        int remainder = (int)length % 32;
+        int blocks = (int)(length >> 5);
+        int remainder = (int)(length & 31);
 
         if(blocks > 0) {
             __asm__ __volatile__ (
