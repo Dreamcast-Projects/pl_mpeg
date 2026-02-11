@@ -208,14 +208,6 @@ typedef struct {
     size_t   len1;
 } plm_packet_t;
 
-// typedef struct {
-// 	int type;
-// 	double pts;
-// 	size_t length;
-// 	uint8_t *data;
-// } plm_packet_t;
-
-
 // Decoded Video Plane
 // The byte length of the data is width * height. Note that different planes
 // have different sizes: the Luma plane (Y) is double the size of each of
@@ -503,7 +495,8 @@ plm_frame_t *plm_seek_frame(plm_t *self, double time, int seek_exact);
 // Provides the data source for all other plm_* interfaces
 
 
-// The default size for buffers created from files or by the high-level API
+// The default size for buffers created from files or by the high-level API. They
+// MUST BE A POWER OF 2 for the internal ring buffer implementation to work correctly.
 #ifndef PLM_BUFFER_DEFAULT_SIZE
 #define PLM_BUFFER_DEFAULT_SIZE (32 * 1024)
 #endif
@@ -1556,6 +1549,7 @@ plm_buffer_t *plm_buffer_create_with_capacity(size_t capacity) {
 	PLM_MEMZERO(self, sizeof(plm_buffer_t));
 	self->capacity = capacity;
 	self->free_when_done = TRUE;
+	self->total_size = 0;
 	self->bytes = (uint8_t *)PLM_MALLOC(capacity + PLM_PEEK_SIZE); // TODO: PLM_MEMALIGN(32, capacity)
 	if(!self->bytes) {
 		fprintf(stderr, "Out of memory for bytes. [plm_buffer_create_with_capacity]\n");
@@ -1791,6 +1785,8 @@ void plm_buffer_seek(plm_buffer_t *self, size_t pos) {
 		self->seek_callback(self, pos, self->load_callback_user_data);
 		self->bit_index = 0;
 		self->length = 0;
+		self->read_byte_pos = 0;
+		self->write_byte_pos = 0;
 	}
 	else if (self->mode == PLM_BUFFER_MODE_RING) {
 		if (pos != 0) {
@@ -1800,6 +1796,8 @@ void plm_buffer_seek(plm_buffer_t *self, size_t pos) {
 		self->bit_index = 0;
 		self->length = 0;
 		self->total_size = 0;
+		self->read_byte_pos = 0;
+		self->write_byte_pos = 0;
 	}
 	else if (pos < self->length) {
 		self->bit_index = (uint32_t)(pos << 3);
@@ -1817,10 +1815,7 @@ void plm_buffer_discard_read_bytes(plm_buffer_t *self) {
     if (byte_pos == 0) return;
 
     /* Advance read position with wrap */
-    self->read_byte_pos += byte_pos;
-    if (self->read_byte_pos >= self->capacity) {
-        self->read_byte_pos %= self->capacity;
-    }
+	self->read_byte_pos = (self->read_byte_pos + byte_pos) & (self->capacity - 1);
 
     /* Decrease buffered length */
     self->length -= byte_pos;
@@ -1828,7 +1823,7 @@ void plm_buffer_discard_read_bytes(plm_buffer_t *self) {
     /* Keep only remaining bit offset within current byte */
     self->bit_index &= 7;
 
-    /* If empty, normalize (optional) */
+    /* If empty, normalize */
     if (self->length == 0) {
         self->bit_index = 0;
         self->read_byte_pos = 0;

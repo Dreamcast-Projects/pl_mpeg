@@ -31,6 +31,9 @@ struct mpeg_player_t {
     /* Size of the sound module data */
     int snd_mod_size;
 
+    /* Volume */
+    int snd_volume;
+
     /* Audio sample rate */
     int sample_rate;
 
@@ -56,7 +59,7 @@ static int mpeg_texture_height;
 #define SOUND_BUFFER (64 * 1024)
 
 static int setup_graphics(mpeg_player_t *player, const mpeg_player_options_t *options);
-static int setup_audio(mpeg_player_t *player, uint8_t volume);
+static int setup_audio(mpeg_player_t *player);
 static void fast_memcpy(void *dest, const void *src, size_t length);
 
 static uint32_t next_power_of_two(uint32_t n) {
@@ -127,6 +130,33 @@ static int mpeg_check_cancel(const mpeg_cancel_options_t *opt) {
 /** Default MPEG player options used when NULL is passed to *_ex() functions. */
 static const mpeg_player_options_t MPEG_PLAYER_OPTIONS_DEFAULT = MPEG_PLAYER_OPTIONS_INITIALIZER;
 
+static bool mpeg_player_init(mpeg_player_t *player, const mpeg_player_options_t *opts) {
+    plm_set_loop(player->decoder, opts->loop);
+
+    player->snd_buf = (uint32_t *)MPEG_MEMALIGN(32, SOUND_BUFFER);
+    if(!player->snd_buf) {
+        fprintf(stderr, "Out of memory for player->snd_buf\n");
+        mpeg_player_destroy(player);
+        return false;
+    }
+
+    player->list_type = opts->list_type;
+    player->snd_volume = opts->volume;
+    if(setup_graphics(player, opts) < 0) {
+        fprintf(stderr, "Setting up graphics failed\n");
+        mpeg_player_destroy(player);
+        return false;
+    }
+
+    if(setup_audio(player) < 0) {
+        fprintf(stderr, "Setting up audio failed\n");
+        mpeg_player_destroy(player);
+        return false;
+    }
+
+    return true;
+}
+
 mpeg_player_t *mpeg_player_create_ex(const char *filename, const mpeg_player_options_t *options) {
     mpeg_player_t *player = NULL;
     const mpeg_player_options_t *opts = options ? options : &MPEG_PLAYER_OPTIONS_DEFAULT;
@@ -151,27 +181,9 @@ mpeg_player_t *mpeg_player_create_ex(const char *filename, const mpeg_player_opt
         mpeg_player_destroy(player);
         return NULL;
     }
-    plm_set_loop(player->decoder, opts->loop);
 
-    player->snd_buf = (uint32_t *)MPEG_MEMALIGN(32, SOUND_BUFFER);
-    if(!player->snd_buf) {
-        fprintf(stderr, "Out of memory for player->snd_buf\n");
-        mpeg_player_destroy(player);
+    if(!mpeg_player_init(player, opts))
         return NULL;
-    }
-
-    player->list_type = opts->list_type;
-    if(setup_graphics(player, opts) < 0) {
-        fprintf(stderr, "Setting up graphics failed\n");
-        mpeg_player_destroy(player);
-        return NULL;
-    }
-
-    if(setup_audio(player, opts->volume) < 0) {
-        fprintf(stderr, "Setting up audio failed\n");
-        mpeg_player_destroy(player);
-        return NULL;
-    }
 
     return player;
 }
@@ -200,27 +212,9 @@ mpeg_player_t *mpeg_player_create_memory_ex(unsigned char *memory, const size_t 
         mpeg_player_destroy(player);
         return NULL;
     }
-    plm_set_loop(player->decoder, opts->loop);
 
-    player->snd_buf = (uint32_t *)MPEG_MEMALIGN(32, SOUND_BUFFER);
-    if(!player->snd_buf) {
-        fprintf(stderr, "Out of memory for player->snd_buf\n");
-        mpeg_player_destroy(player);
+    if(!mpeg_player_init(player, opts))
         return NULL;
-    }
-
-    player->list_type = opts->list_type;
-    if(setup_graphics(player, opts) < 0) {
-        fprintf(stderr, "Setting up graphics failed\n");
-        mpeg_player_destroy(player);
-        return NULL;
-    }
-
-    if(setup_audio(player, opts->volume) < 0) {
-        fprintf(stderr, "Setting up audio failed\n");
-        mpeg_player_destroy(player);
-        return NULL;
-    }
 
     return player;
 }
@@ -234,14 +228,24 @@ mpeg_player_t *mpeg_player_create_memory(uint8_t *memory, const size_t length) {
 }
 
 int mpeg_player_get_loop(mpeg_player_t *player) {
+    if(!player)
+        return -1;
+
     return plm_get_loop(player->decoder);
 }
 
 void mpeg_player_set_loop(mpeg_player_t *player, int loop) {
+    if(!player)
+        return;
+
     plm_set_loop(player->decoder, loop);
 }
 
 void mpeg_player_set_volume(mpeg_player_t *player, uint8_t volume) {
+    if(!player)
+        return;
+
+    player->snd_volume = volume;
     snd_stream_volume(player->snd_hnd, volume);
 }
 
@@ -249,18 +253,14 @@ void mpeg_player_destroy(mpeg_player_t *player) {
     if(!player)
         return;
 
-    if(player->snd_hnd != SND_STREAM_INVALID) {
-        snd_stream_stop(player->snd_hnd);
-        snd_stream_destroy(player->snd_hnd);
-    }
-
     if(player->texture) {
         MPEG_PVR_FREE(player->texture);
         player->texture = NULL;
     }
 
-    if(player->snd_buf) {
-        MPEG_FREE(player->snd_buf);
+    if(player->snd_hnd != SND_STREAM_INVALID) {
+        snd_stream_destroy(player->snd_hnd);
+        player->snd_hnd = SND_STREAM_INVALID;
         player->snd_buf = NULL;
     }
 
@@ -282,6 +282,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
     /* Init sound stream. */
     sound_stream_reset(player);
     snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+    snd_stream_volume(player->snd_hnd, player->snd_volume);
 
     player->frame = plm_decode_video(player->decoder);
     if(!player->frame) {
@@ -289,11 +290,11 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
         sound_stream_reset(player);
         return MPEG_PLAY_ERROR;
     }
-    uint64_t start = timer_ns_gettime64();
+    player->start_time = timer_ns_gettime64();
 
     while(true) {
         /* Get elapsed playback time */
-        double playback_time = (timer_ns_gettime64() - start) * 1e-9f;
+        double playback_time = (timer_ns_gettime64() - player->start_time) * 1e-9f;
 
         /* Check cancel matching */
         int cancel = mpeg_check_cancel(cancel_options);
@@ -318,7 +319,11 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
             pvr_scene_finish();
 
             /* Decode the NEXT frame to have it ready */
+            //uint64_t startd_time = timer_ns_gettime64();
             player->frame = plm_decode_video(player->decoder);
+            //uint64_t decode_time = timer_ns_gettime64() - startd_time;
+            //printf("%" PRIu64 "\n", decode_time);
+
             if(!player->frame) {
                 /* Are we looping? */
                 if(!plm_get_loop(player->decoder)) {
@@ -329,6 +334,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
                 /* We are looping. Reset and restart */
                 sound_stream_reset(player);
                 snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+                snd_stream_volume(player->snd_hnd, player->snd_volume);
 
                 player->frame = plm_decode_video(player->decoder);
                 if(!player->frame) {
@@ -336,7 +342,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
                     goto finish;
                 }
 
-                start = timer_ns_gettime64();
+                player->start_time = timer_ns_gettime64();
             }
         }
     }
@@ -344,6 +350,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
 finish:
     /* Reset some stuff */
     sound_stream_reset(player);
+    player->start_time = 0;
 
     return result;
 }
@@ -364,6 +371,7 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
         /* Init sound stream. */
         sound_stream_reset(player);
         snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+        snd_stream_volume(player->snd_hnd, player->snd_volume);
 
         /* Prime the first frame */
         player->frame = plm_decode_video(player->decoder);
@@ -398,6 +406,7 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
         /* We are Looping. Reset and restart */
         sound_stream_reset(player);
         snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+        snd_stream_volume(player->snd_hnd, player->snd_volume);
 
         player->frame = plm_decode_video(player->decoder);
         if(!player->frame) {
@@ -598,7 +607,7 @@ static void *sound_callback(snd_stream_hnd_t hnd, int size, int *size_out) {
     return player->snd_buf;
 }
 
-static int setup_audio(mpeg_player_t *player, uint8_t volume) {
+static int setup_audio(mpeg_player_t *player) {
     player->snd_mod_size = 0;
     player->snd_mod_start = 0;
     player->sample_rate = plm_get_samplerate(player->decoder);
@@ -607,7 +616,6 @@ static int setup_audio(mpeg_player_t *player, uint8_t volume) {
     if(player->snd_hnd == SND_STREAM_INVALID)
         return -1;
 
-    snd_stream_volume(player->snd_hnd, volume);
     snd_stream_set_userdata(player->snd_hnd, player);
 
     return 0;
