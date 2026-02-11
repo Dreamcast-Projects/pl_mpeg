@@ -10,11 +10,14 @@ struct mpeg_player_t {
     /* Pointer to a decoded video frame */
     plm_frame_t *frame;
 
+    /* Pointer to a decoded video frame */
+    plm_samples_t *sample;
+
     /* PVR list type the video frame will be rendered to */
     pvr_list_type_t list_type;
 
     /* SH4 side sound buffer */
-    uint32_t *snd_buf;
+    uint8_t *snd_buf;
 
     /* Texture that holds decoded data */
     pvr_ptr_t texture;
@@ -26,10 +29,10 @@ struct mpeg_player_t {
     int height;
 
     /* Start position for sound module playback */
-    int snd_mod_start;
+    int snd_pcm_offset;
 
     /* Size of the sound module data */
-    int snd_mod_size;
+    int snd_pcm_leftovers;
 
     /* Volume */
     int snd_volume;
@@ -84,8 +87,8 @@ static inline void sound_stream_reset(mpeg_player_t *player) {
     if(player->start_time != 0)
         snd_stream_stop(player->snd_hnd);
 
-    player->snd_mod_size = 0;
-    player->snd_mod_start = 0;
+    player->snd_pcm_leftovers = 0;
+    player->snd_pcm_offset = 0;
 }
 
 static int mpeg_check_cancel(const mpeg_cancel_options_t *opt) {
@@ -133,7 +136,7 @@ static const mpeg_player_options_t MPEG_PLAYER_OPTIONS_DEFAULT = MPEG_PLAYER_OPT
 static bool mpeg_player_init(mpeg_player_t *player, const mpeg_player_options_t *opts) {
     plm_set_loop(player->decoder, opts->loop);
 
-    player->snd_buf = (uint32_t *)MPEG_MEMALIGN(32, SOUND_BUFFER);
+    player->snd_buf = (uint8_t *)MPEG_MEMALIGN(32, SOUND_BUFFER);
     if(!player->snd_buf) {
         fprintf(stderr, "Out of memory for player->snd_buf\n");
         mpeg_player_destroy(player);
@@ -583,34 +586,37 @@ static int setup_graphics(mpeg_player_t *player, const mpeg_player_options_t *op
     return 0;
 }
 
-static void *sound_callback(snd_stream_hnd_t hnd, int size, int *size_out) {
-    plm_samples_t *sample;
+static void *sound_callback(snd_stream_hnd_t hnd, int request_size, int *size_out) {
     mpeg_player_t *player = (mpeg_player_t *)snd_stream_get_userdata(hnd);
-    uint32_t *dest = player->snd_buf;
-    int out = player->snd_mod_size;
+    uint8_t *dest = player->snd_buf;
+    int out = player->snd_pcm_leftovers;
 
     if(out > 0)
-        fast_memcpy(dest, player->snd_buf + player->snd_mod_start / 4, out);
+        fast_memcpy(dest, (uint8_t *)player->sample->pcm + player->snd_pcm_offset, out);
 
-    while(size > out) {
-        sample = plm_decode_audio(player->decoder);
-        if(!sample)
+    while(request_size > out) {
+        player->sample = plm_decode_audio(player->decoder);
+        if(!player->sample)
             break;
 
-        fast_memcpy(dest + out / 4, sample->pcm, 1152 * 2);
+        int chunk = 1152 * 2;
+        if(out + chunk > request_size)
+            chunk = request_size - out;
+
+        fast_memcpy(dest + out, player->sample->pcm, chunk);
         out += 1152 * 2;
     }
 
-    player->snd_mod_start = size;
-    player->snd_mod_size = out - size;
-    *size_out = size;
+    player->snd_pcm_offset = request_size;
+    player->snd_pcm_leftovers = out - request_size;
+    *size_out = request_size;
 
     return player->snd_buf;
 }
 
 static int setup_audio(mpeg_player_t *player) {
-    player->snd_mod_size = 0;
-    player->snd_mod_start = 0;
+    player->snd_pcm_leftovers = 0;
+    player->snd_pcm_offset = 0;
     player->sample_rate = plm_get_samplerate(player->decoder);
 
     player->snd_hnd = snd_stream_alloc(sound_callback, SOUND_BUFFER);
@@ -623,27 +629,21 @@ static int setup_audio(mpeg_player_t *player) {
 }
 
 static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, size_t length) {
-    int blocks;
-    int remainder;
-    char *char_dest = (char *)dest;
-    const char *char_src = (const char *)src;
+    uintptr_t dest_ptr = (uintptr_t)dest;
+    uintptr_t src_ptr = (uintptr_t)src;
 
-    _Complex float ds;
-    _Complex float ds2;
-    _Complex float ds3;
-    _Complex float ds4;
+    _Complex float ds, ds2, ds3, ds4;
 
-    if(((uintptr_t)dest | (uintptr_t)src) & 7) {
+    if(((dest_ptr | src_ptr) & 7) || length < 32) {
         memcpy(dest, src, length);
     }
     else { /* Fast Path */
-        blocks = length / 32;
-        remainder = length % 32;
+        int blocks = (int)length / 32;
+        int remainder = (int)length % 32;
 
         if(blocks > 0) {
             __asm__ __volatile__ (
                 "fschg\n\t"
-                "clrs\n"
                 ".align 2\n"
                 "1:\n\t"
                 /* *dest++ = *src++ */
@@ -661,13 +661,20 @@ static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, s
                 "bf.s 1b\n\t"
                 "add #32, %[out]\n\t"
                 "fschg\n"
-                : [in] "+&r" ((uintptr_t)src), [out] "+&r" ((uintptr_t)dest),
-                [blocks] "+&r" (blocks), [scratch] "=&d" (ds), [scratch2] "=&d" (ds2),
-                [scratch3] "=&d" (ds3), [scratch4] "=&d" (ds4) /* outputs */
-                : [r0] "z" (remainder) /* inputs */
+                : [in] "+&r" (src_ptr),
+                  [out] "+&r" (dest_ptr),
+                  [blocks] "+&r" (blocks),
+                  [scratch] "=&d" (ds),
+                  [scratch2] "=&d" (ds2),
+                  [scratch3] "=&d" (ds3),
+                  [scratch4] "=&d" (ds4) /* outputs */
+                : [r0] "z" (0) /* inputs */
                 : "t", "memory" /* clobbers */
             );
         }
+
+        char *char_dest = (char *)dest_ptr;
+        const char *char_src = (const char *)src_ptr;
 
         while(remainder--)
             *char_dest++ = *char_src++;
