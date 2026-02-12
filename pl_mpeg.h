@@ -1913,12 +1913,18 @@ inline int plm_buffer_skip_bytes(plm_buffer_t *self, uint8_t v) {
     plm_buffer_align(self);
 
     int skipped = 0;
-    while (plm_buffer_has(self, 8)) {
+    while (TRUE) {
+        size_t avail_bits = (self->length << 3) - self->bit_index;
+        if (avail_bits < 8 && !plm_buffer_has(self, 8)) {
+            break;
+        }
+
         size_t byte_off = (size_t)(self->bit_index >> 3);
         const uint8_t *p = plm_buffer_ptr_from_read(self, byte_off);
 
-        if (*p != v)
+        if (*p != v) {
             break;
+        }
 
         self->bit_index += 8;
         skipped++;
@@ -1930,7 +1936,12 @@ inline int plm_buffer_skip_bytes(plm_buffer_t *self, uint8_t v) {
 inline int plm_buffer_next_start_code(plm_buffer_t *self) {
     plm_buffer_align(self);
 
-    while (plm_buffer_has(self, (5u << 3))) {
+    while (TRUE) {
+        size_t avail_bits = (self->length << 3) - self->bit_index;
+        if (avail_bits < (5u << 3) && !plm_buffer_has(self, (5u << 3))) {
+            return -1;
+        }
+
         size_t byte_off = (size_t)(self->bit_index >> 3);
         const uint8_t *p = plm_buffer_ptr_from_read(self, byte_off);
 
@@ -1942,8 +1953,6 @@ inline int plm_buffer_next_start_code(plm_buffer_t *self) {
 
         self->bit_index += 8;
     }
-
-    return -1;
 }
 
 inline int plm_buffer_find_start_code(plm_buffer_t *self, int code) {
@@ -4079,9 +4088,11 @@ void plm_video_interpolate_macroblock(
 	__attribute__((aligned(8))) static uint32_t buffer[96];
 
 	plm_video_copy_macroblock(buffer, reference, motion_h, motion_v);
-	for(int i = 0; i < 96; i++)
-	{
-		dest[i] = (((dest[i] >> 1) & 0x7f7f7f7f) + ((buffer[i] >> 1) & 0x7f7f7f7f));
+	for (int i = 0; i < 96; i += 4) {
+		dest[i + 0] = (((dest[i + 0] >> 1) & 0x7f7f7f7f) + ((buffer[i + 0] >> 1) & 0x7f7f7f7f));
+		dest[i + 1] = (((dest[i + 1] >> 1) & 0x7f7f7f7f) + ((buffer[i + 1] >> 1) & 0x7f7f7f7f));
+		dest[i + 2] = (((dest[i + 2] >> 1) & 0x7f7f7f7f) + ((buffer[i + 2] >> 1) & 0x7f7f7f7f));
+		dest[i + 3] = (((dest[i + 3] >> 1) & 0x7f7f7f7f) + ((buffer[i + 3] >> 1) & 0x7f7f7f7f));
 	}
 }
 
@@ -4192,19 +4203,9 @@ void plm_video_decode_block(plm_video_t *self, int block) {
 	// Move block to its place
 	uint32_t *display = self->frame_current.display;
 
-	if (block < 4) {
-		display += self->macroblock_address * 96 + 32 + block * 16;
-	}
-	else {
-		if(block == 4)
-		{
-			display += self->macroblock_address * 96;
-		}
-		else
-		{
-			display += self->macroblock_address * 96 + 16;
-		}
-	}
+	int mb_base = self->macroblock_address * 96;
+	int block_offset = (block < 4) ? (32 + (block << 4)) : (block == 4 ? 0 : 16);
+	display += mb_base + block_offset;
 
 	int *s = self->block_data;
 	__asm__("pref @%0" : : "r"(s));
@@ -4236,9 +4237,16 @@ void plm_video_decode_block(plm_video_t *self, int block) {
 				d += 8;
 				s += 8;
 			}
-			s = self->block_data;
-			for (int y = 64; y; y--)
-				*s++ = 0;
+			for (int i = 0; i < 64; i += 8) {
+				self->block_data[i + 0] = 0;
+				self->block_data[i + 1] = 0;
+				self->block_data[i + 2] = 0;
+				self->block_data[i + 3] = 0;
+				self->block_data[i + 4] = 0;
+				self->block_data[i + 5] = 0;
+				self->block_data[i + 6] = 0;
+				self->block_data[i + 7] = 0;
+			}
 		}
 	}
 	else {
@@ -4275,9 +4283,16 @@ void plm_video_decode_block(plm_video_t *self, int block) {
 				d += 8;
 				s += 8;
 			}
-			s = self->block_data;
-			for (int y = 64; y; y--)
-				*s++ = 0;
+			for (int i = 0; i < 64; i += 8) {
+				self->block_data[i + 0] = 0;
+				self->block_data[i + 1] = 0;
+				self->block_data[i + 2] = 0;
+				self->block_data[i + 3] = 0;
+				self->block_data[i + 4] = 0;
+				self->block_data[i + 5] = 0;
+				self->block_data[i + 6] = 0;
+				self->block_data[i + 7] = 0;
+			}
 		}
 	}
 }
@@ -4300,9 +4315,9 @@ void plm_video_idct(int *block) {
         b6 = p[1 * 8] - p[7 * 8];
         b7 = tmp1 + tmp2;
         m0 = p[0 * 8];
-        b4 = block[5 * 8 + i] - block[3 * 8 + i];
-        b1 = block[4 * 8 + i];
-        b3 = block[2 * 8 + i] + block[6 * 8 + i];
+        b4 = p[5 * 8] - p[3 * 8];
+        b1 = p[4 * 8];
+        b3 = p[2 * 8] + p[6 * 8];
 
         x4 = ((b6 * 473 - b4 * 196 + 128) >> 8) - b7;
         x0 = x4 - (((tmp1 - tmp2) * 362 + 128) >> 8);
@@ -4337,9 +4352,9 @@ void plm_video_idct(int *block) {
         b6 = p[1] - p[7];
         b7 = tmp1 + tmp2;
         m0 = p[0];
-        b4 = block[5 + i] - block[3 + i];
-        b1 = block[4 + i];
-        b3 = block[2 + i] + block[6 + i];
+        b4 = p[5] - p[3];
+        b1 = p[4];
+        b3 = p[2] + p[6];
 
         x4 = ((b6 * 473 - b4 * 196 + 128) >> 8) - b7;
         x0 = x4 - (((tmp1 - tmp2) * 362 + 128) >> 8);
