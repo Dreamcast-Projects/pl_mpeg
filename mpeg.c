@@ -588,28 +588,38 @@ static int setup_graphics(mpeg_player_t *player, const mpeg_player_options_t *op
 
 static void *sound_callback(snd_stream_hnd_t hnd, int request_size, int *size_out) {
     mpeg_player_t *player = (mpeg_player_t *)snd_stream_get_userdata(hnd);
+    const int frame_bytes = PLM_AUDIO_SAMPLES_PER_FRAME * (int)sizeof(short);
     uint8_t *dest = player->snd_buf;
-    int out = player->snd_pcm_leftovers;
+    int out = 0;
+    int needed = request_size;
 
-    if(out > 0)
-        fast_memcpy(dest, (uint8_t *)player->sample->pcm + player->snd_pcm_offset, out);
+    while(needed > 0) {
+        if(player->snd_pcm_leftovers > 0 && player->sample) {
+            int chunk = player->snd_pcm_leftovers;
+            if(chunk > needed)
+                chunk = needed;
 
-    while(request_size > out) {
+            fast_memcpy(dest + out, (uint8_t *)player->sample->pcm + player->snd_pcm_offset, chunk);
+            out += chunk;
+            needed -= chunk;
+            player->snd_pcm_offset += chunk;
+            player->snd_pcm_leftovers -= chunk;
+            continue;
+        }
+
         player->sample = plm_decode_audio(player->decoder);
         if(!player->sample)
             break;
 
-        /* We decode this many bytes every sample */
-        int chunk = 1152 * 2;
-        if(out + chunk > request_size)
-            chunk = request_size - out;
-
-        fast_memcpy(dest + out, player->sample->pcm, chunk);
-        out += 1152 * 2;
+        player->snd_pcm_offset = 0;
+        player->snd_pcm_leftovers = frame_bytes;
     }
 
-    player->snd_pcm_offset = request_size;
-    player->snd_pcm_leftovers = out - request_size;
+    if(needed > 0) {
+        MPEG_MEMZERO(dest + out, needed);
+        out += needed;
+    }
+
     *size_out = request_size;
 
     return player->snd_buf;
