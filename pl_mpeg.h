@@ -248,8 +248,7 @@ typedef void(*plm_video_decode_callback)
 
 
 // Decoded Audio Samples
-// Samples are stored as normalized (-1, 1) float either interleaved, or if
-// PLM_AUDIO_SEPARATE_CHANNELS is defined, in two separate arrays.
+// Samples are signed 16-bit PCM (mono output).
 // The `count` is always PLM_AUDIO_SAMPLES_PER_FRAME and just there for
 // convenience.
 
@@ -258,13 +257,6 @@ typedef void(*plm_video_decode_callback)
 typedef struct {
 	double time;
 	unsigned int count;
-	// #ifdef PLM_AUDIO_SEPARATE_CHANNELS
-	// 	float left[PLM_AUDIO_SAMPLES_PER_FRAME];
-	// 	float right[PLM_AUDIO_SAMPLES_PER_FRAME];
-	// #else
-	// 	float interleaved[PLM_AUDIO_SAMPLES_PER_FRAME * 2];
-	// #endif
-
 	short pcm[PLM_AUDIO_SAMPLES_PER_FRAME] __attribute__((aligned(32)));
 } plm_samples_t;
 
@@ -1554,7 +1546,7 @@ plm_buffer_t *plm_buffer_create_with_capacity(size_t capacity) {
 	self->capacity = capacity;
 	self->free_when_done = TRUE;
 	self->total_size = 0;
-	self->bytes = (uint8_t *)PLM_MALLOC(capacity + PLM_PEEK_SIZE); // TODO: PLM_MEMALIGN(32, capacity)
+	self->bytes = (uint8_t *)PLM_MEMALIGN(32, capacity + PLM_PEEK_SIZE); //PLM_MALLOC(capacity + PLM_PEEK_SIZE);
 	if(!self->bytes) {
 		fprintf(stderr, "Out of memory for bytes. [plm_buffer_create_with_capacity]\n");
 		return NULL;
@@ -1622,30 +1614,69 @@ inline void plm_buffer_ring_sync_guard(plm_buffer_t *self) {
     self->bytes[self->capacity + 3] = self->bytes[3];
 }
 
-// int plm_buffer_ring_grow_memalign(plm_buffer_t *self, size_t new_capacity) {
-//     uint8_t *new_bytes = (uint8_t *)PLM_MEMALIGN(32, new_capacity); // or malloc if no alignment need
-// 	if (!new_bytes) {
-//         fprintf(stderr,
-//             "PLM_MEMALIGN failed when trying to resize to %zu bytes [plm_buffer_ring_grow_memalign]\n",
-//             new_capacity);
-//         return -1;
-//     }
+inline void plm_sq_copy_bytes(void *dest, const void *src, size_t length) {
+    uint8_t *d = (uint8_t *)dest;
+    const uint8_t *s = (const uint8_t *)src;
 
-//     // Copy unread data in order into new_bytes[0..length-1]
-//     size_t first = PLM_MIN(self->length, self->capacity - self->read_byte_pos);
-//     memcpy(new_bytes, self->bytes + self->read_byte_pos, first);
-//     if (self->length > first) {
-//         memcpy(new_bytes + first, self->bytes, self->length - first);
-//     }
+    size_t prefix = ((size_t)32 - ((uintptr_t)d & 31)) & 31;
+    if (prefix > length) {
+        prefix = length;
+    }
 
-//     PLM_FREE(self->bytes);          // or your aligned_free
-//     self->bytes = new_bytes;
-//     self->capacity = new_capacity;
-//     self->read_byte_pos = 0;
-//     self->write_byte_pos = self->length;
+    for (size_t i = 0; i < prefix; i++) {
+        d[i] = s[i];
+    }
+    d += prefix;
+    s += prefix;
+    length -= prefix;
 
-//     return 0;
-// }
+    if (length >= 32 && (((uintptr_t)s & 7) == 0)) {
+        size_t block_bytes = length & ~(size_t)31;
+        size_t blocks = block_bytes >> 5;
+
+        sq_lock(d);
+        sq_fast_cpy(SQ_MASK_DEST(d), s, blocks);
+        sq_unlock();
+
+        d += block_bytes;
+        s += block_bytes;
+        length -= block_bytes;
+    }
+
+    while (length--) {
+        *d++ = *s++;
+    }
+}
+
+int plm_buffer_ring_grow_memalign(plm_buffer_t *self, size_t new_capacity) {
+    uint8_t *old_bytes = self->bytes;
+    uint8_t *new_bytes = (uint8_t *)PLM_MEMALIGN(32, new_capacity + PLM_PEEK_SIZE);
+	if (!new_bytes) {
+        fprintf(stderr,
+            "PLM_MEMALIGN failed when trying to resize to %zu bytes [plm_buffer_ring_grow_memalign]\n",
+            new_capacity);
+        return -1;
+    }
+
+    // Copy unread data in order into new_bytes[0..length-1]
+    size_t first = PLM_MIN(self->length, self->capacity - self->read_byte_pos);
+    plm_sq_copy_bytes(new_bytes, old_bytes + self->read_byte_pos, first);
+    if (self->length > first) {
+        plm_sq_copy_bytes(new_bytes + first, old_bytes, self->length - first);
+    }
+
+    PLM_FREE(old_bytes);
+    self->bytes = new_bytes;
+    self->capacity = new_capacity;
+    self->read_byte_pos = 0;
+    self->write_byte_pos = self->length;
+
+    if (self->length > 0) {
+        plm_buffer_ring_sync_guard(self);
+    }
+
+    return 0;
+}
 
 int plm_buffer_ring_grow_realloc(plm_buffer_t *self, size_t new_capacity) {
     size_t old_capacity = self->capacity;
@@ -1663,7 +1694,7 @@ int plm_buffer_ring_grow_realloc(plm_buffer_t *self, size_t new_capacity) {
 
     // Wrapped unread data: [read..old_capacity) + [0..old_write)
     if (old_write < self->read_byte_pos) {
-        memcpy(self->bytes + old_capacity, self->bytes, old_write);
+        plm_sq_copy_bytes(self->bytes + old_capacity, self->bytes, old_write);
         self->write_byte_pos = old_capacity + old_write;
     }
 
@@ -1675,7 +1706,9 @@ int plm_buffer_ring_grow_realloc(plm_buffer_t *self, size_t new_capacity) {
 // Copy up to len bytes into plm_buffer_t. Returns bytes written.
 inline size_t plm_buffer_ring_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
     size_t first = PLM_MIN(length, plm_buffer_bytes_until_wrap(self, self->write_byte_pos));
-    memcpy(&self->bytes[self->write_byte_pos], bytes, first);
+
+    plm_sq_copy_bytes(&self->bytes[self->write_byte_pos], bytes, first);
+
 	self->write_byte_pos += first;
 	if (self->write_byte_pos == self->capacity) {
         self->write_byte_pos = 0;
@@ -1683,7 +1716,9 @@ inline size_t plm_buffer_ring_write(plm_buffer_t *self, uint8_t *bytes, size_t l
 
     size_t remaining = length - first;
     if (remaining) {
-        memcpy(&self->bytes[0], bytes + first, remaining);
+
+        plm_sq_copy_bytes(&self->bytes[0], bytes + first, remaining);
+
 		self->write_byte_pos = remaining;
     }
 
@@ -1753,7 +1788,7 @@ size_t plm_buffer_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
 			new_size *= 2;
 		} while (new_size - self->length < length);
 
-		int result = plm_buffer_ring_grow_realloc(self, new_size);
+		int result = plm_buffer_ring_grow_memalign(self, new_size);
 		if (result < 0)
 			return -1;
 	}
@@ -3330,8 +3365,7 @@ int plm_video_decode_sequence_header(plm_video_t *self) {
 		}
 	}
 	else {
-		// TODO Replace with special memcpy since both arrays will be 32 byte aligned
-		memcpy(self->intra_quant_matrix, PLM_VIDEO_INTRA_QUANT_MATRIX, 64);
+		plm_sq_copy_bytes(self->intra_quant_matrix, PLM_VIDEO_INTRA_QUANT_MATRIX, 64);
 	}
 
 	// Load custom non intra quant matrix?
@@ -3342,8 +3376,7 @@ int plm_video_decode_sequence_header(plm_video_t *self) {
 		}
 	}
 	else {
-		// TODO Replace with special memcpy since both arrays will be 32 byte aligned
-		memcpy(self->non_intra_quant_matrix, PLM_VIDEO_NON_INTRA_QUANT_MATRIX, 64);
+		plm_sq_copy_bytes(self->non_intra_quant_matrix, PLM_VIDEO_NON_INTRA_QUANT_MATRIX, 64);
 	}
 
 	self->mb_width = (self->width + 15) >> 4;
@@ -4712,8 +4745,8 @@ plm_audio_t *plm_audio_create_with_buffer(plm_buffer_t *buffer, int destroy_when
 	self->destroy_buffer_when_done = destroy_when_done;
 	self->samplerate_index = 3; // Indicates 0
 
-	//memcpy(self->D, PLM_AUDIO_SYNTHESIS_WINDOW, 512 * sizeof(float));
-	//memcpy(self->D + 512, PLM_AUDIO_SYNTHESIS_WINDOW, 512 * sizeof(float));
+	//plm_sq_copy_bytes(self->D, PLM_AUDIO_SYNTHESIS_WINDOW, 512 * sizeof(float));
+	//plm_sq_copy_bytes(self->D + 512, PLM_AUDIO_SYNTHESIS_WINDOW, 512 * sizeof(float));
 
 	// Build a window table in a layout that's faster for the Dreamcast.
 	// We write the synthesis window into self->D in the exact order the

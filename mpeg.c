@@ -607,7 +607,10 @@ static void *sound_callback(snd_stream_hnd_t hnd, int request_size, int *size_ou
             continue;
         }
 
+        //uint64_t startd_time = timer_ns_gettime64();
         player->sample = plm_decode_audio(player->decoder);
+        //uint64_t decode_time = timer_ns_gettime64() - startd_time;
+        //printf("%" PRIu64 "\n", decode_time);
         if(!player->sample)
             break;
 
@@ -640,54 +643,85 @@ static int setup_audio(mpeg_player_t *player) {
 }
 
 static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, size_t length) {
-    uintptr_t dest_ptr = (uintptr_t)dest;
-    uintptr_t src_ptr = (uintptr_t)src;
+    uint8_t *d = (uint8_t *)dest;
+    const uint8_t *s = (const uint8_t *)src;
 
-    _Complex float ds, ds2, ds3, ds4;
+    size_t prefix = ((size_t)32 - ((uintptr_t)d & 31)) & 31;
+    if(prefix > length)
+        prefix = length;
 
-    if(((dest_ptr | src_ptr) & 7) || length < 32) {
-        memcpy(dest, src, length);
+    for(size_t i = 0; i < prefix; i++)
+        d[i] = s[i];
+
+    d += prefix;
+    s += prefix;
+    length -= prefix;
+
+    if(length >= 32 && (((uintptr_t)s & 7) == 0)) {
+        size_t block_bytes = length & ~(size_t)31;
+        size_t blocks = block_bytes >> 5;
+
+        sq_lock(d);
+        sq_fast_cpy(SQ_MASK_DEST(d), s, blocks);
+        sq_unlock();
+
+        d += block_bytes;
+        s += block_bytes;
+        length -= block_bytes;
     }
-    else { /* Fast Path */
-        int blocks = (int)(length >> 5);
-        int remainder = (int)(length & 31);
 
-        if(blocks > 0) {
-            __asm__ __volatile__ (
-                "fschg\n\t"
-                ".align 2\n"
-                "1:\n\t"
-                /* *dest++ = *src++ */
-                "fmov.d @%[in]+, %[scratch]\n\t"
-                "fmov.d @%[in]+, %[scratch2]\n\t"
-                "fmov.d @%[in]+, %[scratch3]\n\t"
-                "fmov.d @%[in]+, %[scratch4]\n\t"
-                "movca.l %[r0], @%[out]\n\t"
-                "add #32, %[out]\n\t"
-                "dt %[blocks]\n\t"   /* while(blocks--) */
-                "fmov.d %[scratch4], @-%[out]\n\t"
-                "fmov.d %[scratch3], @-%[out]\n\t"
-                "fmov.d %[scratch2], @-%[out]\n\t"
-                "fmov.d %[scratch], @-%[out]\n\t"
-                "bf.s 1b\n\t"
-                "add #32, %[out]\n\t"
-                "fschg\n"
-                : [in] "+&r" (src_ptr),
-                  [out] "+&r" (dest_ptr),
-                  [blocks] "+&r" (blocks),
-                  [scratch] "=&d" (ds),
-                  [scratch2] "=&d" (ds2),
-                  [scratch3] "=&d" (ds3),
-                  [scratch4] "=&d" (ds4) /* outputs */
-                : [r0] "z" (0) /* inputs */
-                : "t", "memory" /* clobbers */
-            );
-        }
-
-        char *char_dest = (char *)dest_ptr;
-        const char *char_src = (const char *)src_ptr;
-
-        while(remainder--)
-            *char_dest++ = *char_src++;
-    }
+    while(length--)
+        *d++ = *s++;
 }
+
+//     uintptr_t dest_ptr = (uintptr_t)dest;
+//     uintptr_t src_ptr = (uintptr_t)src;
+
+//     _Complex float ds, ds2, ds3, ds4;
+
+//     if(((dest_ptr | src_ptr) & 7) || length < 32) {
+//         memcpy(dest, src, length);
+//     }
+//     else { /* Fast Path */
+//         int blocks = (int)(length >> 5);
+//         int remainder = (int)(length & 31);
+
+//         if(blocks > 0) {
+//             __asm__ __volatile__ (
+//                 "fschg\n\t"
+//                 ".align 2\n"
+//                 "1:\n\t"
+//                 /* *dest++ = *src++ */
+//                 "fmov.d @%[in]+, %[scratch]\n\t"
+//                 "fmov.d @%[in]+, %[scratch2]\n\t"
+//                 "fmov.d @%[in]+, %[scratch3]\n\t"
+//                 "fmov.d @%[in]+, %[scratch4]\n\t"
+//                 "movca.l %[r0], @%[out]\n\t"
+//                 "add #32, %[out]\n\t"
+//                 "dt %[blocks]\n\t"   /* while(blocks--) */
+//                 "fmov.d %[scratch4], @-%[out]\n\t"
+//                 "fmov.d %[scratch3], @-%[out]\n\t"
+//                 "fmov.d %[scratch2], @-%[out]\n\t"
+//                 "fmov.d %[scratch], @-%[out]\n\t"
+//                 "bf.s 1b\n\t"
+//                 "add #32, %[out]\n\t"
+//                 "fschg\n"
+//                 : [in] "+&r" (src_ptr),
+//                   [out] "+&r" (dest_ptr),
+//                   [blocks] "+&r" (blocks),
+//                   [scratch] "=&d" (ds),
+//                   [scratch2] "=&d" (ds2),
+//                   [scratch3] "=&d" (ds3),
+//                   [scratch4] "=&d" (ds4) /* outputs */
+//                 : [r0] "z" (0) /* inputs */
+//                 : "t", "memory" /* clobbers */
+//             );
+//         }
+
+//         char *char_dest = (char *)dest_ptr;
+//         const char *char_src = (const char *)src_ptr;
+
+//         while(remainder--)
+//             *char_dest++ = *char_src++;
+//     }
+// }
