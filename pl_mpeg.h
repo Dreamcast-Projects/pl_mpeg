@@ -3020,55 +3020,52 @@ typedef struct {
 } plm_video_motion_t;
 
 struct plm_video_t {
+	// --- Hot: accessed every decode_block call (target: 1 cache line) ---
+	plm_buffer_t *buffer;
+	int quantizer_scale;
+	int macroblock_intra;
+	int dc_predictor[3];
+	int macroblock_address;
+	int macroblock_type;
+
+	// --- Hot: accessed every macroblock (target: 1 cache line) ---
+	int picture_type;
+	int mb_row;
+	int mb_col;
+	int slice_begin;
+	int mb_width;
+	int mb_size;
+	int luma_width;
+	int chroma_width;
+
+	// --- Warm: motion vectors + predict_macroblock fields ---
+	plm_video_motion_t motion_forward;
+	plm_video_motion_t motion_backward;
+	int mb_height;
+
+	// --- Frame data (frame_current is hot for display/scatter) ---
+	plm_frame_t frame_current;
+	plm_frame_t frame_forward;
+	plm_frame_t frame_backward;
+
+	// --- Large arrays ---
+	int block_data[64];
+	uint8_t intra_quant_matrix[64] __attribute__((aligned(32)));
+	uint8_t non_intra_quant_matrix[64] __attribute__((aligned(32)));
+
+	// --- Cold: accessed once per frame or during init only ---
 	double framerate;
 	double pixel_aspect_ratio;
 	double time;
 	int frames_decoded;
 	int width;
 	int height;
-	int mb_width;
-	int mb_height;
-	int mb_size;
-
-	int luma_width;
 	int luma_height;
-
-	int chroma_width;
 	int chroma_height;
-
 	int start_code;
-	int picture_type;
-
-	plm_video_motion_t motion_forward;
-	plm_video_motion_t motion_backward;
-
 	int has_sequence_header;
-
-	int quantizer_scale;
-	int slice_begin;
-	int macroblock_address;
-
-	int mb_row;
-	int mb_col;
-
-	int macroblock_type;
-	int macroblock_intra;
-
-	int dc_predictor[3];
-
-	plm_buffer_t *buffer;
 	int destroy_buffer_when_done;
-
-	plm_frame_t frame_current;
-	plm_frame_t frame_forward;
-	plm_frame_t frame_backward;
-
 	uint8_t *frames_data;
-
-	int block_data[64];
-	uint8_t intra_quant_matrix[64]; // TODO Align to 32 Bytes
-	uint8_t non_intra_quant_matrix[64]; // TODO Align to 32 Bytes
-
 	int has_reference_frame;
 	int assume_no_b_frames;
 };
@@ -3109,6 +3106,7 @@ void plm_video_decode_motion_vectors(plm_video_t *self);
 void plm_video_predict_macroblock(plm_video_t *self);
 void plm_video_copy_macroblock(uint32_t *dest, plm_frame_t *reference, int motion_h, int motion_v);
 void plm_video_interpolate_macroblock(uint32_t *dest, plm_frame_t *reference, int motion_h, int motion_v);
+void plm_video_scatter_macroblock(plm_video_t *self);
 void plm_video_decode_block(plm_video_t *self, int block, uint32_t *mb_display);
 void plm_video_idct(int *block);
 
@@ -3461,83 +3459,6 @@ void plm_video_decode_picture(plm_video_t *self) {
 		self->start_code = plm_buffer_next_start_code(self->buffer);
 	}
 
-	// Set reference frames // DCL DIFF
-	if (self->picture_type == PLM_VIDEO_PICTURE_TYPE_INTRA ||
-		self->picture_type == PLM_VIDEO_PICTURE_TYPE_PREDICTIVE)
-	{
-		uint32_t *d_y = (uint32_t *)self->frame_current.y.data;
-		uint32_t *d_cr = (uint32_t *)self->frame_current.cr.data;
-		uint32_t *d_cb = (uint32_t *)self->frame_current.cb.data;
-		uint32_t *s = self->frame_current.display;
-		int scan = (self->mb_col + 1) * 4;
-		int scan_half = scan >> 1;
-		int i;
-
-		__asm__("pref @%0" : : "r"(s));
-
-		for (i = (self->mb_row + 1); i; i--)
-		{
-			int j;
-
-			for (j = (self->mb_col + 1); j; j--)
-			{
-				int y;
-
-				__asm__("pref @%0" : : "r"(s + 16));
-
-				for (y = 0; y < 8; y++)
-				{
-					d_cb[0] = s[0];
-					d_cb[1] = s[1];
-					d_cr[0] = s[16];
-					d_cr[1] = s[17];
-					d_cb += scan_half;
-					d_cr += scan_half;
-						s += 2;
-					}
-
-				d_cb -= scan_half * 8 - 2;
-				d_cr -= scan_half * 8 - 2;
-					s += 16;
-
-				__asm__("pref @%0" : : "r"(s + 16));
-
-				for (y = 0; y < 8; y++)
-				{
-					d_y[0] = s[0];
-					d_y[1] = s[1];
-					d_y[2] = s[16];
-					d_y[3] = s[17];
-					d_y += scan;
-						s += 2;
-					}
-
-					s += 16;
-
-				__asm__("pref @%0" : : "r"(s + 16));
-
-				for (y = 0; y < 8; y++)
-				{
-					d_y[0] = s[0];
-					d_y[1] = s[1];
-					d_y[2] = s[16];
-					d_y[3] = s[17];
-					d_y += scan;
-						s += 2;
-					}
-
-				d_y -= scan * 16 - 4;
-					s += 16;
-
-				__asm__("pref @%0" : : "r"(s + 16));
-			}
-
-			d_cb += scan_half * 7;
-			d_cr += scan_half * 7;
-			d_y += scan * 15;
-		}
-	}
-
 	// If this is a reference picture rotate the prediction pointers
 	if (
 		self->picture_type == PLM_VIDEO_PICTURE_TYPE_INTRA ||
@@ -3622,23 +3543,10 @@ void plm_video_decode_macroblock(plm_video_t *self) {
 		// Predict skipped macroblocks
 		while (increment > 1) {
 			plm_video_advance_macroblock(self);
-
-			// DCL DIFF - Actually a Regression
-			// if(self->picture_type == PLM_VIDEO_PICTURE_TYPE_PREDICTIVE)
-			// {
-			// 	// Skipped macroblocks in P-pictures
-			// 	uint32_t *dest = self->frame_current.display + self->macroblock_address * 96;
-			// 	uint32_t *src = self->frame_forward.display + self->macroblock_address * 96;
-			// 	for(int i = 0; i < 96; i++)
-			// 	{
-			// 		*dest++ = *src++;
-			// 	}
-			// }
-			// else
-			// {
-				// Skipped macroblocks in B-pictures
-				plm_video_predict_macroblock(self);
-			//}
+			plm_video_predict_macroblock(self);
+			if (self->picture_type != PLM_VIDEO_PICTURE_TYPE_B) {
+				plm_video_scatter_macroblock(self);
+			}
 			increment--;
 		}
 		plm_video_advance_macroblock(self);
@@ -3694,6 +3602,11 @@ void plm_video_decode_macroblock(plm_video_t *self) {
 			}
 			mask >>= 1;
 		}
+	}
+
+	// Scatter display buffer to Y/Cb/Cr planes while data is cache-hot
+	if (self->picture_type != PLM_VIDEO_PICTURE_TYPE_B) {
+		plm_video_scatter_macroblock(self);
 	}
 }
 
@@ -4135,14 +4048,73 @@ void plm_video_interpolate_macroblock(
 	__attribute__((aligned(8))) static uint32_t buffer[96];
 
 	plm_video_copy_macroblock(buffer, reference, motion_h, motion_v);
-	for (int i = 0; i < 96; i += 4) {
+	__asm__("pref @%0" : : "r"(dest));
+	__asm__("pref @%0" : : "r"(buffer));
+	for (int i = 0; i < 96; i += 8) {
+		__asm__("pref @%0" : : "r"(dest + i + 8));
+		__asm__("pref @%0" : : "r"(buffer + i + 8));
 		dest[i + 0] = (((dest[i + 0] >> 1) & 0x7f7f7f7f) + ((buffer[i + 0] >> 1) & 0x7f7f7f7f));
 		dest[i + 1] = (((dest[i + 1] >> 1) & 0x7f7f7f7f) + ((buffer[i + 1] >> 1) & 0x7f7f7f7f));
 		dest[i + 2] = (((dest[i + 2] >> 1) & 0x7f7f7f7f) + ((buffer[i + 2] >> 1) & 0x7f7f7f7f));
 		dest[i + 3] = (((dest[i + 3] >> 1) & 0x7f7f7f7f) + ((buffer[i + 3] >> 1) & 0x7f7f7f7f));
+		dest[i + 4] = (((dest[i + 4] >> 1) & 0x7f7f7f7f) + ((buffer[i + 4] >> 1) & 0x7f7f7f7f));
+		dest[i + 5] = (((dest[i + 5] >> 1) & 0x7f7f7f7f) + ((buffer[i + 5] >> 1) & 0x7f7f7f7f));
+		dest[i + 6] = (((dest[i + 6] >> 1) & 0x7f7f7f7f) + ((buffer[i + 6] >> 1) & 0x7f7f7f7f));
+		dest[i + 7] = (((dest[i + 7] >> 1) & 0x7f7f7f7f) + ((buffer[i + 7] >> 1) & 0x7f7f7f7f));
 	}
 }
 
+void plm_video_scatter_macroblock(plm_video_t *self) {
+	int scan = self->luma_width >> 2;
+	int scan_half = self->chroma_width >> 2;
+
+	uint32_t *s = self->frame_current.display + self->macroblock_address * 96;
+
+	uint32_t *d_cb = (uint32_t *)self->frame_current.cb.data
+		+ self->mb_row * 8 * scan_half + self->mb_col * 2;
+	uint32_t *d_cr = (uint32_t *)self->frame_current.cr.data
+		+ self->mb_row * 8 * scan_half + self->mb_col * 2;
+	uint32_t *d_y = (uint32_t *)self->frame_current.y.data
+		+ self->mb_row * 16 * scan + self->mb_col * 4;
+
+	__asm__("pref @%0" : : "r"(s));
+
+	// Cb and Cr blocks (display offsets 0-15 and 16-31)
+	__asm__("pref @%0" : : "r"(s + 16));
+	for (int y = 0; y < 8; y++) {
+		d_cb[0] = s[0];
+		d_cb[1] = s[1];
+		d_cr[0] = s[16];
+		d_cr[1] = s[17];
+		d_cb += scan_half;
+		d_cr += scan_half;
+		s += 2;
+	}
+	s += 16; // skip Cr block, advance to Y0
+
+	// Y upper half: Y0 (offsets 32-47) and Y1 (48-63)
+	__asm__("pref @%0" : : "r"(s + 16));
+	for (int y = 0; y < 8; y++) {
+		d_y[0] = s[0];
+		d_y[1] = s[1];
+		d_y[2] = s[16];
+		d_y[3] = s[17];
+		d_y += scan;
+		s += 2;
+	}
+	s += 16; // skip Y1 block, advance to Y2
+
+	// Y lower half: Y2 (offsets 64-79) and Y3 (80-95)
+	__asm__("pref @%0" : : "r"(s + 16));
+	for (int y = 0; y < 8; y++) {
+		d_y[0] = s[0];
+		d_y[1] = s[1];
+		d_y[2] = s[16];
+		d_y[3] = s[17];
+		d_y += scan;
+		s += 2;
+	}
+}
 
 void plm_video_decode_block(plm_video_t *self, int block, uint32_t *mb_display) {
 
@@ -4345,19 +4317,20 @@ void plm_video_decode_block(plm_video_t *self, int block, uint32_t *mb_display) 
 	}
 }
 
-// Ian micheal unrolled 2x
 void plm_video_idct(int *block) {
     int x0, x1, x2, x3, x4, y3, y4, y5, y6, y7;
     int b1, b3, b4, b6, b7, tmp1, tmp2, m0;
     int i;
 
-    // Unrolled loop for columns
+    // Column pass - skip all-zero columns
     for (i = 0; i < 8; ++i) {
         int *p = block + i;
 
-        x0 = p[4 * 8];
-        x1 = p[2 * 8] + p[6 * 8];
-        x2 = p[5 * 8] - p[3 * 8];
+        // Zero-column skip: if entire column is zero, output stays zero
+        if (!(p[0] | p[8] | p[16] | p[24] | p[32] | p[40] | p[48] | p[56])) {
+            continue;
+        }
+
         tmp1 = p[1 * 8] + p[7 * 8];
         tmp2 = p[3 * 8] + p[5 * 8];
         b6 = p[1 * 8] - p[7 * 8];
@@ -4388,13 +4361,15 @@ void plm_video_idct(int *block) {
         p[7 * 8] = y4 - b7;
     }
 
-    // Unrolled loop for rows
+    // Row pass - skip all-zero rows
     for (i = 0; i < 64; i += 8) {
         int *p = block + i;
 
-        x0 = p[4];
-        x1 = p[2] + p[6];
-        x2 = p[5] - p[3];
+        // Zero-row skip: if entire row is zero, output stays zero
+        if (!(p[0] | p[1] | p[2] | p[3] | p[4] | p[5] | p[6] | p[7])) {
+            continue;
+        }
+
         tmp1 = p[1] + p[7];
         tmp2 = p[3] + p[5];
         b6 = p[1] - p[7];
@@ -4716,6 +4691,14 @@ const plm_quantizer_spec_t *plm_audio_read_allocation(plm_audio_t *self, int sb,
 void plm_audio_read_samples(plm_audio_t *self, int ch, int sb, int part);
 void plm_audio_idct36(int s[32][3], int ss, float *d, int dp);
 
+static inline int plm_audio_decode_scalefactor_value(int sf) {
+	if (sf == 63) {
+		return 0;
+	}
+	int shift = sf / 3;
+	return (PLM_AUDIO_SCALEFACTOR_BASE[sf % 3] + ((1 << shift) >> 1)) >> shift;
+}
+
 plm_audio_t *plm_audio_create_with_buffer(plm_buffer_t *buffer, int destroy_when_done) {
 	plm_audio_t *self = (plm_audio_t *)PLM_MALLOC(sizeof(plm_audio_t));
 	if(!self) {
@@ -4967,8 +4950,9 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 	// Prepare the quantizer table lookups
 	int tab3 = 0;
 	int sblimit = 0;
+	int mono = (self->mode == PLM_AUDIO_MODE_MONO);
 
-	int tab1 = (self->mode == PLM_AUDIO_MODE_MONO) ? 0 : 1;
+	int tab1 = mono ? 0 : 1;
 	int tab2 = PLM_AUDIO_QUANT_LUT_STEP_1[tab1][self->bitrate_index];
 	tab3 = QUANT_LUT_STEP_2[tab2][self->samplerate_index];
 	sblimit = tab3 & 63;
@@ -4991,15 +4975,12 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 	}
 
 	// Read scale factor selector information
-	int channels = (self->mode == PLM_AUDIO_MODE_MONO) ? 1 : 2;
+	int channels = mono ? 1 : 2;
 	for (int sb = 0; sb < sblimit; sb++) {
 		for (int ch = 0; ch < channels; ch++) {
 			if (self->allocation[ch][sb]) {
 				self->scale_factor_info[ch][sb] = plm_buffer_read(self->buffer, 2);
 			}
-		}
-		if (self->mode == PLM_AUDIO_MODE_MONO) {
-			self->scale_factor_info[1][sb] = self->scale_factor_info[0][sb];
 		}
 	}
 
@@ -5010,32 +4991,27 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 				int *sf = self->scale_factor[ch][sb];
 				switch (self->scale_factor_info[ch][sb]) {
 					case 0:
-						sf[0] = plm_buffer_read(self->buffer, 6);
-						sf[1] = plm_buffer_read(self->buffer, 6);
-						sf[2] = plm_buffer_read(self->buffer, 6);
+						sf[0] = plm_audio_decode_scalefactor_value(plm_buffer_read(self->buffer, 6));
+						sf[1] = plm_audio_decode_scalefactor_value(plm_buffer_read(self->buffer, 6));
+						sf[2] = plm_audio_decode_scalefactor_value(plm_buffer_read(self->buffer, 6));
 						break;
 					case 1:
 						sf[0] =
-						sf[1] = plm_buffer_read(self->buffer, 6);
-						sf[2] = plm_buffer_read(self->buffer, 6);
+						sf[1] = plm_audio_decode_scalefactor_value(plm_buffer_read(self->buffer, 6));
+						sf[2] = plm_audio_decode_scalefactor_value(plm_buffer_read(self->buffer, 6));
 						break;
 					case 2:
 						sf[0] =
 						sf[1] =
-						sf[2] = plm_buffer_read(self->buffer, 6);
+						sf[2] = plm_audio_decode_scalefactor_value(plm_buffer_read(self->buffer, 6));
 						break;
 					case 3:
-						sf[0] = plm_buffer_read(self->buffer, 6);
+						sf[0] = plm_audio_decode_scalefactor_value(plm_buffer_read(self->buffer, 6));
 						sf[1] =
-						sf[2] = plm_buffer_read(self->buffer, 6);
+						sf[2] = plm_audio_decode_scalefactor_value(plm_buffer_read(self->buffer, 6));
 						break;
 				}
 			}
-		}
-		if (self->mode == PLM_AUDIO_MODE_MONO) {
-			self->scale_factor[1][sb][0] = self->scale_factor[0][sb][0];
-			self->scale_factor[1][sb][1] = self->scale_factor[0][sb][1];
-			self->scale_factor[1][sb][2] = self->scale_factor[0][sb][2];
 		}
 	}
 
@@ -5047,23 +5023,35 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 		for (int granule = 0; granule < 4; granule++) {
 
 			// Read the samples
-			for (int sb = 0; sb < self->bound; sb++) {
-				plm_audio_read_samples(self, 0, sb, part);
-				plm_audio_read_samples(self, 1, sb, part);
+			if (mono) {
+				for (int sb = 0; sb < sblimit; sb++) {
+					plm_audio_read_samples(self, 0, sb, part);
+				}
+				for (int sb = sblimit; sb < 32; sb++) {
+					self->sample[0][sb][0] = 0;
+					self->sample[0][sb][1] = 0;
+					self->sample[0][sb][2] = 0;
+				}
 			}
-			for (int sb = self->bound; sb < sblimit; sb++) {
-				plm_audio_read_samples(self, 0, sb, part);
-				self->sample[1][sb][0] = self->sample[0][sb][0];
-				self->sample[1][sb][1] = self->sample[0][sb][1];
-				self->sample[1][sb][2] = self->sample[0][sb][2];
-			}
-			for (int sb = sblimit; sb < 32; sb++) {
-				self->sample[0][sb][0] = 0;
-				self->sample[0][sb][1] = 0;
-				self->sample[0][sb][2] = 0;
-				self->sample[1][sb][0] = 0;
-				self->sample[1][sb][1] = 0;
-				self->sample[1][sb][2] = 0;
+			else {
+				for (int sb = 0; sb < self->bound; sb++) {
+					plm_audio_read_samples(self, 0, sb, part);
+					plm_audio_read_samples(self, 1, sb, part);
+				}
+				for (int sb = self->bound; sb < sblimit; sb++) {
+					plm_audio_read_samples(self, 0, sb, part);
+					self->sample[1][sb][0] = self->sample[0][sb][0];
+					self->sample[1][sb][1] = self->sample[0][sb][1];
+					self->sample[1][sb][2] = self->sample[0][sb][2];
+				}
+				for (int sb = sblimit; sb < 32; sb++) {
+					self->sample[0][sb][0] = 0;
+					self->sample[0][sb][1] = 0;
+					self->sample[0][sb][2] = 0;
+					self->sample[1][sb][0] = 0;
+					self->sample[1][sb][1] = 0;
+					self->sample[1][sb][2] = 0;
+				}
 			}
 
 			// Synthesis loop
@@ -5075,7 +5063,7 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 				plm_audio_idct36(self->sample[0], p, self->V, self->v_pos);
 
 				int d_index = (512 - (self->v_pos >> 1)) >> 5;
-				int v_index = (self->v_pos % 128) >> 1;
+				int v_index = (self->v_pos & 127) >> 1;
 				float *d = &self->D[d_index];
 				float *v1 = &self->V[v_index];
 				float *v2 = &self->V[96 - v_index];
@@ -5118,15 +5106,6 @@ void plm_audio_read_samples(plm_audio_t *self, int ch, int sb, int part) {
 		return;
 	}
 
-	// Resolve scalefactor
-	if (sf == 63) {
-		sf = 0;
-	}
-	else {
-		int shift = (sf / 3) | 0;
-		sf = (PLM_AUDIO_SCALEFACTOR_BASE[sf % 3] + ((1 << shift) >> 1)) >> shift;
-	}
-
 	// Decode samples
 	int adj = q->levels;
 	if (q->group) {
@@ -5147,15 +5126,17 @@ void plm_audio_read_samples(plm_audio_t *self, int ch, int sb, int part) {
 	// Postmultiply samples
 	int scale = 65536 / (adj + 1);
 	adj = ((adj + 1) >> 1) - 1;
+	int sf_hi = sf >> 12;
+	int sf_lo = sf & 4095;
 
 	val = (adj - sample[0]) * scale;
-	sample[0] = (val * (sf >> 12) + ((val * (sf & 4095) + 2048) >> 12)) >> 12;
+	sample[0] = (val * sf_hi + ((val * sf_lo + 2048) >> 12)) >> 12;
 
 	val = (adj - sample[1]) * scale;
-	sample[1] = (val * (sf >> 12) + ((val * (sf & 4095) + 2048) >> 12)) >> 12;
+	sample[1] = (val * sf_hi + ((val * sf_lo + 2048) >> 12)) >> 12;
 
 	val = (adj - sample[2]) * scale;
-	sample[2] = (val * (sf >> 12) + ((val * (sf & 4095) + 2048) >> 12)) >> 12;
+	sample[2] = (val * sf_hi + ((val * sf_lo + 2048) >> 12)) >> 12;
 }
 
 void plm_audio_idct36(int s[32][3], int ss, float *d, int dp) {
