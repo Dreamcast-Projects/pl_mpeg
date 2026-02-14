@@ -938,15 +938,25 @@ plm_t *plm_create_with_filename(const char *filename) {
 
 plm_t *plm_create_with_file(PLM_FILE_TYPE fh, int close_when_done) {
 	plm_buffer_t *buffer = plm_buffer_create_with_file(fh, close_when_done);
+	if (!buffer) {
+		return NULL;
+	}
 	return plm_create_with_buffer(buffer, TRUE);
 }
 
 plm_t *plm_create_with_memory(uint8_t *bytes, size_t length, int free_when_done) {
 	plm_buffer_t *buffer = plm_buffer_create_with_memory(bytes, length, free_when_done);
+	if (!buffer) {
+		return NULL;
+	}
 	return plm_create_with_buffer(buffer, TRUE);
 }
 
 plm_t *plm_create_with_buffer(plm_buffer_t *buffer, int destroy_when_done) {
+	if (!buffer) {
+		return NULL;
+	}
+
 	plm_t *self = (plm_t *)PLM_MALLOC(sizeof(plm_t));
 	if(!self) {
 		fprintf(stderr, "Out of memory for self. [plm_create_with_buffer]\n");
@@ -955,6 +965,13 @@ plm_t *plm_create_with_buffer(plm_buffer_t *buffer, int destroy_when_done) {
 	PLM_MEMZERO(self, sizeof(plm_t));
 
 	self->demux = plm_demux_create(buffer, destroy_when_done);
+	if (!self->demux) {
+		if (destroy_when_done) {
+			plm_buffer_destroy(buffer);
+		}
+		PLM_FREE(self);
+		return NULL;
+	}
 	self->video_enabled = TRUE;
 	self->audio_enabled = TRUE;
 	plm_init_decoders(self);
@@ -977,8 +994,16 @@ int plm_init_decoders(plm_t *self) {
 		}
 		if (!self->video_decoder) {
 			self->video_buffer = plm_buffer_create_with_capacity(PLM_VID_BUFFER_DEFAULT_SIZE);
+			if (!self->video_buffer) {
+				return FALSE;
+			}
 			plm_buffer_set_load_callback(self->video_buffer, plm_read_video_packet, self);
 			self->video_decoder = plm_video_create_with_buffer(self->video_buffer, TRUE);
+			if (!self->video_decoder) {
+				plm_buffer_destroy(self->video_buffer);
+				self->video_buffer = NULL;
+				return FALSE;
+			}
 		}
 	}
 
@@ -988,8 +1013,16 @@ int plm_init_decoders(plm_t *self) {
 		}
 		if (!self->audio_decoder) {
 			self->audio_buffer = plm_buffer_create_with_capacity(PLM_BUFFER_DEFAULT_SIZE);
+			if (!self->audio_buffer) {
+				return FALSE;
+			}
 			plm_buffer_set_load_callback(self->audio_buffer, plm_read_audio_packet, self);
 			self->audio_decoder = plm_audio_create_with_buffer(self->audio_buffer, TRUE);
+			if (!self->audio_decoder) {
+				plm_buffer_destroy(self->audio_buffer);
+				self->audio_buffer = NULL;
+				return FALSE;
+			}
 		}
 	}
 
@@ -1003,9 +1036,21 @@ void plm_destroy(plm_t *self) {
 
 	if (self->video_decoder) {
 		plm_video_destroy(self->video_decoder);
+		self->video_decoder = NULL;
+		self->video_buffer = NULL;
+	}
+	else if (self->video_buffer) {
+		plm_buffer_destroy(self->video_buffer);
+		self->video_buffer = NULL;
 	}
 	if (self->audio_decoder) {
 		plm_audio_destroy(self->audio_decoder);
+		self->audio_decoder = NULL;
+		self->audio_buffer = NULL;
+	}
+	else if (self->audio_buffer) {
+		plm_buffer_destroy(self->audio_buffer);
+		self->audio_buffer = NULL;
 	}
 
 	plm_demux_destroy(self->demux);
@@ -1500,6 +1545,12 @@ plm_buffer_t *plm_buffer_create_with_filename(const char *filename) {
 
 plm_buffer_t *plm_buffer_create_with_file(PLM_FILE_TYPE fh, int close_when_done) {
 	plm_buffer_t *self = plm_buffer_create_with_capacity(PLM_BUFFER_DEFAULT_SIZE);
+	if (!self) {
+		if (close_when_done && fh != PLM_FILE_INVALID_HANDLE) {
+			PLM_FILE_CLOSE(fh);
+		}
+		return NULL;
+	}
 	self->fh = fh;
 	self->close_when_done = close_when_done;
 	self->mode = PLM_BUFFER_MODE_FILE;
@@ -1558,6 +1609,9 @@ plm_buffer_t *plm_buffer_create_with_capacity(size_t capacity) {
 
 plm_buffer_t *plm_buffer_create_for_appending(size_t initial_capacity) {
 	plm_buffer_t *self = plm_buffer_create_with_capacity(initial_capacity);
+	if (!self) {
+		return NULL;
+	}
 	self->mode = PLM_BUFFER_MODE_APPEND;
 	self->discard_read_bytes = FALSE;
 	return self;
@@ -1789,7 +1843,7 @@ size_t plm_buffer_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
 
 		int result = plm_buffer_ring_grow_memalign(self, new_size);
 		if (result < 0)
-			return -1;
+			return 0;
 	}
 
 	plm_buffer_ring_write(self, bytes, length);
@@ -1871,9 +1925,9 @@ void plm_buffer_load_file_callback(plm_buffer_t *self, void *user) {
 	}
 
 	size_t bytes_available = self->capacity - self->length;
-	size_t bytes_read = plm_buffer_ring_fs_read_into(self, bytes_available);
+	int bytes_read = plm_buffer_ring_fs_read_into(self, bytes_available);
 
-	if (bytes_read == 0) {
+	if (bytes_read <= 0) {
 		self->has_ended = TRUE;
 	}
 }
@@ -4972,7 +5026,7 @@ int plm_audio_decode_header(plm_audio_t *self) {
 	}
 
 	int bitrate_index = plm_buffer_read(self->buffer, 4) - 1;
-	if (bitrate_index > 13) {
+	if (bitrate_index < 0 || bitrate_index > 13) {
 		return 0;
 	}
 
