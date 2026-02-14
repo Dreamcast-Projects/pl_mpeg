@@ -286,6 +286,17 @@ void mpeg_player_set_loop(mpeg_player_t *player, int loop);
  */
 void mpeg_player_set_volume(mpeg_player_t *player, uint8_t volume);
 
+/** \brief   Reset the MPEG player for re-use.
+    \ingroup mpeg_playback
+
+    Stops audio playback, rewinds the decoder to the beginning, and
+    resets internal timing state so that the next call to
+    mpeg_decode_step() will re-initialize from scratch.
+
+    \param  player          The MPEG player instance. If NULL, does nothing.
+*/
+void mpeg_player_reset(mpeg_player_t *player);
+
 /** \brief   Destroy an MPEG player instance.
     \ingroup mpeg_playback
 
