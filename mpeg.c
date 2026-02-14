@@ -463,8 +463,8 @@ void mpeg_upload_frame(mpeg_player_t *player) {
     uint32_t *src = player->frame->display;
 
     /* Video size in macroblocks (16x16) */
-    const int video_blocks_w = player->frame->width  >> 4;
-    const int video_blocks_h = player->frame->height >> 4;
+    const int video_blocks_w = player->frame->y.width  >> 4;
+    const int video_blocks_h = player->frame->y.height >> 4;
 
     /*
      * PVR YUV converter stride (in macroblocks).

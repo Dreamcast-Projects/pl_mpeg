@@ -3792,8 +3792,8 @@ void plm_video_predict_macroblock(plm_video_t *self) {
 void plm_video_copy_macroblock(
 	uint32_t *dest, plm_frame_t *reference, int motion_h, int motion_v
 ) {
-	int dw = reference->width;
-	int dh = reference->height;
+	int dw = reference->y.width;
+	int dh = reference->y.height;
 	int hp = motion_h < 0 ? (dw + (motion_h >> 1)) : (motion_h >> 1);
 	int vp = motion_v < 0 ? (dh + (motion_v >> 1)) : (motion_v >> 1);
 	int odd_h = (motion_h & 1) == 1;
