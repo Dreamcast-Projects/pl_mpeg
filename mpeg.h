@@ -5,19 +5,19 @@
 
     Overview:
     This library facilitates the playback of MPEG1 videos on the Sega Dreamcast console.
-    It supports monaural audio and allows specifying a cancel button during playback.
+    It supports stereo audio and allows specifying a cancel button during playback.
 
     Key Features:
     - Video Playback: MPEG1 video playback.
-    - Audio Support: Mono audio playback. Stereo videos will play only the left channel.
+    - Audio Support: Stereo audio playback (interleaved 16-bit PCM).
     - Cancel Button: Allows specifying a controller button combination to cancel playback.
     - Recommended Resolutions:
-      - 4:3 Aspect Ratio: 320x240 pixels, Mono audio at 80kbits.
-      - 16:9 Aspect Ratio: 368x208 pixels, Mono audio at 80kbits.
+      - 4:3 Aspect Ratio: 320x240 pixels, Stereo audio at 80kbits.
+      - 16:9 Aspect Ratio: 368x208 pixels, Stereo audio at 80kbits.
 
     To create compatible MPEG1 videos, use the following ffmpeg command:
 
-    ffmpeg -i input.mp4 -vf "scale=320:240" -b:v 742k -minrate 742k -maxrate 742k -bufsize 742k -ac 1 -ar 32000 -c:a mp2 -b:a 64k -f mpeg output.mpg
+    ffmpeg -i input.mp4 -vf "scale=320:240" -b:v 742k -minrate 742k -maxrate 742k -bufsize 742k -ac 2 -ar 32000 -c:a mp2 -b:a 64k -f mpeg output.mpg
  */
 
 #ifndef _MPEG_H_INCLUDED_

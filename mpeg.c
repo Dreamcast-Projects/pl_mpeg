@@ -63,6 +63,7 @@ static int mpeg_texture_height;
 
 /* Size of the sound buffer for both the SH4 side and the AICA side */
 #define SOUND_BUFFER (64 * 1024)
+#define AUDIO_CHANNELS 2
 
 static int setup_graphics(mpeg_player_t *player, const mpeg_player_options_t *options);
 static int setup_audio(mpeg_player_t *player);
@@ -305,7 +306,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
 
     /* Init sound stream. */
     sound_stream_reset(player);
-    snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+    snd_stream_start(player->snd_hnd, player->sample_rate, AUDIO_CHANNELS - 1);
     player->snd_started = true;
     snd_stream_volume(player->snd_hnd, player->snd_volume);
 
@@ -359,7 +360,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
 
                 /* We are looping. Reset and restart */
                 sound_stream_reset(player);
-                snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+                snd_stream_start(player->snd_hnd, player->sample_rate, AUDIO_CHANNELS - 1);
                 player->snd_started = true;
                 snd_stream_volume(player->snd_hnd, player->snd_volume);
 
@@ -397,7 +398,7 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
     if(player->start_time == 0) {
         /* Init sound stream. */
         sound_stream_reset(player);
-        snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+        snd_stream_start(player->snd_hnd, player->sample_rate, AUDIO_CHANNELS - 1);
         player->snd_started = true;
         snd_stream_volume(player->snd_hnd, player->snd_volume);
 
@@ -434,7 +435,7 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
 
         /* We are Looping. Reset and restart */
         sound_stream_reset(player);
-        snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+        snd_stream_start(player->snd_hnd, player->sample_rate, AUDIO_CHANNELS - 1);
         player->snd_started = true;
         snd_stream_volume(player->snd_hnd, player->snd_volume);
 
@@ -614,7 +615,7 @@ static int setup_graphics(mpeg_player_t *player, const mpeg_player_options_t *op
 
 static void *sound_callback(snd_stream_hnd_t hnd, int request_size, int *size_out) {
     mpeg_player_t *player = (mpeg_player_t *)snd_stream_get_userdata(hnd);
-    const int frame_bytes = PLM_AUDIO_SAMPLES_PER_FRAME * (int)sizeof(short);
+    const int frame_bytes = PLM_AUDIO_SAMPLES_PER_FRAME * AUDIO_CHANNELS * (int)sizeof(short);
     uint8_t *dest = player->snd_buf;
     int out = 0;
     int needed = request_size;
