@@ -960,6 +960,9 @@ plm_t *plm_create_with_buffer(plm_buffer_t *buffer, int destroy_when_done) {
 	plm_t *self = (plm_t *)PLM_MALLOC(sizeof(plm_t));
 	if(!self) {
 		fprintf(stderr, "Out of memory for self. [plm_create_with_buffer]\n");
+		if (destroy_when_done) {
+			plm_buffer_destroy(buffer);
+		}
 		return NULL;
 	}
 	PLM_MEMZERO(self, sizeof(plm_t));

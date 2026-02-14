@@ -43,6 +43,9 @@ struct mpeg_player_t {
     /* Sound stream handle */
     snd_stream_hnd_t snd_hnd;
 
+    /* Whether this player has started the stream since last reset */
+    bool snd_started;
+
     /* Polygon header for rendering */
     pvr_poly_hdr_t hdr;
 
@@ -84,8 +87,10 @@ static inline void sound_stream_reset(mpeg_player_t *player) {
     if(!player)
         return;
 
-    if(player->start_time != 0)
+    if(player->snd_hnd != SND_STREAM_INVALID && player->snd_started) {
         snd_stream_stop(player->snd_hnd);
+        player->snd_started = false;
+    }
 
     player->snd_pcm_leftovers = 0;
     player->snd_pcm_offset = 0;
@@ -301,6 +306,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
     /* Init sound stream. */
     sound_stream_reset(player);
     snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+    player->snd_started = true;
     snd_stream_volume(player->snd_hnd, player->snd_volume);
 
     player->frame = plm_decode_video(player->decoder);
@@ -354,6 +360,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
                 /* We are looping. Reset and restart */
                 sound_stream_reset(player);
                 snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+                player->snd_started = true;
                 snd_stream_volume(player->snd_hnd, player->snd_volume);
 
                 player->frame = plm_decode_video(player->decoder);
@@ -391,6 +398,7 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
         /* Init sound stream. */
         sound_stream_reset(player);
         snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+        player->snd_started = true;
         snd_stream_volume(player->snd_hnd, player->snd_volume);
 
         /* Prime the first frame */
@@ -427,6 +435,7 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
         /* We are Looping. Reset and restart */
         sound_stream_reset(player);
         snd_stream_start(player->snd_hnd, player->sample_rate, 0);
+        player->snd_started = true;
         snd_stream_volume(player->snd_hnd, player->snd_volume);
 
         player->frame = plm_decode_video(player->decoder);
