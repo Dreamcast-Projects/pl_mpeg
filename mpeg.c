@@ -22,6 +22,12 @@ struct mpeg_player_t {
     /* Texture that holds decoded data */
     pvr_ptr_t texture;
 
+    /* Texture Width */
+    size_t texture_width;
+
+    /* Texture Height */
+    size_t texture_height;
+
     /* Width of the video in pixels */
     int width;
 
@@ -55,11 +61,6 @@ struct mpeg_player_t {
     /* Start time for a/v sync */
     uint64_t start_time;
 };
-
-/* Output texture width and height initial values
-   You can choose from 32, 64, 128, 256, 512, 1024 */
-static int mpeg_texture_width;
-static int mpeg_texture_height;
 
 /* Size of the sound buffer for both the SH4 side and the AICA side */
 #define SOUND_BUFFER (64 * 1024)
@@ -457,8 +458,8 @@ void mpeg_upload_frame(mpeg_player_t *player) {
         return;
 
     /* HACK: Fix Flycast */
-    PVR_SET(PVR_YUV_CFG, (((mpeg_texture_height / 16) - 1) << 8) |
-                      ((mpeg_texture_width / 16) - 1));
+    PVR_SET(PVR_YUV_CFG, (((player->texture_height >> 4) - 1) << 8) |
+                      ((player->texture_width >> 4) - 1));
 
     uint32_t *src = player->frame->display;
 
@@ -471,10 +472,10 @@ void mpeg_upload_frame(mpeg_player_t *player) {
      * This MUST match the width configured in PVR_YUV_CFG.
      *
      * Example:
-     *   mpeg_texture_width = 512 px
+     *   player->texture_width = 512 px
      *   → stride = 512 / 16 = 32 macroblocks
      */
-    const int pvr_blocks_per_row = mpeg_texture_width >> 4;
+    const int pvr_blocks_per_row = player->texture_width >> 4;
     const int pad_blocks_x = pvr_blocks_per_row - video_blocks_w;
 
     /*
@@ -538,10 +539,10 @@ static int setup_graphics(mpeg_player_t *player, const mpeg_player_options_t *op
         }
     }
 
-    mpeg_texture_width = next_power_of_two(player->width);
-    mpeg_texture_height = next_power_of_two(player->height);
+    player->texture_width = next_power_of_two(player->width);
+    player->texture_height = next_power_of_two(player->height);
 
-    player->texture = MPEG_PVR_MALLOC(mpeg_texture_width * mpeg_texture_height * 2);
+    player->texture = MPEG_PVR_MALLOC(player->texture_width * player->texture_height * 2);
     if(!player->texture) {
         fprintf(stderr, "Failed to allocate PVR memory!\n");
         return -1;
@@ -551,23 +552,23 @@ static int setup_graphics(mpeg_player_t *player, const mpeg_player_options_t *op
     PVR_SET(PVR_YUV_ADDR, (((uint32_t)player->texture) & 0xffffff));
     /* Divide texture width and texture height by 16 and subtract 1.
        The actual values to set are 1, 3, 7, 15, 31, 63. */
-    PVR_SET(PVR_YUV_CFG, (((mpeg_texture_height / 16) - 1) << 8) |
-                          ((mpeg_texture_width / 16) - 1));
+    PVR_SET(PVR_YUV_CFG, (((player->texture_height >> 4) - 1) << 8) |
+                          ((player->texture_width >> 4) - 1));
     PVR_GET(PVR_YUV_CFG);
 
     /* Clear texture to black */
-    sq_set(player->texture, 0, mpeg_texture_width * mpeg_texture_height * 2);
+    sq_set(player->texture, 0, player->texture_width * player->texture_height * 2);
 
     pvr_poly_cxt_t cxt;
     pvr_poly_cxt_txr(&cxt, player->list_type,
                      PVR_TXRFMT_YUV422 | PVR_TXRFMT_NONTWIDDLED,
-                     mpeg_texture_width, mpeg_texture_height,
+                     player->texture_width, player->texture_height,
                      player->texture,
                      opts->filter_mode);
     pvr_poly_compile(&player->hdr, &cxt);
 
-    float u = (float)player->width / mpeg_texture_width;
-    float v = (float)player->height / mpeg_texture_height;
+    float u = (float)player->width / player->texture_width;
+    float v = (float)player->height / player->texture_height;
     float left   = screen_x;
     float top    = screen_y;
     float right  = screen_x + screen_width;
