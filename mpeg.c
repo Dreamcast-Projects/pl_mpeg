@@ -252,6 +252,19 @@ void mpeg_player_set_volume(mpeg_player_t *player, uint8_t volume) {
     snd_stream_volume(player->snd_hnd, volume);
 }
 
+void mpeg_player_reset(mpeg_player_t *player) {
+    if(!player)
+        return;
+
+    sound_stream_reset(player);
+    player->start_time = 0;
+    player->frame = NULL;
+    player->sample = NULL;
+
+    if(player->decoder)
+        plm_rewind(player->decoder);
+}
+
 void mpeg_player_destroy(mpeg_player_t *player) {
     if(!player)
         return;
@@ -264,6 +277,10 @@ void mpeg_player_destroy(mpeg_player_t *player) {
     if(player->snd_hnd != SND_STREAM_INVALID) {
         snd_stream_destroy(player->snd_hnd);
         player->snd_hnd = SND_STREAM_INVALID;
+    }
+
+    if(player->snd_buf) {
+        MPEG_FREE(player->snd_buf);
         player->snd_buf = NULL;
     }
 
@@ -273,7 +290,6 @@ void mpeg_player_destroy(mpeg_player_t *player) {
     }
 
     MPEG_FREE(player);
-    player = NULL;
 }
 
 mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options_t *cancel_options) {
@@ -326,7 +342,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
             //uint64_t startd_time = timer_ns_gettime64();
             player->frame = plm_decode_video(player->decoder);
             //uint64_t decode_time = timer_ns_gettime64() - startd_time;
-            //printf("%" PRIu64 "\n", decode_time);
+            //printf("V %" PRIu64 "\n", decode_time);
 
             if(!player->frame) {
                 /* Are we looping? */
@@ -404,6 +420,7 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
         /* Are we looping? */
         if(!plm_get_loop(player->decoder)) {
             sound_stream_reset(player);
+            player->start_time = 0;
             return MPEG_DECODE_EOF;
         }
 
@@ -610,7 +627,7 @@ static void *sound_callback(snd_stream_hnd_t hnd, int request_size, int *size_ou
         //uint64_t startd_time = timer_ns_gettime64();
         player->sample = plm_decode_audio(player->decoder);
         //uint64_t decode_time = timer_ns_gettime64() - startd_time;
-        //printf("%" PRIu64 "\n", decode_time);
+        //printf("A %" PRIu64 "\n", decode_time);
         if(!player->sample)
             break;
 

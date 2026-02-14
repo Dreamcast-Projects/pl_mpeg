@@ -1010,7 +1010,6 @@ void plm_destroy(plm_t *self) {
 
 	plm_demux_destroy(self->demux);
 	PLM_FREE(self);
-	self = NULL;
 }
 
 int plm_get_audio_enabled(plm_t *self) {
@@ -1549,6 +1548,7 @@ plm_buffer_t *plm_buffer_create_with_capacity(size_t capacity) {
 	self->bytes = (uint8_t *)PLM_MEMALIGN(32, capacity + PLM_PEEK_SIZE); //PLM_MALLOC(capacity + PLM_PEEK_SIZE);
 	if(!self->bytes) {
 		fprintf(stderr, "Out of memory for bytes. [plm_buffer_create_with_capacity]\n");
+		PLM_FREE(self);
 		return NULL;
 	}
 	self->mode = PLM_BUFFER_MODE_RING;
@@ -1575,7 +1575,6 @@ void plm_buffer_destroy(plm_buffer_t *self) {
 		self->bytes = NULL;
 	}
 	PLM_FREE(self);
-	self = NULL;
 }
 
 size_t plm_buffer_get_size(plm_buffer_t *self) {
@@ -2127,7 +2126,6 @@ void plm_demux_destroy(plm_demux_t *self) {
 		plm_buffer_destroy(self->buffer);
 	}
 	PLM_FREE(self);
-	self = NULL;
 }
 
 int plm_demux_has_headers(plm_demux_t *self) {
@@ -3187,7 +3185,6 @@ void plm_video_destroy(plm_video_t *self) {
 	}
 
 	PLM_FREE(self);
-	self = NULL;
 }
 
 double plm_video_get_framerate(plm_video_t *self) {
@@ -3395,16 +3392,16 @@ int plm_video_decode_sequence_header(plm_video_t *self) {
 	size_t chroma_plane_size = self->chroma_width * self->chroma_height;
 	size_t frame_data_size = (luma_plane_size + 2 * chroma_plane_size);
 
-	// 32byte align // DCL DIFF
-	self->frames_data = (uint8_t*)PLM_MALLOC(frame_data_size * 3 * 2 + 31);
+	// DCL DIFF
+	self->frames_data = (uint8_t *)PLM_MEMALIGN(32, frame_data_size * 3 * 2);
 	if(!self->frames_data) {
 		fprintf(stderr, "Out of memory for self->frames_data. [plm_video_decode_sequence_header]\n");
 		return FALSE;
 	}
-	uint8_t *frames_data = (uint8_t*)(((unsigned int)self->frames_data + 31) & 0xffffffe0);
-	plm_video_init_frame(self, &self->frame_current, frames_data + frame_data_size * 0);
-	plm_video_init_frame(self, &self->frame_forward, frames_data + frame_data_size * 2);
-	plm_video_init_frame(self, &self->frame_backward, frames_data + frame_data_size * 4);
+
+	plm_video_init_frame(self, &self->frame_current, self->frames_data + frame_data_size * 0);
+	plm_video_init_frame(self, &self->frame_forward, self->frames_data + frame_data_size * 2);
+	plm_video_init_frame(self, &self->frame_backward, self->frames_data + frame_data_size * 4);
 
 	self->has_sequence_header = TRUE;
 	return TRUE;
@@ -4667,26 +4664,30 @@ typedef struct plm_quantizer_spec_t {
 	unsigned short levels;
 	unsigned char group;
 	unsigned char bits;
+	unsigned short recip;   // 65536/levels + 1 (for fast div by levels)
+	unsigned short scale;   // 65536 / (levels + 1) (for postmultiply)
+	unsigned short adj_half; // ((levels + 1) >> 1) - 1
 } plm_quantizer_spec_t;
 
  __attribute__((aligned(32))) static const plm_quantizer_spec_t PLM_AUDIO_QUANT_TAB[] = {
-	{     3, 1,  5 },  //  1
-	{     5, 1,  7 },  //  2
-	{     7, 0,  3 },  //  3
-	{     9, 1, 10 },  //  4
-	{    15, 0,  4 },  //  5
-	{    31, 0,  5 },  //  6
-	{    63, 0,  6 },  //  7
-	{   127, 0,  7 },  //  8
-	{   255, 0,  8 },  //  9
-	{   511, 0,  9 },  // 10
-	{  1023, 0, 10 },  // 11
-	{  2047, 0, 11 },  // 12
-	{  4095, 0, 12 },  // 13
-	{  8191, 0, 13 },  // 14
-	{ 16383, 0, 14 },  // 15
-	{ 32767, 0, 15 },  // 16
-	{ 65535, 0, 16 }   // 17
+	//  levels, group, bits, recip,  scale, adj_half
+	{     3, 1,  5, 21846, 16384,     1 },  //  1
+	{     5, 1,  7, 13108, 10923,     2 },  //  2
+	{     7, 0,  3,  9363,  8192,     3 },  //  3
+	{     9, 1, 10,  7282,  6554,     4 },  //  4
+	{    15, 0,  4,  4370,  4096,     7 },  //  5
+	{    31, 0,  5,  2114,  2048,    15 },  //  6
+	{    63, 0,  6,  1041,  1024,    31 },  //  7
+	{   127, 0,  7,   516,   512,    63 },  //  8
+	{   255, 0,  8,   257,   256,   127 },  //  9
+	{   511, 0,  9,   128,   128,   255 },  // 10
+	{  1023, 0, 10,    64,    64,   511 },  // 11
+	{  2047, 0, 11,    32,    32,  1023 },  // 12
+	{  4095, 0, 12,    16,    16,  2047 },  // 13
+	{  8191, 0, 13,     8,     8,  4095 },  // 14
+	{ 16383, 0, 14,     4,     4,  8191 },  // 15
+	{ 32767, 0, 15,     2,     2, 16383 },  // 16
+	{ 65535, 0, 16,     1,     1, 32767 }   // 17
 };
 
 struct plm_audio_t {
@@ -4724,12 +4725,58 @@ const plm_quantizer_spec_t *plm_audio_read_allocation(plm_audio_t *self, int sb,
 void plm_audio_read_samples(plm_audio_t *self, int ch, int sb, int part);
 void plm_audio_idct36(int s[32][3], int ss, float *d, int dp);
 
+// Precomputed scalefactor values for sf=0..62.
+// Each entry = (PLM_AUDIO_SCALEFACTOR_BASE[sf%3] + ((1<<(sf/3))>>1)) >> (sf/3)
+// sf=63 maps to 0 (handled by bounds check or extra entry).
+static const int PLM_AUDIO_SCALEFACTOR_TABLE[64] = {
+	// sf=0..2 (shift=0)
+	0x02000000, 0x01965FEA, 0x01428A30,
+	// sf=3..5 (shift=1)
+	0x01000000, 0x00CB2FF5, 0x00A14518,
+	// sf=6..8 (shift=2)
+	0x00800000, 0x006597FB, 0x0050A28C,
+	// sf=9..11 (shift=3)
+	0x00400000, 0x0032CBFD, 0x00285146,
+	// sf=12..14 (shift=4)
+	0x00200000, 0x001965FF, 0x001428A3,
+	// sf=15..17 (shift=5)
+	0x00100000, 0x000CB2FF, 0x000A1452,
+	// sf=18..20 (shift=6)
+	0x00080000, 0x00065980, 0x00050A29,
+	// sf=21..23 (shift=7)
+	0x00040000, 0x00032CC0, 0x00028514,
+	// sf=24..26 (shift=8)
+	0x00020000, 0x00019660, 0x0001428A,
+	// sf=27..29 (shift=9)
+	0x00010000, 0x0000CB30, 0x0000A145,
+	// sf=30..32 (shift=10)
+	0x00008000, 0x00006598, 0x000050A3,
+	// sf=33..35 (shift=11)
+	0x00004000, 0x000032CC, 0x00002851,
+	// sf=36..38 (shift=12)
+	0x00002000, 0x00001966, 0x00001429,
+	// sf=39..41 (shift=13)
+	0x00001000, 0x00000CB3, 0x00000A14,
+	// sf=42..44 (shift=14)
+	0x00000800, 0x00000659, 0x0000050A,
+	// sf=45..47 (shift=15)
+	0x00000400, 0x0000032D, 0x00000285,
+	// sf=48..50 (shift=16)
+	0x00000200, 0x00000196, 0x00000143,
+	// sf=51..53 (shift=17)
+	0x00000100, 0x000000CB, 0x000000A1,
+	// sf=54..56 (shift=18)
+	0x00000080, 0x00000066, 0x00000051,
+	// sf=57..59 (shift=19)
+	0x00000040, 0x00000033, 0x00000028,
+	// sf=60..62 (shift=20)
+	0x00000020, 0x00000019, 0x00000014,
+	// sf=63 (special case: returns 0)
+	0x00000000
+};
+
 static inline int plm_audio_decode_scalefactor_value(int sf) {
-	if (sf == 63) {
-		return 0;
-	}
-	int shift = sf / 3;
-	return (PLM_AUDIO_SCALEFACTOR_BASE[sf % 3] + ((1 << shift) >> 1)) >> shift;
+	return PLM_AUDIO_SCALEFACTOR_TABLE[sf];
 }
 
 plm_audio_t *plm_audio_create_with_buffer(plm_buffer_t *buffer, int destroy_when_done) {
@@ -4792,7 +4839,6 @@ void plm_audio_destroy(plm_audio_t *self) {
 		plm_buffer_destroy(self->buffer);
 	}
 	PLM_FREE(self);
-	self = NULL;
 }
 
 int plm_audio_has_header(plm_audio_t *self) {
@@ -5142,12 +5188,15 @@ void plm_audio_read_samples(plm_audio_t *self, int ch, int sb, int part) {
 	// Decode samples
 	int adj = q->levels;
 	if (q->group) {
-		// Decode grouped samples
+		// Decode grouped samples — use reciprocal multiply instead of division
 		val = plm_buffer_read(self->buffer, q->bits);
-		sample[0] = val % adj;
-		val /= adj;
-		sample[1] = val % adj;
-		sample[2] = val / adj;
+		unsigned int recip = q->recip;
+		int quot = (unsigned int)((unsigned int)val * recip) >> 16;
+		sample[0] = val - quot * adj;
+		val = quot;
+		quot = (unsigned int)((unsigned int)val * recip) >> 16;
+		sample[1] = val - quot * adj;
+		sample[2] = quot;
 	}
 	else {
 		// Decode direct samples
@@ -5156,9 +5205,9 @@ void plm_audio_read_samples(plm_audio_t *self, int ch, int sb, int part) {
 		sample[2] = plm_buffer_read(self->buffer, q->bits);
 	}
 
-	// Postmultiply samples
-	int scale = 65536 / (adj + 1);
-	adj = ((adj + 1) >> 1) - 1;
+	// Postmultiply samples — use precomputed scale and adj_half
+	int scale = q->scale;
+	adj = q->adj_half;
 	int sf_hi = sf >> 12;
 	int sf_lo = sf & 4095;
 
