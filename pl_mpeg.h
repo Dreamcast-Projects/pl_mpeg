@@ -177,6 +177,14 @@ extern "C" {
 
 #define PLM_MIN(a,b) ((a) < (b) ? (a) : (b))
 
+#ifndef likely
+#define likely(x)   __builtin_expect(!!(x), 1)
+#endif
+
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
 // -----------------------------------------------------------------------------
 // Public Data Types
 
@@ -840,57 +848,121 @@ plm_samples_t *plm_audio_decode(plm_audio_t *self);
 #include <string.h>
 #include <stdlib.h>
 
+// Pipelined inner loop for audio synthesis using SH4 secondary FP bank.
+// Computes one sample: sum of 4 FIPRs across d[0..15] and strided v1/v2.
+// Does NOT modify d, v1, or v2 (uses internal temp copies).
+static inline __attribute__((always_inline))
+float shz_pl_inner_loop(const float *d, const float *v1, const float *v2) {
+	const float *td = d;
+	const float *tv1 = v1;
+	const float *tv2 = v2;
+	uint32_t stride;
+	float result;
 
-//------------------------------------------------------------------------------
-// Vector and matrix math operations Since DreamHAL
-//------------------------------------------------------------------------------
+	asm volatile(R"(
+		! Swap to back-bank so we don't need to clobber any FP regs.
+		frchg
 
-// Inner/dot product: vec . vec = scalar
-//                       _    _
-//                      |  y1  |
-//  [ x1 x2 x3 x4 ]  .  |  y2  | = scalar
-//                      |  y3  |
-//                      |_ y4 _|
-//
-// SH4 calling convention states we get 8 float arguments. Perfect!
-static inline __attribute__((always_inline)) float pl_fipr(float x1, float x2, float x3, float x4, float y1, float y2, float y3, float y4)
-{
-  // FR4-FR11 are the regs that are passed in, aka vectors FV4 and FV8.
-  // Just need to make sure GCC doesn't modify anything, and these register vars do that job.
+		! s = 512 (stride: 128 floats * 4 bytes)
+		mov     #2, %[s]
+		shll8   %[s]               ! 2 << 8 = 512
 
-  // Temporary variables are necessary per GCC to avoid clobbering:
-  // https://gcc.gnu.org/onlinedocs/gcc/Local-Register-Variables.html#Local-Register-Variables
+		! Load first vector into fv0 for first FIPR.
+		fmov.s  @%[td]+, fr0       ! fr0 = d[0]
+		fmov.s  @%[td]+, fr1       ! fr1 = d[1]
+		fmov.s  @%[td]+, fr2       ! fr2 = d[2]
+		fmov.s  @%[td]+, fr3       ! fr3 = d[3]
 
-  float tx1 = x1;
-  float tx2 = x2;
-  float tx3 = x3;
-  float tx4 = x4;
+		! Load second vector into fv4 for first FIPR
+		fmov.s  @%[tv1], fr4       ! fr4 = v1[0]
+		add     %[s], %[tv1]       ! tv1 -> v1[128]
+		fmov.s  @%[tv2], fr5       ! fr5 = v2[0]
+		add     %[s], %[tv2]       ! tv2 -> v2[128]
+		fmov.s  @%[tv1], fr6       ! fr6 = v1[128]
+		add     %[s], %[tv1]       ! tv1 -> v1[256]
+		fmov.s  @%[tv2], fr7       ! fr7 = v2[128]
+		add     %[s], %[tv2]       ! tv2 -> v2[256]
 
-  float ty1 = y1;
-  float ty2 = y2;
-  float ty3 = y3;
-  float ty4 = y4;
+		! Issue first FIPR
+		fipr    fv0, fv4           ! fr7 = FIPR1 result
 
-  // vector FV4
-  register float __x1 __asm__("fr4") = tx1;
-  register float __x2 __asm__("fr5") = tx2;
-  register float __x3 __asm__("fr6") = tx3;
-  register float __x4 __asm__("fr7") = tx4;
+		! Load first vector into fv8 for second FIPR.
+		fmov.s  @%[td]+, fr8       ! fr8  = d[4]
+		fmov.s  @%[td]+, fr9       ! fr9  = d[5]
+		fmov.s  @%[td]+, fr10      ! fr10 = d[6]
+		fmov.s  @%[td]+, fr11      ! fr11 = d[7]
 
-  // vector FV8
-  register float __y1 __asm__("fr8") = ty1;
-  register float __y2 __asm__("fr9") = ty2;
-  register float __y3 __asm__("fr10") = ty3;
-  register float __y4 __asm__("fr11") = ty4;
+		! Load second vector into fv12 for second FIPR.
+		fmov.s  @%[tv1], fr12      ! fr12 = v1[256]
+		add     %[s], %[tv1]       ! tv1 -> v1[384]
+		fmov.s  @%[tv2], fr13      ! fr13 = v2[256]
+		add     %[s], %[tv2]       ! tv2 -> v2[384]
+		fmov.s  @%[tv1], fr14      ! fr14 = v1[384]
+		add     %[s], %[tv1]       ! tv1 -> v1[512]
+		fmov.s  @%[tv2], fr15      ! fr15 = v2[384]
+		add     %[s], %[tv2]       ! tv2 -> v2[512]
 
-  // take care of all the floats in one fell swoop
-  __asm__ __volatile__ ("fipr FV4, FV8\n"
-  : "+f" (__y4) // output (gets written to FR11)
-  : "f" (__x1), "f" (__x2), "f" (__x3), "f" (__x4), "f" (__y1), "f" (__y2), "f" (__y3) // inputs
-  : // clobbers
-  );
+		! Issue second FIPR
+		fipr    fv8, fv12          ! fr15 = FIPR2 result
+		fmov.s  fr7, @-r15         ! push FIPR1 result onto stack
 
-  return __y4;
+		! Load first vector into fv0 for third FIPR
+		fmov.s  @%[td]+, fr0       ! fr0 = d[8]
+		fmov.s  @%[td]+, fr1       ! fr1 = d[9]
+		fmov.s  @%[td]+, fr2       ! fr2 = d[10]
+		fmov.s  @%[td]+, fr3       ! fr3 = d[11]
+
+		! Load second vector into fv4 for third FIPR
+		fmov.s  @%[tv1], fr4       ! fr4 = v1[512]
+		add     %[s], %[tv1]       ! tv1 -> v1[640]
+		fmov.s  @%[tv2], fr5       ! fr5 = v2[512]
+		add     %[s], %[tv2]       ! tv2 -> v2[640]
+		fmov.s  @%[tv1], fr6       ! fr6 = v1[640]
+		add     %[s], %[tv1]       ! tv1 -> v1[768]
+		fmov.s  @%[tv2], fr7       ! fr7 = v2[640]
+		add     %[s], %[tv2]       ! tv2 -> v2[768]
+
+		! Issue third FIPR
+		fipr    fv0, fv4           ! fr7 = FIPR3 result
+		fmov.s  fr15, @-r15        ! push FIPR2 result onto stack
+
+		! Load first vector into fv8 for fourth FIPR
+		fmov.s  @%[td]+, fr8       ! fr8  = d[12]
+		fmov.s  @%[td]+, fr9       ! fr9  = d[13]
+		fmov.s  @%[td]+, fr10      ! fr10 = d[14]
+		fmov.s  @%[td]+, fr11      ! fr11 = d[15]
+
+		! Load second vector into fv12 for fourth FIPR
+		fmov.s  @%[tv1], fr12      ! fr12 = v1[768]
+		add     %[s], %[tv1]       ! tv1 -> v1[896]
+		fmov.s  @%[tv2], fr13      ! fr13 = v2[768]
+		add     %[s], %[tv2]       ! tv2 -> v2[896]
+		fmov.s  @%[tv1], fr14      ! fr14 = v1[896]
+		fmov.s  @%[tv2], fr15      ! fr15 = v2[896]
+
+		! Issue fourth FIPR
+		fipr    fv8, fv12          ! fr15 = FIPR4 result
+
+		! Add up results from previous FIPRs while we wait
+		fmov.s  @r15+, fr0         ! pop FIPR2 result
+		fmov.s  @r15+, fr1         ! pop FIPR1 result
+		fadd    fr1, fr0           ! fr0 = FIPR1 + FIPR2
+		fadd    fr7, fr0           ! fr0 += FIPR3
+
+		! Add result from fourth FIPR now that it's ready
+		fadd    fr15, fr0          ! fr0 += FIPR4
+
+		! Transfer result to primary bank via FPUL
+		flds    fr0, FPUL          ! secondary fr0 -> FPUL
+		frchg                      ! Switch back to primary FP bank
+		fsts    FPUL, %[result]    ! FPUL -> result register (primary bank)
+	)"
+	: [td] "+r" (td), [tv1] "+r" (tv1), [tv2] "+r" (tv2),
+	  [s] "=r" (stride), [result] "=f" (result)
+	:
+	: "memory");
+
+	return result;
 }
 
 // -----------------------------------------------------------------------------
@@ -4414,9 +4486,9 @@ void plm_video_idct(int *block) {
         int *p = block + i;
 
         // Zero-column skip: if entire column is zero, output stays zero
-        if (!(p[0] | p[8] | p[16] | p[24] | p[32] | p[40] | p[48] | p[56])) {
-            continue;
-        }
+        if (unlikely(!(p[0] | p[8] | p[16] | p[24] | p[32] | p[40] | p[48] | p[56]))) {
+			continue;
+		}
 
         tmp1 = p[1 * 8] + p[7 * 8];
         tmp2 = p[3 * 8] + p[5 * 8];
@@ -4453,7 +4525,7 @@ void plm_video_idct(int *block) {
         int *p = block + i;
 
         // Zero-row skip: if entire row is zero, output stays zero
-        if (!(p[0] | p[1] | p[2] | p[3] | p[4] | p[5] | p[6] | p[7])) {
+        if (unlikely(!(p[0] | p[1] | p[2] | p[3] | p[4] | p[5] | p[6] | p[7]))) {
             continue;
         }
 
@@ -4771,8 +4843,6 @@ struct plm_audio_t {
 	plm_samples_t samples;
 	float D[1024];
 	float V[2][1024];
-	// DCL DIFF
-	//float U[32];
 };
 
 int plm_audio_find_frame_sync(plm_audio_t *self);
@@ -5159,8 +5229,6 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 		}
 	}
 
-	#define AUDIO_INVERSE 1.0f / 2147418112.0f
-
 	// Coefficient input and reconstruction
 	short *out = self->samples.pcm;
 	for (int part = 0; part < 3; part++) {
@@ -5202,20 +5270,8 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 					/* KOS stream splitter expects stereo pairs as L, R in memory. */
 					short *out_ch = out + ch;
 					for (int i = 16; i; --i) {
-						float u0, u1;
-						// Prefetch next iteration's V[] data
-						__asm__("pref @%0" : : "r"(v1 + 2));
-						__asm__("pref @%0" : : "r"(v2 + 2));
-						// Sample 0
-						u0 = pl_fipr(d[0], d[1], d[2], d[3], v1[0], v2[0], v1[128], v2[128]);
-						u0 += pl_fipr(d[4], d[5], d[6], d[7], v1[256], v2[256], v1[384], v2[384]);
-						u0 += pl_fipr(d[8], d[9], d[10], d[11], v1[512], v2[512], v1[640], v2[640]);
-						u0 += pl_fipr(d[12], d[13], d[14], d[15], v1[768], v2[768], v1[896], v2[896]);
-						// Sample 1
-						u1 = pl_fipr(d[32], d[33], d[34], d[35], v1[1], v2[1], v1[129], v2[129]);
-						u1 += pl_fipr(d[36], d[37], d[38], d[39], v1[257], v2[257], v1[385], v2[385]);
-						u1 += pl_fipr(d[40], d[41], d[42], d[43], v1[513], v2[513], v1[641], v2[641]);
-						u1 += pl_fipr(d[44], d[45], d[46], d[47], v1[769], v2[769], v1[897], v2[897]);
+						float u0 = shz_pl_inner_loop(d, v1, v2);
+						float u1 = shz_pl_inner_loop(d + 32, v1 + 1, v2 + 1);
 						d += 64;
 						v1 += 2;
 						v2 += 2;
