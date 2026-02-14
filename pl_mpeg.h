@@ -248,16 +248,16 @@ typedef void(*plm_video_decode_callback)
 
 
 // Decoded Audio Samples
-// Samples are signed 16-bit PCM (mono output).
-// The `count` is always PLM_AUDIO_SAMPLES_PER_FRAME and just there for
-// convenience.
+// Samples are signed 16-bit PCM interleaved as L, R.
+// The `count` is always PLM_AUDIO_SAMPLES_PER_FRAME (per channel) and just
+// there for convenience.
 
 #define PLM_AUDIO_SAMPLES_PER_FRAME 1152
 
 typedef struct {
 	double time;
 	unsigned int count;
-	short pcm[PLM_AUDIO_SAMPLES_PER_FRAME] __attribute__((aligned(32)));
+	short pcm[PLM_AUDIO_SAMPLES_PER_FRAME * 2] __attribute__((aligned(32)));
 } plm_samples_t;
 
 
@@ -4756,7 +4756,7 @@ struct plm_audio_t {
 	int layer;
 	int mode;
 	int bound;
-	int v_pos;
+	int v_pos[2];
 	int next_frame_data_size;
 	int has_header;
 
@@ -4770,9 +4770,9 @@ struct plm_audio_t {
 
 	plm_samples_t samples;
 	float D[1024];
-	float V[1024];
+	float V[2][1024];
 	// DCL DIFF
-	float U[32];
+	//float U[32];
 };
 
 int plm_audio_find_frame_sync(plm_audio_t *self);
@@ -5118,6 +5118,9 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 				self->scale_factor_info[ch][sb] = plm_buffer_read(self->buffer, 2);
 			}
 		}
+		if (mono) {
+			self->scale_factor_info[1][sb] = self->scale_factor_info[0][sb];
+		}
 	}
 
 	// Read scale factors
@@ -5149,6 +5152,11 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 				}
 			}
 		}
+		if (mono) {
+			self->scale_factor[1][sb][0] = self->scale_factor[0][sb][0];
+			self->scale_factor[1][sb][1] = self->scale_factor[0][sb][1];
+			self->scale_factor[1][sb][2] = self->scale_factor[0][sb][2];
+		}
 	}
 
 	#define AUDIO_INVERSE 1.0f / 2147418112.0f
@@ -5159,62 +5167,64 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 		for (int granule = 0; granule < 4; granule++) {
 
 			// Read the samples
-			if (mono) {
-				for (int sb = 0; sb < sblimit; sb++) {
-					plm_audio_read_samples(self, 0, sb, part);
-				}
-				for (int sb = sblimit; sb < 32; sb++) {
-					self->sample[0][sb][0] = 0;
-					self->sample[0][sb][1] = 0;
-					self->sample[0][sb][2] = 0;
-				}
+			for (int sb = 0; sb < self->bound; sb++) {
+				plm_audio_read_samples(self, 0, sb, part);
+				plm_audio_read_samples(self, 1, sb, part);
 			}
-			else {
-				for (int sb = 0; sb < self->bound; sb++) {
-					plm_audio_read_samples(self, 0, sb, part);
-					plm_audio_read_samples(self, 1, sb, part);
-				}
-				for (int sb = self->bound; sb < sblimit; sb++) {
-					plm_audio_read_samples(self, 0, sb, part);
-					self->sample[1][sb][0] = self->sample[0][sb][0];
-					self->sample[1][sb][1] = self->sample[0][sb][1];
-					self->sample[1][sb][2] = self->sample[0][sb][2];
-				}
-				for (int sb = sblimit; sb < 32; sb++) {
-					self->sample[0][sb][0] = 0;
-					self->sample[0][sb][1] = 0;
-					self->sample[0][sb][2] = 0;
-					self->sample[1][sb][0] = 0;
-					self->sample[1][sb][1] = 0;
-					self->sample[1][sb][2] = 0;
-				}
+			for (int sb = self->bound; sb < sblimit; sb++) {
+				plm_audio_read_samples(self, 0, sb, part);
+				self->sample[1][sb][0] = self->sample[0][sb][0];
+				self->sample[1][sb][1] = self->sample[0][sb][1];
+				self->sample[1][sb][2] = self->sample[0][sb][2];
+			}
+			for (int sb = sblimit; sb < 32; sb++) {
+				self->sample[0][sb][0] = 0;
+				self->sample[0][sb][1] = 0;
+				self->sample[0][sb][2] = 0;
+				self->sample[1][sb][0] = 0;
+				self->sample[1][sb][1] = 0;
+				self->sample[1][sb][2] = 0;
 			}
 
 			// Synthesis loop
 			for (int p = 0; p < 3; p++) {
-				// Shifting step
-				self->v_pos = (self->v_pos - 64) & 1023;
+				for (int ch = 0; ch < 2; ch++) {
+					// Shifting step
+					self->v_pos[ch] = (self->v_pos[ch] - 64) & 1023;
 
-				// !! Monoral only !! // DCL DIFF
-				plm_audio_idct36(self->sample[0], p, self->V, self->v_pos);
+					plm_audio_idct36(self->sample[ch], p, self->V[ch], self->v_pos[ch]);
 
-				int d_index = (512 - (self->v_pos >> 1)) >> 5;
-				int v_index = (self->v_pos & 127) >> 1;
-				float *d = &self->D[d_index];
-				float *v1 = &self->V[v_index];
-				float *v2 = &self->V[96 - v_index];
-				for (int i = 32; i; --i)
-				{
-					float u;
-					u = pl_fipr(d[0], d[1], d[2], d[3], v1[0], v2[0], v1[128], v2[128]);
-					u += pl_fipr(d[4], d[5], d[6], d[7], v1[256], v2[256], v1[384], v2[384]);
-					u += pl_fipr(d[8], d[9], d[10], d[11], v1[512], v2[512], v1[640], v2[640]);
-					u += pl_fipr(d[12], d[13], d[14], d[15], v1[768], v2[768], v1[896], v2[896]);
-					d += 32;
-					v1++;
-					v2++;
-					*out++ = (short)((int)u >> 16);
-				} // !! Monoral only !!
+					int d_index = (512 - (self->v_pos[ch] >> 1)) >> 5;
+					int v_index = (self->v_pos[ch] & 127) >> 1;
+					float *d = &self->D[d_index];
+					float *v1 = &self->V[ch][v_index];
+					float *v2 = &self->V[ch][96 - v_index];
+					/* KOS stream splitter expects stereo pairs as L, R in memory. */
+					short *out_ch = out + ch;
+					for (int i = 16; i; --i) {
+						float u0, u1;
+						// Prefetch next iteration's V[] data
+						__asm__("pref @%0" : : "r"(v1 + 2));
+						__asm__("pref @%0" : : "r"(v2 + 2));
+						// Sample 0
+						u0 = pl_fipr(d[0], d[1], d[2], d[3], v1[0], v2[0], v1[128], v2[128]);
+						u0 += pl_fipr(d[4], d[5], d[6], d[7], v1[256], v2[256], v1[384], v2[384]);
+						u0 += pl_fipr(d[8], d[9], d[10], d[11], v1[512], v2[512], v1[640], v2[640]);
+						u0 += pl_fipr(d[12], d[13], d[14], d[15], v1[768], v2[768], v1[896], v2[896]);
+						// Sample 1
+						u1 = pl_fipr(d[32], d[33], d[34], d[35], v1[1], v2[1], v1[129], v2[129]);
+						u1 += pl_fipr(d[36], d[37], d[38], d[39], v1[257], v2[257], v1[385], v2[385]);
+						u1 += pl_fipr(d[40], d[41], d[42], d[43], v1[513], v2[513], v1[641], v2[641]);
+						u1 += pl_fipr(d[44], d[45], d[46], d[47], v1[769], v2[769], v1[897], v2[897]);
+						d += 64;
+						v1 += 2;
+						v2 += 2;
+						out_ch[0] = (short)((int)u0 >> 16);
+						out_ch[2] = (short)((int)u1 >> 16);
+						out_ch += 4;
+					}
+				}
+				out += 64;
 
 			} // End of synthesis sub-block loop
 
