@@ -5,12 +5,41 @@ MPEG1 Decode library for Dreamcast Ver.0.8
 
 
 #### FEATURES ####
-You can play MPEG1 videos with audio.
-Audio is monaural only. For stereo, only the left channel will be played.
-You can specify a cancel button during playback.
-The recommended resolutions are:
-	4:3 = 320x240 Mono audio 80kbits
-	16:9 = 368x208 Mono audio 80kbits
+- MPEG1 video playback with MP2 audio (mono or stereo)
+- Supports video resolutions up to 640x480
+- Configurable cancel buttons during playback (controller buttons, keyboard keys, button combos)
+- Simple, extended, and manual playback APIs
+- Overridable memory allocators and file I/O
+
+
+#### ENCODING FOR DREAMCAST ####
+
+Videos must be MPEG-PS (`.mpg`) with MPEG1 video and MP2 audio. Use constant
+bitrate (`-minrate`/`-maxrate`/`-bufsize` matching `-b:v`) to avoid decode
+spikes that cause frame drops. Audio at 32kHz keeps CPU overhead low while
+sounding good.
+
+**320x240 (4:3) — Standard (Recommended Standard):**
+```
+ffmpeg -i input.mp4 -vf "fps=24,scale=320:240" -c:v mpeg1video -b:v 1500k -minrate 1500k -maxrate 1500k -bufsize 1500k -ac 2 -ar 48000 -c:a mp2 -b:a 128k -f mpeg 320x240.mpg
+```
+
+**368x208 (16:9) — Widescreen (Recommended Widescreen):**
+```
+ffmpeg -i input.mp4 -vf "fps=24,scale=368:208" -c:v mpeg1video -b:v 1500k -minrate 1500k -maxrate 1500k -bufsize 1500k -ac 2 -ar 48000 -c:a mp2 -b:a 128k -f mpeg 368x208.mpg
+```
+
+**448x336 (4:3) — Standard:**
+```
+ffmpeg -i input.mp4 -vf "fps=24,scale=448:336" -c:v mpeg1video -b:v 1100k -minrate 1100k -maxrate 1100k -bufsize 1100k -ac 2 -ar 32000 -c:a mp2 -b:a 128k -f mpeg 448x336.mpg
+```
+
+**512x288 (16:9) — Widescreen:**
+```
+ffmpeg -i input.mp4 -vf "fps=24,scale=512:288" -c:v mpeg1video -b:v 1100k -minrate 1100k -maxrate 1100k -bufsize 1100k -ac 2 -ar 32000 -c:a mp2 -b:a 128k -f mpeg 512x288.mpg
+```
+
+For mono audio, replace `-ac 2 -b:a 128k` with `-ac 1 -b:a 64k`.
 
 
 #### LICENSE ####
@@ -21,19 +50,13 @@ mpeg.c, mpeg.h - Public Domain
 #### THANKS TO ####
 Dominic Szablewski (https://phoboslab.org) - Great decoding engine.
 Provided advice and ideas:
-- Ian Robinson
-- Andy Barajas
+- Ian Robinson (https://github.com/ianmicheal)
+- Andy Barajas (https://github.com/andressbarajas)
 - Jnmartin84 (https://github.com/jnmartin84)
 - BitBank2 (https://github.com/bitbank2)
+- Falco Girgis (https://github.com/gyrovorbis)
 
 with permission https://dcemulation.org/phpBB/viewtopic.php?p=1060259#p1060259
-
-I have added this here to get your started with encoding for a cdr
-```ffmpeg -i input.mp4 -vf "scale=320:240" -b:v 742k -minrate 742k -maxrate 742k -bufsize 742k -ac 1 -ar 32000 -c:a mp2 -b:a 64k -f mpeg output.mpg```
-Profiling
-![output](https://github.com/ianmicheal/MPEG1-Decode-library-for-Dreamcast-Ver.0.8-2023-09-19-Tashi/assets/59771322/59842ba9-31fa-469e-827a-bfd3880d8450)
-
-
 
 Single-file MIT licensed library for C/C++
 

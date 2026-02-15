@@ -851,6 +851,7 @@ plm_samples_t *plm_audio_decode(plm_audio_t *self);
 // Pipelined inner loop for audio synthesis using SH4 secondary FP bank.
 // Computes one sample: sum of 4 FIPRs across d[0..15] and strided v1/v2.
 // Does NOT modify d, v1, or v2 (uses internal temp copies).
+// Donated by Falco Girgis
 static inline __attribute__((always_inline))
 float shz_pl_inner_loop(const float *d, const float *v1, const float *v2) {
 	const float *td = d;
@@ -4820,29 +4821,28 @@ typedef struct plm_quantizer_spec_t {
 };
 
 struct plm_audio_t {
-	double time;
-	int samples_decoded;
+	plm_buffer_t *buffer;
+	int bound;
+	int mode;
+	int v_pos[2];
 	int samplerate_index;
 	int bitrate_index;
-	int version;
-	int layer;
-	int mode;
-	int bound;
-	int v_pos[2];
-	int next_frame_data_size;
-	int has_header;
-
-	plm_buffer_t *buffer;
-	int destroy_buffer_when_done;
 
 	const plm_quantizer_spec_t *allocation[2][32];
 	uint8_t scale_factor_info[2][32];
 	int scale_factor[2][32][3];
 	int sample[2][32][3];
-
 	plm_samples_t samples;
 	float D[1024];
 	float V[2][1024];
+
+	double time;
+	int samples_decoded;
+	int version;
+	int layer;
+	int next_frame_data_size;
+	int has_header;
+	int destroy_buffer_when_done;
 };
 
 int plm_audio_find_frame_sync(plm_audio_t *self);
@@ -4855,7 +4855,7 @@ void plm_audio_idct36(int s[32][3], int ss, float *d, int dp);
 // Precomputed scalefactor values for sf=0..62.
 // Each entry = (PLM_AUDIO_SCALEFACTOR_BASE[sf%3] + ((1<<(sf/3))>>1)) >> (sf/3)
 // sf=63 maps to 0 (handled by bounds check or extra entry).
-static const int PLM_AUDIO_SCALEFACTOR_TABLE[64] = {
+ __attribute__((aligned(32))) static const int PLM_AUDIO_SCALEFACTOR_TABLE[64] = {
 	// sf=0..2 (shift=0)
 	0x02000000, 0x01965FEA, 0x01428A30,
 	// sf=3..5 (shift=1)
@@ -4918,9 +4918,6 @@ plm_audio_t *plm_audio_create_with_buffer(plm_buffer_t *buffer, int destroy_when
 	self->buffer = buffer;
 	self->destroy_buffer_when_done = destroy_when_done;
 	self->samplerate_index = 3; // Indicates 0
-
-	//plm_sq_copy_bytes(self->D, PLM_AUDIO_SYNTHESIS_WINDOW, 512 * sizeof(float));
-	//plm_sq_copy_bytes(self->D + 512, PLM_AUDIO_SYNTHESIS_WINDOW, 512 * sizeof(float));
 
 	// Build a window table in a layout that's faster for the Dreamcast.
 	// We write the synthesis window into self->D in the exact order the
