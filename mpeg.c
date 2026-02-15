@@ -4,62 +4,28 @@
 #include "pl_mpeg.h"
 
 struct mpeg_player_t {
-    /* MPEG decoder */
     plm_t *decoder;
-
-    /* Pointer to a decoded video frame */
     plm_frame_t *frame;
-
-    /* Pointer to a decoded video frame */
-    plm_samples_t *sample;
-
-    /* PVR list type the video frame will be rendered to */
+    uint64_t start_time;
+    snd_stream_hnd_t snd_hnd;
     pvr_list_type_t list_type;
-
-    /* SH4 side sound buffer */
-    uint8_t *snd_buf;
-
-    /* Texture that holds decoded data */
-    pvr_ptr_t texture;
-
-    /* Texture Width */
     size_t texture_width;
-
-    /* Texture Height */
     size_t texture_height;
 
-    /* Width of the video in pixels */
-    int width;
-
-    /* Height of the video in pixels */
-    int height;
-
-    /* Start position for sound module playback */
+    plm_samples_t *sample;
+    uint8_t *snd_buf;
     int snd_pcm_offset;
-
-    /* Size of the sound module data */
     int snd_pcm_leftovers;
-
-    /* Volume */
-    int snd_volume;
-
-    /* Audio sample rate */
     int sample_rate;
-
-    /* Sound stream handle */
-    snd_stream_hnd_t snd_hnd;
-
-    /* Whether this player has started the stream since last reset */
+    int snd_volume;
     bool snd_started;
 
-    /* Polygon header for rendering */
     pvr_poly_hdr_t hdr;
-
-    /* Vertices for rendering the video frame */
     pvr_vertex_t vert[4];
 
-    /* Start time for a/v sync */
-    uint64_t start_time;
+    pvr_ptr_t texture;
+    int width;
+    int height;
 };
 
 /* Size of the sound buffer for both the SH4 side and the AICA side */
@@ -347,11 +313,7 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
             pvr_scene_finish();
 
             /* Decode the NEXT frame to have it ready */
-            //uint64_t startd_time = timer_ns_gettime64();
             player->frame = plm_decode_video(player->decoder);
-            //uint64_t decode_time = timer_ns_gettime64() - startd_time;
-            //printf("V %" PRIu64 "\n", decode_time);
-
             if(!player->frame) {
                 /* Are we looping? */
                 if(!plm_get_loop(player->decoder)) {
@@ -461,8 +423,6 @@ void mpeg_upload_frame(mpeg_player_t *player) {
     PVR_SET(PVR_YUV_CFG, (((player->texture_height >> 4) - 1) << 8) |
                       ((player->texture_width >> 4) - 1));
 
-    uint32_t *src = player->frame->display;
-
     /* Video size in macroblocks (16x16) */
     const int video_blocks_w = player->frame->y.width  >> 4;
     const int video_blocks_h = player->frame->y.height >> 4;
@@ -484,19 +444,18 @@ void mpeg_upload_frame(mpeg_player_t *player) {
      */
     const int mb_sq_iters = 384 / 32;
 
+    uint32_t *src = player->frame->display;
     uint32_t *d = SQ_MASK_DEST((void *)PVR_TA_YUV_CONV);
     sq_lock((void *)PVR_TA_YUV_CONV);
 
     for(int y = 0; y < video_blocks_h; y++) {
-        /* Upload real macroblocks */
-        for(int x = 0; x < video_blocks_w; x++, src += 96) {
-            sq_fast_cpy(d, src, mb_sq_iters);
-        }
+        /* Upload whole row of real macroblocks */
+        sq_fast_cpy(d, src, video_blocks_w * mb_sq_iters);
+        src += 96 * video_blocks_w;
 
         /* Pad row to PVR stride */
-        for(int i = 0; i < pad_blocks_x * mb_sq_iters; i++) {
+        for(int i = 0; i < pad_blocks_x * mb_sq_iters; i++)
             sq_flush(d);
-        }
     }
 
     sq_unlock();
@@ -635,10 +594,7 @@ static void *sound_callback(snd_stream_hnd_t hnd, int request_size, int *size_ou
             continue;
         }
 
-        //uint64_t startd_time = timer_ns_gettime64();
         player->sample = plm_decode_audio(player->decoder);
-        //uint64_t decode_time = timer_ns_gettime64() - startd_time;
-        //printf("A %" PRIu64 "\n", decode_time);
         if(!player->sample)
             break;
 
@@ -701,55 +657,3 @@ static __attribute__((noinline)) void fast_memcpy(void *dest, const void *src, s
     while(length--)
         *d++ = *s++;
 }
-
-//     uintptr_t dest_ptr = (uintptr_t)dest;
-//     uintptr_t src_ptr = (uintptr_t)src;
-
-//     _Complex float ds, ds2, ds3, ds4;
-
-//     if(((dest_ptr | src_ptr) & 7) || length < 32) {
-//         memcpy(dest, src, length);
-//     }
-//     else { /* Fast Path */
-//         int blocks = (int)(length >> 5);
-//         int remainder = (int)(length & 31);
-
-//         if(blocks > 0) {
-//             __asm__ __volatile__ (
-//                 "fschg\n\t"
-//                 ".align 2\n"
-//                 "1:\n\t"
-//                 /* *dest++ = *src++ */
-//                 "fmov.d @%[in]+, %[scratch]\n\t"
-//                 "fmov.d @%[in]+, %[scratch2]\n\t"
-//                 "fmov.d @%[in]+, %[scratch3]\n\t"
-//                 "fmov.d @%[in]+, %[scratch4]\n\t"
-//                 "movca.l %[r0], @%[out]\n\t"
-//                 "add #32, %[out]\n\t"
-//                 "dt %[blocks]\n\t"   /* while(blocks--) */
-//                 "fmov.d %[scratch4], @-%[out]\n\t"
-//                 "fmov.d %[scratch3], @-%[out]\n\t"
-//                 "fmov.d %[scratch2], @-%[out]\n\t"
-//                 "fmov.d %[scratch], @-%[out]\n\t"
-//                 "bf.s 1b\n\t"
-//                 "add #32, %[out]\n\t"
-//                 "fschg\n"
-//                 : [in] "+&r" (src_ptr),
-//                   [out] "+&r" (dest_ptr),
-//                   [blocks] "+&r" (blocks),
-//                   [scratch] "=&d" (ds),
-//                   [scratch2] "=&d" (ds2),
-//                   [scratch3] "=&d" (ds3),
-//                   [scratch4] "=&d" (ds4) /* outputs */
-//                 : [r0] "z" (0) /* inputs */
-//                 : "t", "memory" /* clobbers */
-//             );
-//         }
-
-//         char *char_dest = (char *)dest_ptr;
-//         const char *char_src = (const char *)src_ptr;
-
-//         while(remainder--)
-//             *char_dest++ = *char_src++;
-//     }
-// }
