@@ -1,27 +1,17 @@
 
-TARGET = mpeg.elf
-OBJS = example.o mpeg.o romdisk.o
-KOS_ROMDISK_DIR = romdisk
-KOS_CFLAGS += -g
+EXAMPLES = examples/basic examples/3dtv
 
+all:
+	@for dir in $(EXAMPLES); do $(MAKE) -C $$dir; done
 
-all: rm-elf $(TARGET)
+clean:
+	@for dir in $(EXAMPLES); do $(MAKE) -C $$dir clean; done
 
-include $(KOS_BASE)/Makefile.rules
+run-basic:
+	$(MAKE) -C examples/basic run
 
-clean: rm-elf
-	-rm -f $(OBJS) romdisk.img
+run-3dtv:
+	$(MAKE) -C examples/3dtv run
 
-rm-elf:
-	-rm -f $(TARGET)
-
-$(TARGET): $(OBJS)
-	kos-cc -o $(TARGET) $(OBJS)
-
-run: $(TARGET)
-	$(KOS_LOADER) $(TARGET)
-
-dist: $(TARGET)
-	-rm -f $(OBJS)
-	$(KOS_STRIP) $(TARGET)
-
+dist:
+	@for dir in $(EXAMPLES); do $(MAKE) -C $$dir dist; done

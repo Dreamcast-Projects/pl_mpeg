@@ -26,6 +26,7 @@ struct mpeg_player_t {
     pvr_ptr_t texture;
     int width;
     int height;
+    bool loop;
 };
 
 /* Size of the sound buffer for both the SH4 side and the AICA side */
@@ -107,7 +108,12 @@ static int mpeg_check_cancel(const mpeg_cancel_options_t *opt) {
 static const mpeg_player_options_t MPEG_PLAYER_OPTIONS_DEFAULT = MPEG_PLAYER_OPTIONS_INITIALIZER;
 
 static bool mpeg_player_init(mpeg_player_t *player, const mpeg_player_options_t *opts) {
-    plm_set_loop(player->decoder, opts->loop);
+    /* Never let plm loop internally — it rewinds without resetting our
+       start_time, which causes playback_time >> frame->time and the video
+       plays at max speed.  We store the flag ourselves and rewind manually
+       so that start_time and audio are properly re-initialized. */
+    player->loop = opts->loop;
+    plm_set_loop(player->decoder, 0);
 
     player->snd_buf = (uint8_t *)MPEG_MEMALIGN(32, SOUND_BUFFER);
     if(!player->snd_buf) {
@@ -117,13 +123,13 @@ static bool mpeg_player_init(mpeg_player_t *player, const mpeg_player_options_t 
     }
 
     player->list_type = opts->list_type;
-    player->snd_volume = opts->volume;
     if(setup_graphics(player, opts) < 0) {
         fprintf(stderr, "Setting up graphics failed\n");
         mpeg_player_destroy(player);
         return false;
     }
 
+    player->snd_volume = opts->volume;
     if(setup_audio(player) < 0) {
         fprintf(stderr, "Setting up audio failed\n");
         mpeg_player_destroy(player);
@@ -207,14 +213,14 @@ int mpeg_player_get_loop(mpeg_player_t *player) {
     if(!player)
         return -1;
 
-    return plm_get_loop(player->decoder);
+    return player->loop;
 }
 
 void mpeg_player_set_loop(mpeg_player_t *player, int loop) {
     if(!player)
         return;
 
-    plm_set_loop(player->decoder, loop);
+    player->loop = loop;
 }
 
 void mpeg_player_set_volume(mpeg_player_t *player, uint8_t volume) {
@@ -222,7 +228,34 @@ void mpeg_player_set_volume(mpeg_player_t *player, uint8_t volume) {
         return;
 
     player->snd_volume = volume;
-    snd_stream_volume(player->snd_hnd, volume);
+    snd_stream_volume(player->snd_hnd, player->snd_volume);
+}
+
+const pvr_poly_hdr_t *mpeg_player_get_texture_hdr(mpeg_player_t *player) {
+    if(!player)
+        return NULL;
+
+    return &player->hdr;
+}
+
+void mpeg_player_get_uv_scale(mpeg_player_t *player, float *u_scale, float *v_scale) {
+    if(!player)
+        return;
+
+    if(u_scale)
+        *u_scale = (float)player->width / (float)player->texture_width;
+    if(v_scale)
+        *v_scale = (float)player->height / (float)player->texture_height;
+}
+
+void mpeg_player_get_dimensions(mpeg_player_t *player, int *width, int *height) {
+    if(!player)
+        return;
+
+    if(width)
+        *width = player->width;
+    if(height)
+        *height = player->height;
 }
 
 void mpeg_player_reset(mpeg_player_t *player) {
@@ -275,7 +308,6 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
     sound_stream_reset(player);
     snd_stream_start(player->snd_hnd, player->sample_rate, AUDIO_CHANNELS - 1);
     player->snd_started = true;
-    snd_stream_volume(player->snd_hnd, player->snd_volume);
 
     player->frame = plm_decode_video(player->decoder);
     if(!player->frame) {
@@ -316,16 +348,15 @@ mpeg_play_result_t mpeg_play_ex(mpeg_player_t *player, const mpeg_cancel_options
             player->frame = plm_decode_video(player->decoder);
             if(!player->frame) {
                 /* Are we looping? */
-                if(!plm_get_loop(player->decoder)) {
+                if(!player->loop) {
                     result = MPEG_PLAY_NORMAL;
                     goto finish;
                 }
 
                 /* We are looping. Reset and restart */
-                sound_stream_reset(player);
+                mpeg_player_reset(player);
                 snd_stream_start(player->snd_hnd, player->sample_rate, AUDIO_CHANNELS - 1);
                 player->snd_started = true;
-                snd_stream_volume(player->snd_hnd, player->snd_volume);
 
                 player->frame = plm_decode_video(player->decoder);
                 if(!player->frame) {
@@ -363,7 +394,6 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
         sound_stream_reset(player);
         snd_stream_start(player->snd_hnd, player->sample_rate, AUDIO_CHANNELS - 1);
         player->snd_started = true;
-        snd_stream_volume(player->snd_hnd, player->snd_volume);
 
         /* Prime the first frame */
         player->frame = plm_decode_video(player->decoder);
@@ -390,17 +420,16 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player) {
             return MPEG_DECODE_FRAME;
 
         /* Are we looping? */
-        if(!plm_get_loop(player->decoder)) {
+        if(!player->loop) {
             sound_stream_reset(player);
             player->start_time = 0;
             return MPEG_DECODE_EOF;
         }
 
         /* We are Looping. Reset and restart */
-        sound_stream_reset(player);
+        mpeg_player_reset(player);
         snd_stream_start(player->snd_hnd, player->sample_rate, AUDIO_CHANNELS - 1);
         player->snd_started = true;
-        snd_stream_volume(player->snd_hnd, player->snd_volume);
 
         player->frame = plm_decode_video(player->decoder);
         if(!player->frame) {
@@ -621,6 +650,7 @@ static int setup_audio(mpeg_player_t *player) {
     if(player->snd_hnd == SND_STREAM_INVALID)
         return -1;
 
+    snd_stream_volume(player->snd_hnd, player->snd_volume);
     snd_stream_set_userdata(player->snd_hnd, player);
 
     return 0;

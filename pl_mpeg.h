@@ -1672,7 +1672,7 @@ plm_buffer_t *plm_buffer_create_with_capacity(size_t capacity) {
 	self->capacity = capacity;
 	self->free_when_done = TRUE;
 	self->total_size = 0;
-	self->bytes = (uint8_t *)PLM_MEMALIGN(32, capacity + PLM_PEEK_SIZE); //PLM_MALLOC(capacity + PLM_PEEK_SIZE);
+	self->bytes = (uint8_t *)PLM_MEMALIGN(32, capacity + PLM_PEEK_SIZE);
 	if(!self->bytes) {
 		fprintf(stderr, "Out of memory for bytes. [plm_buffer_create_with_capacity]\n");
 		PLM_FREE(self);

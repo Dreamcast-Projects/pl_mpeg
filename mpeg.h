@@ -52,7 +52,7 @@ extern "C" {
     #define MPEG_MALLOC(sz)        malloc(sz)
     #define MPEG_FREE(p)           free(p)
     #define MPEG_REALLOC(p, sz)    realloc((p), (sz))
-    #define MPEG_MEMALIGN(a, sz)   memalign((a), (sz))
+    #define MPEG_MEMALIGN(a, sz)   aligned_alloc((a), ((sz) + ((a) - 1)) & ~((a) - 1))
     #define MPEG_MEMZERO(p, sz)    memset((p), 0, (sz))
     ```
 
@@ -114,7 +114,7 @@ extern "C" {
 	#define MPEG_MALLOC(sz)      malloc(sz)
 	#define MPEG_FREE(p)         free(p)
 	#define MPEG_REALLOC(p, sz)  realloc((p), (sz))
-    #define MPEG_MEMALIGN(a, sz) memalign((a), (sz))
+    #define MPEG_MEMALIGN(a, sz) aligned_alloc((a), ((sz) + ((a) - 1)) & ~((a) - 1))
     #define MPEG_MEMZERO(p, sz)  memset(p, 0, sz)
 #endif
 
@@ -286,12 +286,53 @@ void mpeg_player_set_loop(mpeg_player_t *player, int loop);
  */
 void mpeg_player_set_volume(mpeg_player_t *player, uint8_t volume);
 
+
+/** \brief   Get the PVR polygon header for the video texture.
+    \ingroup mpeg_playback
+
+    Returns a pointer to the compiled PVR polygon header that references
+    the player's video texture. This allows rendering the video onto
+    custom geometry instead of using the built-in full-screen quad.
+
+    \param  player      The MPEG player instance. Must be initialized.
+    \return             A pointer to the player's pvr_poly_hdr_t, or NULL
+                        if player is NULL.
+*/
+const pvr_poly_hdr_t *mpeg_player_get_texture_hdr(mpeg_player_t *player);
+
+/** \brief   Get the UV scale factors for the video texture.
+    \ingroup mpeg_playback
+
+    Returns the UV scale factors needed to map only the video portion
+    of the power-of-2 texture. Since the PVR texture dimensions are
+    rounded up to the next power of two, the video may not fill the
+    entire texture. Use these values as the maximum U and V coordinates
+    when mapping the texture onto custom geometry.
+
+    \param  player      The MPEG player instance. Must be initialized.
+    \param  u_scale     Output: video width / texture width (0.0 to 1.0).
+    \param  v_scale     Output: video height / texture height (0.0 to 1.0).
+*/
+void mpeg_player_get_uv_scale(mpeg_player_t *player, float *u_scale, float *v_scale);
+
+/** \brief   Get the video dimensions in pixels.
+    \ingroup mpeg_playback
+
+    Returns the native width and height of the decoded video stream.
+
+    \param  player      The MPEG player instance. Must be initialized.
+    \param  width       Output: video width in pixels. May be NULL.
+    \param  height      Output: video height in pixels. May be NULL.
+*/
+void mpeg_player_get_dimensions(mpeg_player_t *player, int *width, int *height);
+
+
 /** \brief   Reset the MPEG player for re-use.
     \ingroup mpeg_playback
 
     Stops audio playback, rewinds the decoder to the beginning, and
     resets internal timing state so that the next call to
-    mpeg_decode_step() will re-initialize from scratch.
+    mpeg_play(), mpeg_play_ex(), or mpeg_decode_step() will re-initialize from scratch.
 
     \param  player          The MPEG player instance. If NULL, does nothing.
 */
