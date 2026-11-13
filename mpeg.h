@@ -1,23 +1,32 @@
 /**
-    MPEG1 Decode Library for Dreamcast - Version 0.8 (2023/09/19)
-    Originally ported by Tashi (aka Twada)
+    MPEG1 Decode Library for Dreamcast - Version 2.0
+    Originally ported by Tashi (aka Twada) 2023/09/19
     Further edits done by Ian Robinson and Andy Barajas
 
     Overview:
-    This library facilitates the playback of MPEG1 videos on the Sega Dreamcast console.
-    It supports stereo audio and allows specifying a cancel button during playback.
+    This library plays MPEG1 videos (MPEG-PS, .mpg) on the Sega Dreamcast console, from a
+    file or from memory.
 
     Key Features:
-    - Video Playback: MPEG1 video playback.
-    - Audio Support: Stereo audio playback (interleaved 16-bit PCM).
-    - Cancel Button: Allows specifying a controller button combination to cancel playback.
-    - Recommended Resolutions:
-      - 4:3 Aspect Ratio: 320x240 pixels, Stereo audio at 80kbits.
-      - 16:9 Aspect Ratio: 368x208 pixels, Stereo audio at 80kbits.
+    - Video Playback: MPEG1 video up to 640x480, at 23.976 to 30 frames per second.
+    - Audio Support: MP2 audio, mono or stereo. ADX audio in files made with tools/mpg2sfd.py.
+    - Cancel Button: controller buttons, keyboard keys or button combinations cancel playback.
+    - Frame Queue and Read-Ahead: optional (mpeg_player_options_t), mainly for large 640x480 videos.
+    - Simple, extended and manual playback APIs.
 
-    To create compatible MPEG1 videos, use the following ffmpeg command:
+    Recommended Encoding:
+    - Up to 640x480, sides a multiple of 16, video peaks capped at 1.8 Mbit/s, no B-pictures,
+      stereo MP2 audio at 44.1 kHz and 192 kbit/s.
+    - 30 fps video larger than about 640x400 needs the frame queue (frame_queue = 4) to play
+      without late frames. With the queue off, cap the peaks at 1.5 Mbit/s
+      (tools/dcencode.sh -l).
 
-    ffmpeg -i input.mp4 -vf "scale=320:240" -b:v 742k -minrate 742k -maxrate 742k -bufsize 742k -ac 2 -ar 32000 -c:a mp2 -b:a 64k -f mpeg output.mpg
+    To create compatible MPEG1 videos from any input, use tools/dcencode.sh:
+
+    tools/dcencode.sh input.mp4 output.mpg
+
+    It fits the picture inside 640x480, brings the frame rate to 30 fps or less, and reports
+    anything about the input it had to change or could not fix. See README.md.
  */
 
 #ifndef _MPEG_H_INCLUDED_

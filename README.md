@@ -33,7 +33,8 @@ ffmpeg -i input.mp4 -vf "scale=iw*sar:ih,setsar=1,scale='min(640,iw)':'min(480,i
 - The picture is fitted inside 640x480 with its shape kept (never enlarged), and frame rates above 30 fps are halved.
 - `-maxrate`/`-bufsize` are what keep decode time in bounds; `-b:v` has little effect.
 - 30 fps video larger than about 640x400 needs the frame queue (`options.frame_queue = 4`) to play without late frames. With the queue off, use `tools/dcencode.sh -l` (`-b:v 1300k -maxrate 1500k -bufsize 400k`).
-- HDR and interlaced sources are not handled (add a deinterlace filter such as `bwdif` in front for interlaced video).
+- Interlaced sources are deinterlaced by the script (in the bare command, add `bwdif=mode=send_frame,` at the start of `-vf`). HDR sources are not handled.
+- The script reports what it changed (frame rate halved, audio mixed down to stereo, no audio) and what it could not fix (HDR, variable frame rate), then checks the output is no larger than 640x480, has sides that are multiples of 16, and is 30 fps or less.
 - Tested in-memory on the console at sizes from 320x176 to 640x480 and 23.976 to 30 fps; from CD only at 640x368.
 
 **320x240 (4:3) — Standard (Recommended Standard):**
