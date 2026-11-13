@@ -188,6 +188,20 @@ typedef struct mpeg_player_options_t {
     pvr_filter_mode_t   filter_mode;  /**< Texture filter mode */
     uint8_t             volume;       /**< Volume (0–255) */
     bool                loop;         /**< Enable looping */
+    uint8_t             frame_queue;  /**< Frames mpeg_play()/mpeg_play_ex() keep decoded ahead,
+                                           each in its own texture (0 = off, at most 6). Fewer
+                                           are used if video memory runs short. */
+    bool                stride_texture; /**< Use a texture as wide as the video instead of the next
+                                           power of two, for widths that are a multiple of 32
+                                           and not a power of two (640, say). Less data per
+                                           frame upload and less video memory. It sets the
+                                           PVR's one global texture stride (pvr_txr_set_stride),
+                                           so no other stride texture of a different width can
+                                           be drawn while the player is in use. */
+    uint32_t            read_ahead;   /**< Bytes of the file a separate thread keeps read ahead of
+                                           the decoder (0 = off; rounded to 32 KB steps, at least
+                                           64 KB). A slow disc read then no longer stops playback.
+                                           Only for players created from a file name. */
 } mpeg_player_options_t;
 
 /**
@@ -199,6 +213,9 @@ typedef struct mpeg_player_options_t {
  * - `filter_mode` = `PVR_FILTER_BILINEAR`
  * - `volume`      = `255`
  * - `loop`        = `false`
+ * - `frame_queue` = `0`
+ * - `stride_texture` = `false`
+ * - `read_ahead`  = `0`
  *
  * Example:
  * ```c
@@ -207,7 +224,7 @@ typedef struct mpeg_player_options_t {
  * ```
  */
 #define MPEG_PLAYER_OPTIONS_INITIALIZER \
-    { PVR_LIST_OP_POLY, PVR_FILTER_BILINEAR, 255, false }
+    { PVR_LIST_OP_POLY, PVR_FILTER_BILINEAR, 255, false, 0, false, 0 }
 
 /** \brief   Create an MPEG player instance with custom options.
     \ingroup mpeg_playback
@@ -498,6 +515,26 @@ mpeg_decode_result_t mpeg_decode_step(mpeg_player_t *player);
                         have a valid frame decoded.
  */
 void mpeg_upload_frame(mpeg_player_t *player);
+
+/** \brief   Start uploading the most recently decoded frame without waiting.
+    \ingroup mpeg_playback
+
+    When the decoder's display rows are as long as the texture's rows (always the case
+    for a player made with mpeg_player_create*()), the whole frame goes to the PVR YUV converter in one
+    DMA and the CPU is free until mpeg_upload_frame_wait(). Do not submit polygons,
+    start another PVR DMA, or decode the next video frame before waiting. Otherwise
+    this uploads with store queues before returning.
+
+    \param  player      The MPEG player instance.
+    \retval 1           A DMA was started.
+    \retval 0           The frame was uploaded synchronously.
+ */
+int mpeg_upload_frame_start(mpeg_player_t *player);
+
+/** \brief   Wait for an upload started by mpeg_upload_frame_start() to finish.
+    \ingroup mpeg_playback
+ */
+void mpeg_upload_frame_wait(mpeg_player_t *player);
 
 /** \brief   Render the most recently uploaded frame to the screen.
     \ingroup mpeg_playback

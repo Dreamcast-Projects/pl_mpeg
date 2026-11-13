@@ -245,6 +245,7 @@ typedef struct {
 	plm_plane_t cr;
 	plm_plane_t cb;
 	uint32_t *display;
+	unsigned int display_stride_mbs;   // macroblocks per row of display (>= width / 16; padding is never written)
 } plm_frame_t;
 
 
@@ -353,6 +354,20 @@ int plm_probe(plm_t *self, size_t probesize);
 
 int plm_get_video_enabled(plm_t *self);
 void plm_set_video_enabled(plm_t *self, int enabled);
+
+
+// Skip B-pictures while set: they are not decoded (no other picture refers to them) and no frame
+// is returned for them, but the video clock advances as if they had been. A player that has
+// fallen behind real time can set this to catch up and clear it again once it has.
+
+void plm_set_video_skip_b_frames(plm_t *self, int skip);
+
+
+// Skip every picture up to the next I-picture (and the B-pictures right after it, whose forward
+// reference was skipped). The last resort for catching up, e.g. in streams with no B-pictures.
+// Clears itself once the decoder is back on a complete reference chain.
+
+void plm_set_video_skip_to_intra(plm_t *self);
 
 
 // Get the number of video streams (0--1) reported in the system header.
@@ -728,6 +743,29 @@ int plm_video_get_height(plm_video_t *self);
 void plm_video_set_no_delay(plm_video_t *self, int no_delay);
 
 
+// See plm_set_video_skip_b_frames().
+
+void plm_video_set_skip_b_frames(plm_video_t *self, int skip);
+void plm_video_set_skip_to_intra(plm_video_t *self);
+
+
+// Set a function that is called after every slice while a picture is decoded (several times per
+// picture), or NULL for none. The Dreamcast player shows queued frames and polls the sound stream
+// from it, so a picture that takes longer than a frame period does not hold them up. The function
+// must not call into the decoder or the demuxer.
+
+typedef void(*plm_video_slice_callback)(plm_video_t *self, void *user);
+void plm_video_set_slice_callback(plm_video_t *self, plm_video_slice_callback fp, void *user);
+
+
+// Lay out the rows of plm_frame_t.display with exactly width / 16 macroblocks (exact = TRUE)
+// instead of padding them to the next power of two (the default). For a PVR texture with a
+// stride, whose rows are as long as the video is wide. Call it before the first picture is
+// decoded.
+
+void plm_video_set_display_stride_exact(plm_video_t *self, int exact);
+
+
 // Get the current internal time in seconds.
 
 double plm_video_get_time(plm_video_t *self);
@@ -848,123 +886,9 @@ plm_samples_t *plm_audio_decode(plm_audio_t *self);
 #include <string.h>
 #include <stdlib.h>
 
-// Pipelined inner loop for audio synthesis using SH4 secondary FP bank.
-// Computes one sample: sum of 4 FIPRs across d[0..15] and strided v1/v2.
-// Does NOT modify d, v1, or v2 (uses internal temp copies).
-// Donated by Falco Girgis
-static inline __attribute__((always_inline))
-float shz_pl_inner_loop(const float *d, const float *v1, const float *v2) {
-	const float *td = d;
-	const float *tv1 = v1;
-	const float *tv2 = v2;
-	uint32_t stride;
-	float result;
+// ---- shared definitions ----
+#define PLM_AVG4(a, b) (((a) | (b)) - ((((a) ^ (b)) >> 1) & 0x7f7f7f7f))   // four bytes, rounding up
 
-	asm volatile(R"(
-		! Swap to back-bank so we don't need to clobber any FP regs.
-		frchg
-
-		! s = 512 (stride: 128 floats * 4 bytes)
-		mov     #2, %[s]
-		shll8   %[s]               ! 2 << 8 = 512
-
-		! Load first vector into fv0 for first FIPR.
-		fmov.s  @%[td]+, fr0       ! fr0 = d[0]
-		fmov.s  @%[td]+, fr1       ! fr1 = d[1]
-		fmov.s  @%[td]+, fr2       ! fr2 = d[2]
-		fmov.s  @%[td]+, fr3       ! fr3 = d[3]
-
-		! Load second vector into fv4 for first FIPR
-		fmov.s  @%[tv1], fr4       ! fr4 = v1[0]
-		add     %[s], %[tv1]       ! tv1 -> v1[128]
-		fmov.s  @%[tv2], fr5       ! fr5 = v2[0]
-		add     %[s], %[tv2]       ! tv2 -> v2[128]
-		fmov.s  @%[tv1], fr6       ! fr6 = v1[128]
-		add     %[s], %[tv1]       ! tv1 -> v1[256]
-		fmov.s  @%[tv2], fr7       ! fr7 = v2[128]
-		add     %[s], %[tv2]       ! tv2 -> v2[256]
-
-		! Issue first FIPR
-		fipr    fv0, fv4           ! fr7 = FIPR1 result
-
-		! Load first vector into fv8 for second FIPR.
-		fmov.s  @%[td]+, fr8       ! fr8  = d[4]
-		fmov.s  @%[td]+, fr9       ! fr9  = d[5]
-		fmov.s  @%[td]+, fr10      ! fr10 = d[6]
-		fmov.s  @%[td]+, fr11      ! fr11 = d[7]
-
-		! Load second vector into fv12 for second FIPR.
-		fmov.s  @%[tv1], fr12      ! fr12 = v1[256]
-		add     %[s], %[tv1]       ! tv1 -> v1[384]
-		fmov.s  @%[tv2], fr13      ! fr13 = v2[256]
-		add     %[s], %[tv2]       ! tv2 -> v2[384]
-		fmov.s  @%[tv1], fr14      ! fr14 = v1[384]
-		add     %[s], %[tv1]       ! tv1 -> v1[512]
-		fmov.s  @%[tv2], fr15      ! fr15 = v2[384]
-		add     %[s], %[tv2]       ! tv2 -> v2[512]
-
-		! Issue second FIPR
-		fipr    fv8, fv12          ! fr15 = FIPR2 result
-		fmov.s  fr7, @-r15         ! push FIPR1 result onto stack
-
-		! Load first vector into fv0 for third FIPR
-		fmov.s  @%[td]+, fr0       ! fr0 = d[8]
-		fmov.s  @%[td]+, fr1       ! fr1 = d[9]
-		fmov.s  @%[td]+, fr2       ! fr2 = d[10]
-		fmov.s  @%[td]+, fr3       ! fr3 = d[11]
-
-		! Load second vector into fv4 for third FIPR
-		fmov.s  @%[tv1], fr4       ! fr4 = v1[512]
-		add     %[s], %[tv1]       ! tv1 -> v1[640]
-		fmov.s  @%[tv2], fr5       ! fr5 = v2[512]
-		add     %[s], %[tv2]       ! tv2 -> v2[640]
-		fmov.s  @%[tv1], fr6       ! fr6 = v1[640]
-		add     %[s], %[tv1]       ! tv1 -> v1[768]
-		fmov.s  @%[tv2], fr7       ! fr7 = v2[640]
-		add     %[s], %[tv2]       ! tv2 -> v2[768]
-
-		! Issue third FIPR
-		fipr    fv0, fv4           ! fr7 = FIPR3 result
-		fmov.s  fr15, @-r15        ! push FIPR2 result onto stack
-
-		! Load first vector into fv8 for fourth FIPR
-		fmov.s  @%[td]+, fr8       ! fr8  = d[12]
-		fmov.s  @%[td]+, fr9       ! fr9  = d[13]
-		fmov.s  @%[td]+, fr10      ! fr10 = d[14]
-		fmov.s  @%[td]+, fr11      ! fr11 = d[15]
-
-		! Load second vector into fv12 for fourth FIPR
-		fmov.s  @%[tv1], fr12      ! fr12 = v1[768]
-		add     %[s], %[tv1]       ! tv1 -> v1[896]
-		fmov.s  @%[tv2], fr13      ! fr13 = v2[768]
-		add     %[s], %[tv2]       ! tv2 -> v2[896]
-		fmov.s  @%[tv1], fr14      ! fr14 = v1[896]
-		fmov.s  @%[tv2], fr15      ! fr15 = v2[896]
-
-		! Issue fourth FIPR
-		fipr    fv8, fv12          ! fr15 = FIPR4 result
-
-		! Add up results from previous FIPRs while we wait
-		fmov.s  @r15+, fr0         ! pop FIPR2 result
-		fmov.s  @r15+, fr1         ! pop FIPR1 result
-		fadd    fr1, fr0           ! fr0 = FIPR1 + FIPR2
-		fadd    fr7, fr0           ! fr0 += FIPR3
-
-		! Add result from fourth FIPR now that it's ready
-		fadd    fr15, fr0          ! fr0 += FIPR4
-
-		! Transfer result to primary bank via FPUL
-		flds    fr0, FPUL          ! secondary fr0 -> FPUL
-		frchg                      ! Switch back to primary FP bank
-		fsts    FPUL, %[result]    ! FPUL -> result register (primary bank)
-	)"
-	: [td] "+r" (td), [tv1] "+r" (tv1), [tv2] "+r" (tv2),
-	  [s] "=r" (stride), [result] "=f" (result)
-	:
-	: "memory");
-
-	return result;
-}
 
 // -----------------------------------------------------------------------------
 // plm (high-level interface) implementation
@@ -1194,6 +1118,18 @@ void plm_set_audio_stream(plm_t *self, int stream_index) {
 
 int plm_get_video_enabled(plm_t *self) {
 	return self->video_enabled;
+}
+
+void plm_set_video_skip_to_intra(plm_t *self) {
+	if (self->video_decoder) {
+		plm_video_set_skip_to_intra(self->video_decoder);
+	}
+}
+
+void plm_set_video_skip_b_frames(plm_t *self, int skip) {
+	if (self->video_decoder) {
+		plm_video_set_skip_b_frames(self->video_decoder, skip);
+	}
 }
 
 void plm_set_video_enabled(plm_t *self, int enabled) {
@@ -1600,15 +1536,15 @@ void plm_buffer_load_file_callback(plm_buffer_t *self, void *user);
 void plm_buffer_seek_file_callback(plm_buffer_t *self, size_t offset, void *user);
 size_t plm_buffer_tell_file_callback(plm_buffer_t *self, void *user);
 
-inline int plm_buffer_has(plm_buffer_t *self, size_t count);
-inline uint32_t plm_buffer_read(plm_buffer_t *self, int count);
-inline void plm_buffer_align(plm_buffer_t *self);
-inline void plm_buffer_skip(plm_buffer_t *self, size_t count);
-inline int plm_buffer_skip_bytes(plm_buffer_t *self, uint8_t v);
-inline int plm_buffer_next_start_code(plm_buffer_t *self);
-inline int plm_buffer_find_start_code(plm_buffer_t *self, int code);
-inline int16_t plm_buffer_read_vlc(plm_buffer_t *self, const plm_vlc_t *table);
-inline uint16_t plm_buffer_read_vlc_uint(plm_buffer_t *self, const plm_vlc_uint_t *table);
+static inline int plm_buffer_has(plm_buffer_t *self, size_t count);
+static inline uint32_t plm_buffer_read(plm_buffer_t *self, int count);
+static inline void plm_buffer_align(plm_buffer_t *self);
+static inline void plm_buffer_skip(plm_buffer_t *self, size_t count);
+static inline int plm_buffer_skip_bytes(plm_buffer_t *self, uint8_t v);
+static inline int plm_buffer_next_start_code(plm_buffer_t *self);
+static inline int plm_buffer_find_start_code(plm_buffer_t *self, int code);
+static inline int16_t plm_buffer_read_vlc(plm_buffer_t *self, const plm_vlc_t *table);
+static inline uint16_t plm_buffer_read_vlc_uint(plm_buffer_t *self, const plm_vlc_uint_t *table);
 
 plm_buffer_t *plm_buffer_create_with_filename(const char *filename) {
 	PLM_FILE_TYPE fh = PLM_FILE_OPEN(filename);
@@ -1651,7 +1587,14 @@ plm_buffer_t *plm_buffer_create_with_memory(uint8_t *bytes, size_t length, int f
 	}
 
 	PLM_MEMZERO(self, sizeof(plm_buffer_t));
-	self->capacity = length;
+	// Reads index the bytes with (pos & (capacity - 1)), the ring buffers' wrap. A fixed buffer
+	// must never wrap, so its capacity is the next power of two >= length (only length is read).
+	// With capacity = length (a file size, rarely a power of two) memory playback read wrong bytes.
+	size_t cap = 1;
+	while (cap < length) {
+		cap <<= 1;
+	}
+	self->capacity = cap;
 	self->length = length;
 	self->total_size = length;
 	self->free_when_done = free_when_done;
@@ -1717,18 +1660,18 @@ size_t plm_buffer_get_remaining(plm_buffer_t *self) {
 	return self->length - (self->bit_index >> 3);
 }
 
-inline size_t plm_buffer_get_space(plm_buffer_t *self) {
+static inline size_t plm_buffer_get_space(plm_buffer_t *self) {
     return self->capacity - self->length;
 }
 
 // How many bytes are contiguous from pos until end of buffer
-inline size_t plm_buffer_bytes_until_wrap(plm_buffer_t *self, size_t pos) {
+static inline size_t plm_buffer_bytes_until_wrap(plm_buffer_t *self, size_t pos) {
     return self->capacity - pos;
 }
 
 // (self->capacity - 1) is mod[%] trick that can only be used with capacity that are
 // powers of 2.
-inline uint8_t *plm_buffer_ptr_from_read(const plm_buffer_t *self, size_t byte_off) {
+static inline uint8_t *plm_buffer_ptr_from_read(const plm_buffer_t *self, size_t byte_off) {
     size_t pos = (self->read_byte_pos + byte_off) & (self->capacity - 1);
     return &self->bytes[pos]; // Safe for bytes[0..3] because of guard bytes
 }
@@ -1736,45 +1679,17 @@ inline uint8_t *plm_buffer_ptr_from_read(const plm_buffer_t *self, size_t byte_o
 // Keep a 4-byte guard at the end of the allocation in sync with bytes[0..3].
 // This lets hot-path bit reads grab a 32-bit window (s[0..3]) without needing
 // any ring wrap checks when the read crosses the end of the buffer.
-inline void plm_buffer_ring_sync_guard(plm_buffer_t *self) {
+static inline void plm_buffer_ring_sync_guard(plm_buffer_t *self) {
     self->bytes[self->capacity + 0] = self->bytes[0];
     self->bytes[self->capacity + 1] = self->bytes[1];
     self->bytes[self->capacity + 2] = self->bytes[2];
     self->bytes[self->capacity + 3] = self->bytes[3];
 }
 
-inline void plm_sq_copy_bytes(void *dest, const void *src, size_t length) {
-    uint8_t *d = (uint8_t *)dest;
-    const uint8_t *s = (const uint8_t *)src;
-
-    size_t prefix = ((size_t)32 - ((uintptr_t)d & 31)) & 31;
-    if (prefix > length) {
-        prefix = length;
-    }
-
-    for (size_t i = 0; i < prefix; i++) {
-        d[i] = s[i];
-    }
-    d += prefix;
-    s += prefix;
-    length -= prefix;
-
-    if (length >= 32 && (((uintptr_t)s & 7) == 0)) {
-        size_t block_bytes = length & ~(size_t)31;
-        size_t blocks = block_bytes >> 5;
-
-        sq_lock(d);
-        sq_fast_cpy(SQ_MASK_DEST(d), s, blocks);
-        sq_unlock();
-
-        d += block_bytes;
-        s += block_bytes;
-        length -= block_bytes;
-    }
-
-    while (length--) {
-        *d++ = *s++;
-    }
+// An ordinary cached copy. (Store-queue writes into the ring bypass the D-cache and gave wrong
+// pictures on hardware.)
+static inline void plm_sq_copy_bytes(void *dest, const void *src, size_t length) {
+    memcpy(dest, src, length);
 }
 
 int plm_buffer_ring_grow_memalign(plm_buffer_t *self, size_t new_capacity) {
@@ -1833,7 +1748,7 @@ int plm_buffer_ring_grow_realloc(plm_buffer_t *self, size_t new_capacity) {
 }
 
 // Copy up to len bytes into plm_buffer_t. Returns bytes written.
-inline size_t plm_buffer_ring_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
+static inline size_t plm_buffer_ring_write(plm_buffer_t *self, uint8_t *bytes, size_t length) {
     size_t first = PLM_MIN(length, plm_buffer_bytes_until_wrap(self, self->write_byte_pos));
 
     plm_sq_copy_bytes(&self->bytes[self->write_byte_pos], bytes, first);
@@ -1859,7 +1774,7 @@ inline size_t plm_buffer_ring_write(plm_buffer_t *self, uint8_t *bytes, size_t l
     return length;
 }
 
-inline int plm_buffer_ring_fs_read_into(plm_buffer_t *self, size_t want) {
+static inline int plm_buffer_ring_fs_read_into(plm_buffer_t *self, size_t want) {
     // One contiguous span until we wrap
     size_t bytes_until_wrap = plm_buffer_bytes_until_wrap(self, self->write_byte_pos);
     size_t first_chunk_want = (want < bytes_until_wrap) ? want : bytes_until_wrap;
@@ -2022,7 +1937,7 @@ inline int plm_buffer_has_ended(plm_buffer_t *self) {
 	return self->has_ended;
 }
 
-inline int plm_buffer_has(plm_buffer_t *self, size_t count) {
+static inline int plm_buffer_has(plm_buffer_t *self, size_t count) {
 	if (((self->length << 3) - self->bit_index) >= count) {
 		return TRUE;
 	}
@@ -2041,7 +1956,7 @@ inline int plm_buffer_has(plm_buffer_t *self, size_t count) {
 	return FALSE;
 }
 
-inline uint32_t plm_buffer_load_u32be(const uint8_t *s) {
+static inline uint32_t plm_buffer_load_u32be(const uint8_t *s) {
 	return
 		((uint32_t)s[0] << 24) |
 		((uint32_t)s[1] << 16) |
@@ -2050,7 +1965,7 @@ inline uint32_t plm_buffer_load_u32be(const uint8_t *s) {
 }
 
 // Gain 12%: https://github.com/bitbank2/pl_mpeg/blob/master/pl_mpeg.h
-inline uint32_t plm_buffer_read(plm_buffer_t *self, int count) {
+static inline uint32_t plm_buffer_read(plm_buffer_t *self, int count) {
 	uint32_t value = 0;
     uint32_t bit_index = (uint32_t)self->bit_index;
     size_t byte_off = (size_t)(bit_index >> 3);
@@ -2067,17 +1982,17 @@ inline uint32_t plm_buffer_read(plm_buffer_t *self, int count) {
     return value;
 }
 
-inline void plm_buffer_align(plm_buffer_t *self) {
+static inline void plm_buffer_align(plm_buffer_t *self) {
 	self->bit_index = ((self->bit_index + 7) >> 3) << 3; // Align to next byte
 }
 
-inline void plm_buffer_skip(plm_buffer_t *self, size_t count) {
+static inline void plm_buffer_skip(plm_buffer_t *self, size_t count) {
 	if (plm_buffer_has(self, count)) {
 		self->bit_index += count;
 	}
 }
 
-inline int plm_buffer_skip_bytes(plm_buffer_t *self, uint8_t v) {
+static inline int plm_buffer_skip_bytes(plm_buffer_t *self, uint8_t v) {
     plm_buffer_align(self);
 
     int skipped = 0;
@@ -2101,7 +2016,41 @@ inline int plm_buffer_skip_bytes(plm_buffer_t *self, uint8_t v) {
     return skipped;
 }
 
-inline int plm_buffer_next_start_code(plm_buffer_t *self) {
+// Number of the n aligned words at w, from the first, that contain no zero byte. A start code
+// (00 00 01) cannot begin inside such a word.
+static inline size_t plm_words_without_zero(const uint32_t *w, size_t n) {
+	const uint32_t *q = w;
+	uint32_t x;
+	if (!n) {
+		return 0;
+	}
+#ifdef __SH4__
+	__asm__(
+		"1:\n\t"
+		"mov.l	@%0+,%1\n\t"
+		"cmp/str	%3,%1\n\t"
+		"bt	2f\n\t"
+		"dt	%2\n\t"
+		"bf	1b\n\t"
+		"bra	3f\n\t"
+		"nop\n"
+		"2:\n\t"
+		"add	#-4,%0\n"
+		"3:\n"
+		: "+r"(q), "=&r"(x), "+r"(n) : "r"(0) : "t", "memory");
+#else
+	while (n--) {
+		x = *q;
+		if ((x - 0x01010101u) & ~x & 0x80808080u) {
+			break;
+		}
+		q++;
+	}
+#endif
+	return (size_t)(q - w);
+}
+
+static inline int plm_buffer_next_start_code(plm_buffer_t *self) {
     plm_buffer_align(self);
 
     while (TRUE) {
@@ -2112,6 +2061,22 @@ inline int plm_buffer_next_start_code(plm_buffer_t *self) {
 
         size_t byte_off = (size_t)(self->bit_index >> 3);
         const uint8_t *p = plm_buffer_ptr_from_read(self, byte_off);
+        if (((uintptr_t)p & 3) == 0) {
+            // whole words before the end of the ring's storage, keeping the last 5 bytes for the
+            // exact check (which also refills)
+            size_t left = self->length - byte_off;
+            size_t room = (size_t)(self->bytes + self->capacity - p);
+            if (left > room) {
+                left = room;
+            }
+            if (left >= 9) {
+                size_t k = plm_words_without_zero((const uint32_t *)p, (left - 5) >> 2);
+                if (k) {
+                    self->bit_index += (uint32_t)(k << 5);
+                    continue;
+                }
+            }
+        }
 
         // Thanks to the 4-byte guard, p[0..3] is always safe here
         if (p[0] == 0x00 && p[1] == 0x00 && p[2] == 0x01) {
@@ -2123,7 +2088,7 @@ inline int plm_buffer_next_start_code(plm_buffer_t *self) {
     }
 }
 
-inline int plm_buffer_find_start_code(plm_buffer_t *self, int code) {
+static inline int plm_buffer_find_start_code(plm_buffer_t *self, int code) {
 	int current = 0;
 	while (TRUE) {
 		current = plm_buffer_next_start_code(self);
@@ -2134,7 +2099,7 @@ inline int plm_buffer_find_start_code(plm_buffer_t *self, int code) {
 	return -1;
 }
 
-inline int plm_buffer_has_start_code(plm_buffer_t *self, int code) {
+static inline int plm_buffer_has_start_code(plm_buffer_t *self, int code) {
 	size_t previous_bit_index = self->bit_index;
 	int previous_discard_read_bytes = self->discard_read_bytes;
 
@@ -2146,7 +2111,7 @@ inline int plm_buffer_has_start_code(plm_buffer_t *self, int code) {
 	return current;
 }
 
-inline int plm_buffer_peek_non_zero(plm_buffer_t *self, int bit_count) {
+static inline int plm_buffer_peek_non_zero(plm_buffer_t *self, int bit_count) {
 	size_t avail_bits = (self->length << 3) - self->bit_index;
 	if (avail_bits < (size_t)bit_count && !plm_buffer_has(self, bit_count)) {
 		return FALSE;
@@ -2160,7 +2125,7 @@ inline int plm_buffer_peek_non_zero(plm_buffer_t *self, int bit_count) {
 	return val != 0;
 }
 
-inline int16_t plm_buffer_read_vlc(plm_buffer_t *self, const plm_vlc_t *table) {
+static inline int16_t plm_buffer_read_vlc(plm_buffer_t *self, const plm_vlc_t *table) {
 	plm_vlc_t state = {0, 0};
 	uint32_t bit_index = (uint32_t)self->bit_index;
 	size_t byte_off = (size_t)(bit_index >> 3);
@@ -2189,8 +2154,200 @@ inline int16_t plm_buffer_read_vlc(plm_buffer_t *self, const plm_vlc_t *table) {
 	return state.value;
 }
 
-inline uint16_t plm_buffer_read_vlc_uint(plm_buffer_t *self, const plm_vlc_uint_t *table) {
+static inline uint16_t plm_buffer_read_vlc_uint(plm_buffer_t *self, const plm_vlc_uint_t *table) {
 	return (uint16_t)plm_buffer_read_vlc(self, (const plm_vlc_t *)table);
+}
+
+// Table-driven VLC decoding. A lookup table built from a plm_vlc_t tree resolves every code of up to
+// PLM_VLC_LUT_BITS bits with one lookup; longer codes continue the bit-serial tree walk from the
+// node the table stopped at. Results are identical to plm_buffer_read_vlc by construction.
+#define PLM_VLC_LUT_BITS 10
+__attribute__((noinline, cold)) static int16_t plm_buffer_read_vlc_tail(plm_buffer_t *self, const plm_vlc_t *table,
+		int index, uint32_t bit_index);
+
+typedef struct {
+	int16_t value;   // leaf: the decoded value; otherwise: tree index to continue from
+	uint8_t len;     // bits consumed
+	uint8_t leaf;
+} plm_vlc_lut_t;
+
+static void plm_vlc_lut_build_n(const plm_vlc_t *table, plm_vlc_lut_t *lut, int lut_bits) {
+	for (int p = 0; p < (1 << lut_bits); p++) {
+		int index = 0;
+		plm_vlc_lut_t e = {0, (uint8_t)lut_bits, 0};
+		for (int k = 0; k < lut_bits; k++) {
+			int bit = (p >> (lut_bits - 1 - k)) & 1;
+			plm_vlc_t st = table[index + bit];
+			if (st.index <= 0) {
+				e.value = st.value;
+				e.len = (uint8_t)(k + 1);
+				e.leaf = 1;
+				break;
+			}
+			index = st.index;
+		}
+		if (!e.leaf) {
+			e.value = (int16_t)index;
+		}
+		lut[p] = e;
+	}
+}
+
+static void plm_vlc_lut_build(const plm_vlc_t *table, plm_vlc_lut_t *lut) {
+	plm_vlc_lut_build_n(table, lut, PLM_VLC_LUT_BITS);
+}
+
+// DCT coefficient table with the sign bit and the end-of-block bit folded in. Entry for a 9-bit
+// window: run, level and total bits (code + sign), or a kind for end_of_block, escape, or a code
+// longer than the window.
+// 'first' tables are for coefficient 0 (where '1s' is run 0 / level 1), 'rest' for later ones
+// (where '10' is end_of_block and '11s' is run 0 / level 1).
+#ifndef PLM_COEF_LUT_BITS
+#define PLM_COEF_LUT_BITS 9   // window of the sign/EOB-folded coefficient tables (2 KB each at 9)
+#endif
+// Entry: four bytes, in the order the assembly loads them (mov.b @r14+, sign-extending):
+//   run4  4 * run: the step to this coefficient's entry in the per-index table (plm_video_t.qz_*)
+//   lenf  bits to skip (code + sign), or with bit 7 set one of the kinds below (run4 is 0 then)
+//   mag   2|level| + 1, the non-intra dequantiser's factor (at most 81 for the table codes)
+//   sign  0, or -1 for a negative level
+#define PLM_COEF_EOB  0x81   // end_of_block
+#define PLM_COEF_ESC  0x82   // escape
+#define PLM_COEF_LONG 0x84   // code longer than the window: second-level table
+#define PLM_COEF_L3   0x88   // second-level miss: third-level table
+#define PLM_COEF_INV  0x90   // third-level miss: not a valid code
+typedef struct {
+	uint8_t run4;
+	uint8_t lenf;
+	uint8_t mag;
+	int8_t sign;
+} plm_coef_lut_t;
+
+static void plm_coef_lut_build(const plm_vlc_t *tree, plm_coef_lut_t *lut, int rest) {
+	const int B = PLM_COEF_LUT_BITS;
+	for (int p = 0; p < (1 << B); p++) {
+		plm_coef_lut_t e = {0, PLM_COEF_LONG, 0, 0};
+		int index = 0, len = 0;
+		uint16_t coeff = 0;
+		int leaf = 0;
+		for (int k = 0; k < B; k++) {
+			plm_vlc_t st = tree[index + ((p >> (B - 1 - k)) & 1)];
+			if (st.index <= 0) {
+				coeff = (uint16_t)st.value;
+				len = k + 1;
+				leaf = 1;
+				break;
+			}
+			index = st.index;
+		}
+		if (leaf) {
+			#define PLM_BIT_AT(pos) ((p >> (B - 1 - (pos))) & 1)
+			if (coeff == 0xffff) {
+				e.lenf = PLM_COEF_ESC;
+			}
+			else if (rest && coeff == 0x0001) {
+				// len == 1 here; the next bit decides
+				if (PLM_BIT_AT(1) == 0) {
+					e.lenf = PLM_COEF_EOB;
+				}
+				else if (3 <= B) {
+					e.mag = 3;
+					e.sign = PLM_BIT_AT(2) ? -1 : 0;
+					e.lenf = 3;
+				}
+			}
+			else if (len + 1 <= B) {
+				int lv = coeff & 0xff;
+				e.run4 = (uint8_t)((coeff >> 8) * 4);
+				e.mag = (uint8_t)(2 * lv + 1);
+				e.sign = (lv && PLM_BIT_AT(len)) ? -1 : 0;   // level 0 (an invalid code) has no sign
+				e.lenf = (uint8_t)(len + 1);
+			}
+			#undef PLM_BIT_AT
+		}
+		lut[p] = e;
+	}
+}
+
+// Second level for codes that start with six zeros (all codes longer than 8 bits + sign): entry for
+// the next PLM_COEF_L2_BITS bits, same format, length counted from the start of the code. Codes
+// whose sign is outside the 6 + PLM_COEF_L2_BITS window get `miss` (the next level, or invalid).
+#ifndef PLM_COEF_L2_BITS
+#define PLM_COEF_L2_BITS 8   // 1 KB; covers the 10-, 12- and 13-bit codes
+#endif
+static __attribute__((unused)) void plm_coef_ln_build(const plm_vlc_t *tree, plm_coef_lut_t *lut, int zeros, int bits, int miss) {
+	const int B = zeros + bits;
+	for (int p = 0; p < (1 << bits); p++) {   // the B-bit window is `zeros` zero bits, then p
+		plm_coef_lut_t e = {0, (uint8_t)miss, 0, 0};
+		int index = 0;
+		for (int k = 0; k < B; k++) {
+			plm_vlc_t st = tree[index + ((p >> (B - 1 - k)) & 1)];
+			if (st.index <= 0) {
+				uint16_t coeff = (uint16_t)st.value;
+				int len = k + 1;
+				if (coeff != 0xffff && coeff != 0x0001 && len + 1 <= B) {
+					int lv = coeff & 0xff;
+					e.run4 = (uint8_t)((coeff >> 8) * 4);
+					e.mag = (uint8_t)(2 * lv + 1);
+					e.sign = (lv && ((p >> (B - 1 - len)) & 1)) ? -1 : 0;
+					e.lenf = (uint8_t)(len + 1);
+				}
+				break;
+			}
+			index = st.index;
+		}
+		lut[p] = e;
+	}
+}
+
+// Same as plm_buffer_read_vlc_lut for a table built with plm_vlc_lut_build_n(..., lut_bits).
+static inline int16_t plm_buffer_read_vlc_lut_n(plm_buffer_t *self, const plm_vlc_t *table, const plm_vlc_lut_t *lut, int lut_bits) {
+	uint32_t bit_index = (uint32_t)self->bit_index;
+	const uint8_t *s = plm_buffer_ptr_from_read(self, (size_t)(bit_index >> 3));
+	uint32_t bits = plm_buffer_load_u32be(s) << (bit_index & 7);
+	plm_vlc_lut_t e = lut[bits >> (32 - lut_bits)];
+	if (e.leaf) {
+		self->bit_index = bit_index + e.len;
+		return e.value;
+	}
+	return plm_buffer_read_vlc_tail(self, table, e.value, bit_index + (uint32_t)lut_bits);
+}
+
+// Codes longer than a lookup table: finish the bit-serial tree walk from 'index', starting at
+// bit_index. Out of line and cold so the inlined table readers stay small (SH-4 I-cache is 8 KB).
+__attribute__((noinline, cold)) static int16_t plm_buffer_read_vlc_tail(plm_buffer_t *self, const plm_vlc_t *table,
+		int index, uint32_t bit_index) {
+	const uint8_t *s = plm_buffer_ptr_from_read(self, (size_t)(bit_index >> 3));
+	uint32_t bits = plm_buffer_load_u32be(s) << (bit_index & 7);
+	plm_vlc_t state = {(int16_t)index, 0};
+	while (TRUE) {
+		state = table[state.index + (int)(bits >> 31)];
+		bit_index++;
+		if (state.index <= 0) {
+			break;
+		}
+		if ((bit_index & 7) == 0) {
+			s = plm_buffer_ptr_from_read(self, (size_t)(bit_index >> 3));
+			bits = plm_buffer_load_u32be(s);
+		}
+		else {
+			bits <<= 1;
+		}
+	}
+	self->bit_index = bit_index;
+	return state.value;
+}
+
+static inline int16_t plm_buffer_read_vlc_lut(plm_buffer_t *self, const plm_vlc_t *table, const plm_vlc_lut_t *lut) {
+	uint32_t bit_index = (uint32_t)self->bit_index;
+	const uint8_t *s = plm_buffer_ptr_from_read(self, (size_t)(bit_index >> 3));
+	uint32_t bits = plm_buffer_load_u32be(s) << (bit_index & 7);   // >= 25 valid bits
+	plm_vlc_lut_t e = lut[bits >> (32 - PLM_VLC_LUT_BITS)];
+	if (e.leaf) {
+		self->bit_index = bit_index + e.len;
+		return e.value;
+	}
+	// Long code: continue the tree walk from the node reached after PLM_VLC_LUT_BITS bits.
+	return plm_buffer_read_vlc_tail(self, table, e.value, bit_index + PLM_VLC_LUT_BITS);
 }
 
 
@@ -2829,17 +2986,6 @@ static const float PLM_VIDEO_PIXEL_ASPECT_RATIO[] = {
 	16, 16, 16, 16, 16, 16, 16, 16
 };
 
- __attribute__((aligned(32))) static const uint8_t PLM_VIDEO_PREMULTIPLIER_MATRIX[] = {
-	32, 44, 42, 38, 32, 25, 17,  9,
-	44, 62, 58, 52, 44, 35, 24, 12,
-	42, 58, 55, 49, 42, 33, 23, 12,
-	38, 52, 49, 44, 38, 30, 20, 10,
-	32, 44, 42, 38, 32, 25, 17,  9,
-	25, 35, 33, 30, 25, 20, 14,  7,
-	17, 24, 23, 20, 17, 14,  9,  5,
-	 9, 12, 12, 10,  9,  7,  5,  2
-};
-
  __attribute__((aligned(32))) static const plm_vlc_t PLM_VIDEO_MACROBLOCK_ADDRESS_INCREMENT[] = {
 	{  1 << 1,    0}, {       0,    1},  //   0: x
 	{  2 << 1,    0}, {  3 << 1,    0},  //   1: 0x
@@ -3182,10 +3328,35 @@ typedef struct {
 	int v;
 } plm_video_motion_t;
 
+typedef struct {
+	uint32_t P;              //  0 in/out: absolute bit position (read_byte_pos * 8 + bit_index)
+	const uint8_t *base;     //  4 ring buffer
+	uint32_t mask;           //  8 capacity - 1
+	const void *first;       // 12 FIRST table
+	const void *rest;        // 16 REST table
+	const void *unused20;    // 20
+	const int16_t *qz;       // 24 per coefficient index: quantizer_scale * matrix, block offset (qz_* below)
+	int32_t ni;              // 28 0 (intra) or -1
+	uint32_t cbp;            // 32 in/out: blocks still to decode, the next one in bit 31
+	float *blocks;           // 36 6 x 64 floats
+	int *dcp;                // 40 dc predictors [3]
+	const void *dclut;       // 44 PLM_VIDEO_DCT_SIZE_LUT
+	int32_t b;               // 48 in/out: current block (-1 to start)
+	int32_t n;               // 52 in/out: coefficient index when resuming
+	int32_t resume;          // 56 1: continue block b's AC tokens at n
+	const void *l2;          // 60 second-level table for codes that start 000000
+	uint8_t nb[8];           // 64 out
+} plm_mbc_t;
 struct plm_video_t {
-	// --- Hot: accessed every decode_block call (target: 1 cache line) ---
+	// --- Hot: accessed for every block (target: 1 cache line) ---
 	plm_buffer_t *buffer;
 	int quantizer_scale;
+	int16_t qm_cached_scale[2];          // quantizer_scale qz_non_intra [0] / qz_intra [1] were built for, -1 = stale
+	// Per coefficient index n (zigzag order): [0] quantizer_scale * matrix, [1] byte offset of the
+	// coefficient in the float block (4 * PLM_FIDCT_POS), -4 for n >= 64. The token loop walks these
+	// with a pointer, so a run that leaves the block lands on an entry marked invalid.
+	int16_t qz_intra[128][2];
+	int16_t qz_non_intra[128][2];
 	int macroblock_intra;
 	int dc_predictor[3];
 	int macroblock_address;
@@ -3195,6 +3366,7 @@ struct plm_video_t {
 	int picture_type;
 	int mb_row;
 	int mb_col;
+	int display_stride_mbs;
 	int slice_begin;
 	int mb_width;
 	int mb_size;
@@ -3212,7 +3384,7 @@ struct plm_video_t {
 	plm_frame_t frame_backward;
 
 	// --- Large arrays ---
-	int block_data[64];
+	int block_data[64] __attribute__((aligned(8)));   // float coefficients in the FTRV layout
 	uint8_t intra_quant_matrix[64] __attribute__((aligned(32)));
 	uint8_t non_intra_quant_matrix[64] __attribute__((aligned(32)));
 
@@ -3231,6 +3403,15 @@ struct plm_video_t {
 	uint8_t *frames_data;
 	int has_reference_frame;
 	int assume_no_b_frames;
+	int skip_b_frames;
+	int skip_to_intra;   // 2: skip until an I-picture; 1: then skip B-pictures until the next anchor
+	int picture_skipped;
+	plm_mbc_t mbc;
+	float mb_blocks[6][64] __attribute__((aligned(32)));   // coefficients of one macroblock; kept zero between uses
+	plm_video_slice_callback slice_callback;   // after the hot data so nothing above moves
+	void *slice_callback_user_data;
+	int display_stride_exact;
+	void *alloc_base;        // what to free: the struct sits at a chosen data-cache offset inside it
 };
 
 // DCL Gives 6% speedup...(https://github.com/bitbank2/pl_mpeg/blob/master/pl_mpeg.h)
@@ -3256,6 +3437,637 @@ static const uint8_t the_clamp_table[] = {
 };
 static const uint8_t *clamp_table = &the_clamp_table[16];
 
+// ---------------------------------------------------------------------------------------------
+// Floating-point IDCT (FTRV). Coefficients are stored as floats at PLM_FIDCT_POS(natural index);
+// see plm_fidct_sh4 below for the layout and method.
+// XMTRX belongs to the application between calls (KOS's mat_load/mat_apply keep their matrix there),
+// so plm_video_decode saves it on entry and restores it on exit.
+static inline __attribute__((always_inline)) void plm_xmtrx_save(float *m) {
+	float *e = m + 16;
+	__asm__ volatile("fschg\n\tfmov xd14,@-%0\n\tfmov xd12,@-%0\n\tfmov xd10,@-%0\n\tfmov xd8,@-%0\n\t"
+		"fmov xd6,@-%0\n\tfmov xd4,@-%0\n\tfmov xd2,@-%0\n\tfmov xd0,@-%0\n\tfschg\n" : "+r"(e) : : "memory");
+}
+static inline __attribute__((always_inline)) void plm_xmtrx_restore(const float *m) {
+	__asm__ volatile("fschg\n\tfmov @%0+,xd0\n\tfmov @%0+,xd2\n\tfmov @%0+,xd4\n\tfmov @%0+,xd6\n\t"
+		"fmov @%0+,xd8\n\tfmov @%0+,xd10\n\tfmov @%0+,xd12\n\tfmov @%0+,xd14\n\tfschg\n" : "+r"(m) : : "memory");
+}
+typedef float plm_float_alias __attribute__((may_alias));   // block_data is declared int
+#define PLM_FIDCT_POS(i) ((((i) >> 3) & 1) * 32 + ((i) & 7) * 4 + ((i) >> 4))
+
+
+#define PLM_FIDCT_MAGIC_BITS 0x4b400000u
+
+/* XMTRX element XF[c * 4 + r] = M[r][c]. E[k][j] = C(2j)/2 cos((2k+1) 2j pi/16), O[k][j] = 1/2 cos((2k+1)(2j+1) pi/16). */
+static void plm_fidct_init(float *mtx) {
+	for (int k = 0; k < 4; k++)
+		for (int j = 0; j < 4; j++) {
+			double ce = (j == 0 ? sqrt(0.5) : 1.0) * 0.5 * cos((2 * k + 1) * (2 * j) * M_PI / 16);
+			double co = 0.5 * cos((2 * k + 1) * (2 * j + 1) * M_PI / 16);
+			mtx[j * 4 + k] = (float)ce;
+			mtx[16 + j * 4 + k] = (float)co;
+		}
+	mtx[32] = 12582912.0f;
+}
+
+
+void plm_fidct_sh4_v2(float *blk, float *tmp, uint32_t *out, const float *mtx);
+
+/* Float IDCT, in place (out may equal blk). Pass 1: even and odd halves through FTRV (E and O
+   matrices), then the column butterflies into tmp (transposed). Pass 2: the same for the rows, plus
+   the 12582912.0 bias that leaves each result's integer in the low mantissa bits. Software-pipelined
+   with the ornio.nilware.io SH7091 pipeline model: each in-place FTRV pass loads the next vector
+   before transforming the current one; the column step loads the next column's e values in its idle
+   load/store slots; pass 2 is unrolled (8 rows) and each row loads three of the next row's o values
+   into the registers the previous row freed (fr4-fr7, fr9-fr11 rotate). For each butterfly
+   a = e + o and b = 2e - a, as before, so results are unchanged. Pass 1 reads 16 bytes past the
+   even halves (blk+128..143, inside the block). r0-r7, fr0-fr11 and XMTRX are clobbered; FPSCR.SZ is
+   toggled and restored. */
+__asm__(
+	"\t.section .text.plm_hot,\"ax\"\n"
+	"\t.align 5\n"
+	"\t.global _plm_fidct_sh4_v2\n"
+	"_plm_fidct_sh4_v2:\n\t"
+	"mov.l r8,@-r15\n\t"
+	"mov.l r9,@-r15\n\t"
+	"mov #16,r8\n\t"
+	"mov.l r10,@-r15\n\t"
+	"mov #32,r9\n\t"
+	"mov.l r11,@-r15\n\t"
+	"mov #48,r10\n\t"
+	"mov.l r12,@-r15\n\t"
+	"mov #64,r11\n\t"
+	"mov.l r13,@-r15\n\t"
+	"mov #80,r12\n\t"
+	"mov.l r14,@-r15\n\t"
+	"mov #96,r13\n\t"
+	"fmov.s fr12,@-r15\n\t"
+	"mov #112,r14\n\t"
+	"fmov.s fr13,@-r15\n\t"
+	"fmov.s fr14,@-r15\n\t"
+	"fmov.s fr15,@-r15\n\t"
+	"mov.l r7,@-r15\n\t"
+	"mov.l r6,@-r15\n\t"
+	"mov.l r5,@-r15\n\t"
+	"fschg\n\t"
+	"fmov @r7+,xd0\n\t"
+	"fmov @r7+,xd2\n\t"
+	"fmov @r7+,xd4\n\t"
+	"fmov @r7+,xd6\n\t"
+	"fmov @r7+,xd8\n\t"
+	"fmov @r7+,xd10\n\t"
+	"fmov @r7+,xd12\n\t"
+	"fmov @r7+,xd14\n\t"
+	"mov r4,r2\n\t"
+	"mov r4,r3\n\t"
+	"add #16,r3\n\t"
+	"fmov @r2+,dr0\n\t"
+	"fmov @r2+,dr2\n\t"
+	"fmov @r2+,dr4\n\t"
+	"fmov @r2+,dr6\n\t"
+	"ftrv xmtrx,fv0\n\t"
+	"fmov @r2+,dr8\n\t"
+	"fmov @r2+,dr10\n\t"
+	"ftrv xmtrx,fv4\n\t"
+	"fmov @r2+,dr12\n\t"
+	"fmov @r2+,dr14\n\t"
+	"ftrv xmtrx,fv8\n\t"
+	"fmov dr2,@-r3\n\t"
+	"fmov dr0,@-r3\n\t"
+	"add #32,r3\n\t"
+	"fmov @r2+,dr0\n\t"
+	"fmov @r2+,dr2\n\t"
+	"ftrv xmtrx,fv12\n\t"
+	"fmov dr6,@-r3\n\t"
+	"fmov dr4,@-r3\n\t"
+	"add #32,r3\n\t"
+	"fmov @r2+,dr4\n\t"
+	"fmov @r2+,dr6\n\t"
+	"ftrv xmtrx,fv0\n\t"
+	"fmov dr10,@-r3\n\t"
+	"fmov dr8,@-r3\n\t"
+	"add #32,r3\n\t"
+	"fmov @r2+,dr8\n\t"
+	"fmov @r2+,dr10\n\t"
+	"ftrv xmtrx,fv4\n\t"
+	"fmov dr14,@-r3\n\t"
+	"fmov dr12,@-r3\n\t"
+	"add #32,r3\n\t"
+	"fmov @r2+,dr12\n\t"
+	"fmov @r2+,dr14\n\t"
+	"ftrv xmtrx,fv8\n\t"
+	"fmov dr2,@-r3\n\t"
+	"fmov dr0,@-r3\n\t"
+	"add #32,r3\n\t"
+	"ftrv xmtrx,fv12\n\t"
+	"fmov dr6,@-r3\n\t"
+	"fmov dr4,@-r3\n\t"
+	"add #32,r3\n\t"
+	"fmov dr10,@-r3\n\t"
+	"fmov dr8,@-r3\n\t"
+	"add #32,r3\n\t"
+	"fmov dr14,@-r3\n\t"
+	"fmov dr12,@-r3\n\t"
+	"fmov @r7+,xd0\n\t"
+	"fmov @r7+,xd2\n\t"
+	"fmov @r7+,xd4\n\t"
+	"fmov @r7+,xd6\n\t"
+	"fmov @r7+,xd8\n\t"
+	"fmov @r7+,xd10\n\t"
+	"fmov @r7+,xd12\n\t"
+	"fmov @r7+,xd14\n\t"
+	"fschg\n\t"
+	"mov r4,r2\n\t"
+	"mov r4,r3\n\t"
+	"add #127,r3\n\t"
+	"add #1,r3\n\t"
+	"mov r5,r4\n\t"
+	"mov r5,r6\n\t"
+	"add #127,r6\n\t"
+	"add #1,r6\n\t"
+	"fmov.s @r3+,fr4\n\t"
+	"fmov.s @r3+,fr5\n\t"
+	"fmov.s @r3+,fr6\n\t"
+	"fmov.s @r3+,fr7\n\t"
+	"ftrv xmtrx,fv4\n\t"
+	"mov #4,r1\n\t"
+	"fmov.s @r2+,fr0\n\t"
+	"fmov.s @r2+,fr1\n\t"
+	"fmov.s @r2+,fr2\n\t"
+	"fmov.s @r2+,fr3\n\t"
+	"\n5:\n\t"
+	"fmov.s @r3+,fr12\n\t"
+	"fadd fr0,fr4\n\t"
+	"fmov.s @r3+,fr13\n\t"
+	"fadd fr1,fr5\n\t"
+	"fmov.s @r3+,fr14\n\t"
+	"fadd fr2,fr6\n\t"
+	"fmov.s @r3+,fr15\n\t"
+	"fadd fr3,fr7\n\t"
+	"mov r4,r0\n\t"
+	"fadd fr0,fr0\n\t"
+	"fmov.s @r2+,fr8\n\t"
+	"fadd fr1,fr1\n\t"
+	"fmov.s @r2+,fr9\n\t"
+	"fadd fr2,fr2\n\t"
+	"fmov.s @r2+,fr10\n\t"
+	"fadd fr3,fr3\n\t"
+	"fmov.s fr4,@r0\n\t"
+	"fsub fr4,fr0\n\t"
+	"fmov.s fr5,@(r0,r8)\n\t"
+	"fsub fr5,fr1\n\t"
+	"fmov.s fr6,@(r0,r9)\n\t"
+	"fsub fr6,fr2\n\t"
+	"fmov.s fr7,@(r0,r10)\n\t"
+	"fsub fr7,fr3\n\t"
+	"fmov.s @r2+,fr11\n\t"
+	"ftrv xmtrx,fv12\n\t"
+	"fmov.s fr0,@(r0,r14)\n\t"
+	"fmov.s fr1,@(r0,r13)\n\t"
+	"fmov.s fr2,@(r0,r12)\n\t"
+	"fmov.s fr3,@(r0,r11)\n\t"
+	"fmov.s @r3+,fr4\n\t"
+	"fadd fr8,fr12\n\t"
+	"fmov.s @r3+,fr5\n\t"
+	"fadd fr9,fr13\n\t"
+	"fmov.s @r3+,fr6\n\t"
+	"fadd fr10,fr14\n\t"
+	"fmov.s @r3+,fr7\n\t"
+	"fadd fr11,fr15\n\t"
+	"mov r6,r0\n\t"
+	"fadd fr8,fr8\n\t"
+	"fmov.s @r2+,fr0\n\t"
+	"fadd fr9,fr9\n\t"
+	"fmov.s @r2+,fr1\n\t"
+	"fadd fr10,fr10\n\t"
+	"fmov.s @r2+,fr2\n\t"
+	"fadd fr11,fr11\n\t"
+	"fmov.s fr12,@r0\n\t"
+	"fsub fr12,fr8\n\t"
+	"fmov.s fr13,@(r0,r8)\n\t"
+	"fsub fr13,fr9\n\t"
+	"fmov.s fr14,@(r0,r9)\n\t"
+	"fsub fr14,fr10\n\t"
+	"fmov.s fr15,@(r0,r10)\n\t"
+	"fsub fr15,fr11\n\t"
+	"fmov.s @r2+,fr3\n\t"
+	"ftrv xmtrx,fv4\n\t"
+	"fmov.s fr8,@(r0,r14)\n\t"
+	"fmov.s fr9,@(r0,r13)\n\t"
+	"fmov.s fr10,@(r0,r12)\n\t"
+	"fmov.s fr11,@(r0,r11)\n\t"
+	"add #4,r4\n\t"
+	"dt r1\n\t"
+	"bf/s 5b\n\t"
+	"add #4,r6\n\t"
+	"fschg\n\t"
+	"mov.l @r15,r5\n\t"
+	"mov r5,r2\n\t"
+	"add #127,r2\n\t"
+	"add #1,r2\n\t"
+	"mov r2,r3\n\t"
+	"add #16,r3\n\t"
+	"fmov @r2+,dr0\n\t"
+	"fmov @r2+,dr2\n\t"
+	"fmov @r2+,dr4\n\t"
+	"fmov @r2+,dr6\n\t"
+	"ftrv xmtrx,fv0\n\t"
+	"fmov @r2+,dr8\n\t"
+	"fmov @r2+,dr10\n\t"
+	"ftrv xmtrx,fv4\n\t"
+	"fmov @r2+,dr12\n\t"
+	"fmov @r2+,dr14\n\t"
+	"ftrv xmtrx,fv8\n\t"
+	"fmov dr2,@-r3\n\t"
+	"fmov dr0,@-r3\n\t"
+	"add #32,r3\n\t"
+	"fmov @r2+,dr0\n\t"
+	"fmov @r2+,dr2\n\t"
+	"ftrv xmtrx,fv12\n\t"
+	"fmov dr6,@-r3\n\t"
+	"fmov dr4,@-r3\n\t"
+	"add #32,r3\n\t"
+	"fmov @r2+,dr4\n\t"
+	"fmov @r2+,dr6\n\t"
+	"ftrv xmtrx,fv0\n\t"
+	"fmov dr10,@-r3\n\t"
+	"fmov dr8,@-r3\n\t"
+	"add #32,r3\n\t"
+	"fmov @r2+,dr8\n\t"
+	"fmov @r2+,dr10\n\t"
+	"ftrv xmtrx,fv4\n\t"
+	"fmov dr14,@-r3\n\t"
+	"fmov dr12,@-r3\n\t"
+	"add #32,r3\n\t"
+	"fmov @r2+,dr12\n\t"
+	"fmov @r2+,dr14\n\t"
+	"ftrv xmtrx,fv8\n\t"
+	"fmov dr2,@-r3\n\t"
+	"fmov dr0,@-r3\n\t"
+	"add #32,r3\n\t"
+	"ftrv xmtrx,fv12\n\t"
+	"fmov dr6,@-r3\n\t"
+	"fmov dr4,@-r3\n\t"
+	"add #32,r3\n\t"
+	"fmov dr10,@-r3\n\t"
+	"fmov dr8,@-r3\n\t"
+	"add #32,r3\n\t"
+	"fmov dr14,@-r3\n\t"
+	"fmov dr12,@-r3\n\t"
+	"mov.l @(8,r15),r7\n\t"
+	"fmov @r7+,xd0\n\t"
+	"fmov @r7+,xd2\n\t"
+	"fmov @r7+,xd4\n\t"
+	"fmov @r7+,xd6\n\t"
+	"fmov @r7+,xd8\n\t"
+	"fmov @r7+,xd10\n\t"
+	"fmov @r7+,xd12\n\t"
+	"fmov @r7+,xd14\n\t"
+	"fschg\n\t"
+	"add #64,r7\n\t"
+	"fmov.s @r7,fr8\n\t"
+	"mov r5,r2\n\t"
+	"mov r5,r3\n\t"
+	"add #127,r3\n\t"
+	"add #1,r3\n\t"
+	"mov.l @(4,r15),r6\n\t"
+	"add #32,r6\n\t"
+	"fmov.s @r2+,fr0\n\t"
+	"fmov.s @r2+,fr1\n\t"
+	"fmov.s @r2+,fr2\n\t"
+	"fmov.s @r2+,fr3\n\t"
+	"ftrv xmtrx,fv0\n\t"
+	"fmov.s @r3+,fr4\n\t"
+	"fmov.s @r3+,fr5\n\t"
+	"fmov.s @r3+,fr6\n\t"
+	"fadd fr0,fr4\n\t"
+	"fmov.s @r3+,fr7\n\t"
+	"fadd fr1,fr5\n\t"
+	"fmov.s @r2+,fr12\n\t"
+	"fadd fr2,fr6\n\t"
+	"fmov.s @r2+,fr13\n\t"
+	"fadd fr3,fr7\n\t"
+	"fmov.s @r2+,fr14\n\t"
+	"fadd fr0,fr0\n\t"
+	"fmov.s @r2+,fr15\n\t"
+	"fadd fr1,fr1\n\t"
+	"fmov.s @r3+,fr9\n\t"
+	"fadd fr2,fr2\n\t"
+	"fmov.s @r3+,fr10\n\t"
+	"fadd fr3,fr3\n\t"
+	"fmov.s @r3+,fr11\n\t"
+	"fsub fr4,fr0\n\t"
+	"fsub fr5,fr1\n\t"
+	"fsub fr6,fr2\n\t"
+	"fsub fr7,fr3\n\t"
+	"fadd fr8,fr7\n\t"
+	"fadd fr8,fr6\n\t"
+	"fadd fr8,fr5\n\t"
+	"fadd fr8,fr4\n\t"
+	"fadd fr8,fr0\n\t"
+	"mov r6,r7\n\t"
+	"add #-16,r7\n\t"
+	"fadd fr8,fr1\n\t"
+	"fmov.s fr7,@-r7\n\t"
+	"fadd fr8,fr2\n\t"
+	"fmov.s fr6,@-r7\n\t"
+	"fadd fr8,fr3\n\t"
+	"fmov.s fr5,@-r7\n\t"
+	"fmov.s fr4,@-r7\n\t"
+	"ftrv xmtrx,fv12\n\t"
+	"fmov.s fr0,@-r6\n\t"
+	"fmov.s fr1,@-r6\n\t"
+	"fmov.s fr2,@-r6\n\t"
+	"fmov.s fr3,@-r6\n\t"
+	"add #48,r6\n\t"
+	"fadd fr12,fr9\n\t"
+	"fmov.s @r3+,fr4\n\t"
+	"fadd fr13,fr10\n\t"
+	"fmov.s @r2+,fr0\n\t"
+	"fadd fr14,fr11\n\t"
+	"fmov.s @r2+,fr1\n\t"
+	"fadd fr15,fr4\n\t"
+	"fmov.s @r2+,fr2\n\t"
+	"fadd fr12,fr12\n\t"
+	"fmov.s @r2+,fr3\n\t"
+	"fadd fr13,fr13\n\t"
+	"fmov.s @r3+,fr5\n\t"
+	"fadd fr14,fr14\n\t"
+	"fmov.s @r3+,fr6\n\t"
+	"fadd fr15,fr15\n\t"
+	"fmov.s @r3+,fr7\n\t"
+	"fsub fr9,fr12\n\t"
+	"fsub fr10,fr13\n\t"
+	"fsub fr11,fr14\n\t"
+	"fsub fr4,fr15\n\t"
+	"fadd fr8,fr4\n\t"
+	"fadd fr8,fr11\n\t"
+	"fadd fr8,fr10\n\t"
+	"fadd fr8,fr9\n\t"
+	"fadd fr8,fr12\n\t"
+	"mov r6,r7\n\t"
+	"add #-16,r7\n\t"
+	"fadd fr8,fr13\n\t"
+	"fmov.s fr4,@-r7\n\t"
+	"fadd fr8,fr14\n\t"
+	"fmov.s fr11,@-r7\n\t"
+	"fadd fr8,fr15\n\t"
+	"fmov.s fr10,@-r7\n\t"
+	"fmov.s fr9,@-r7\n\t"
+	"ftrv xmtrx,fv0\n\t"
+	"fmov.s fr12,@-r6\n\t"
+	"fmov.s fr13,@-r6\n\t"
+	"fmov.s fr14,@-r6\n\t"
+	"fmov.s fr15,@-r6\n\t"
+	"add #48,r6\n\t"
+	"fadd fr0,fr5\n\t"
+	"fmov.s @r3+,fr9\n\t"
+	"fadd fr1,fr6\n\t"
+	"fmov.s @r2+,fr12\n\t"
+	"fadd fr2,fr7\n\t"
+	"fmov.s @r2+,fr13\n\t"
+	"fadd fr3,fr9\n\t"
+	"fmov.s @r2+,fr14\n\t"
+	"fadd fr0,fr0\n\t"
+	"fmov.s @r2+,fr15\n\t"
+	"fadd fr1,fr1\n\t"
+	"fmov.s @r3+,fr4\n\t"
+	"fadd fr2,fr2\n\t"
+	"fmov.s @r3+,fr10\n\t"
+	"fadd fr3,fr3\n\t"
+	"fmov.s @r3+,fr11\n\t"
+	"fsub fr5,fr0\n\t"
+	"fsub fr6,fr1\n\t"
+	"fsub fr7,fr2\n\t"
+	"fsub fr9,fr3\n\t"
+	"fadd fr8,fr9\n\t"
+	"fadd fr8,fr7\n\t"
+	"fadd fr8,fr6\n\t"
+	"fadd fr8,fr5\n\t"
+	"fadd fr8,fr0\n\t"
+	"mov r6,r7\n\t"
+	"add #-16,r7\n\t"
+	"fadd fr8,fr1\n\t"
+	"fmov.s fr9,@-r7\n\t"
+	"fadd fr8,fr2\n\t"
+	"fmov.s fr7,@-r7\n\t"
+	"fadd fr8,fr3\n\t"
+	"fmov.s fr6,@-r7\n\t"
+	"fmov.s fr5,@-r7\n\t"
+	"ftrv xmtrx,fv12\n\t"
+	"fmov.s fr0,@-r6\n\t"
+	"fmov.s fr1,@-r6\n\t"
+	"fmov.s fr2,@-r6\n\t"
+	"fmov.s fr3,@-r6\n\t"
+	"add #48,r6\n\t"
+	"fadd fr12,fr4\n\t"
+	"fmov.s @r3+,fr5\n\t"
+	"fadd fr13,fr10\n\t"
+	"fmov.s @r2+,fr0\n\t"
+	"fadd fr14,fr11\n\t"
+	"fmov.s @r2+,fr1\n\t"
+	"fadd fr15,fr5\n\t"
+	"fmov.s @r2+,fr2\n\t"
+	"fadd fr12,fr12\n\t"
+	"fmov.s @r2+,fr3\n\t"
+	"fadd fr13,fr13\n\t"
+	"fmov.s @r3+,fr6\n\t"
+	"fadd fr14,fr14\n\t"
+	"fmov.s @r3+,fr7\n\t"
+	"fadd fr15,fr15\n\t"
+	"fmov.s @r3+,fr9\n\t"
+	"fsub fr4,fr12\n\t"
+	"fsub fr10,fr13\n\t"
+	"fsub fr11,fr14\n\t"
+	"fsub fr5,fr15\n\t"
+	"fadd fr8,fr5\n\t"
+	"fadd fr8,fr11\n\t"
+	"fadd fr8,fr10\n\t"
+	"fadd fr8,fr4\n\t"
+	"fadd fr8,fr12\n\t"
+	"mov r6,r7\n\t"
+	"add #-16,r7\n\t"
+	"fadd fr8,fr13\n\t"
+	"fmov.s fr5,@-r7\n\t"
+	"fadd fr8,fr14\n\t"
+	"fmov.s fr11,@-r7\n\t"
+	"fadd fr8,fr15\n\t"
+	"fmov.s fr10,@-r7\n\t"
+	"fmov.s fr4,@-r7\n\t"
+	"ftrv xmtrx,fv0\n\t"
+	"fmov.s fr12,@-r6\n\t"
+	"fmov.s fr13,@-r6\n\t"
+	"fmov.s fr14,@-r6\n\t"
+	"fmov.s fr15,@-r6\n\t"
+	"add #48,r6\n\t"
+	"fadd fr0,fr6\n\t"
+	"fmov.s @r3+,fr4\n\t"
+	"fadd fr1,fr7\n\t"
+	"fmov.s @r2+,fr12\n\t"
+	"fadd fr2,fr9\n\t"
+	"fmov.s @r2+,fr13\n\t"
+	"fadd fr3,fr4\n\t"
+	"fmov.s @r2+,fr14\n\t"
+	"fadd fr0,fr0\n\t"
+	"fmov.s @r2+,fr15\n\t"
+	"fadd fr1,fr1\n\t"
+	"fmov.s @r3+,fr5\n\t"
+	"fadd fr2,fr2\n\t"
+	"fmov.s @r3+,fr10\n\t"
+	"fadd fr3,fr3\n\t"
+	"fmov.s @r3+,fr11\n\t"
+	"fsub fr6,fr0\n\t"
+	"fsub fr7,fr1\n\t"
+	"fsub fr9,fr2\n\t"
+	"fsub fr4,fr3\n\t"
+	"fadd fr8,fr4\n\t"
+	"fadd fr8,fr9\n\t"
+	"fadd fr8,fr7\n\t"
+	"fadd fr8,fr6\n\t"
+	"fadd fr8,fr0\n\t"
+	"mov r6,r7\n\t"
+	"add #-16,r7\n\t"
+	"fadd fr8,fr1\n\t"
+	"fmov.s fr4,@-r7\n\t"
+	"fadd fr8,fr2\n\t"
+	"fmov.s fr9,@-r7\n\t"
+	"fadd fr8,fr3\n\t"
+	"fmov.s fr7,@-r7\n\t"
+	"fmov.s fr6,@-r7\n\t"
+	"ftrv xmtrx,fv12\n\t"
+	"fmov.s fr0,@-r6\n\t"
+	"fmov.s fr1,@-r6\n\t"
+	"fmov.s fr2,@-r6\n\t"
+	"fmov.s fr3,@-r6\n\t"
+	"add #48,r6\n\t"
+	"fadd fr12,fr5\n\t"
+	"fmov.s @r3+,fr6\n\t"
+	"fadd fr13,fr10\n\t"
+	"fmov.s @r2+,fr0\n\t"
+	"fadd fr14,fr11\n\t"
+	"fmov.s @r2+,fr1\n\t"
+	"fadd fr15,fr6\n\t"
+	"fmov.s @r2+,fr2\n\t"
+	"fadd fr12,fr12\n\t"
+	"fmov.s @r2+,fr3\n\t"
+	"fadd fr13,fr13\n\t"
+	"fmov.s @r3+,fr4\n\t"
+	"fadd fr14,fr14\n\t"
+	"fmov.s @r3+,fr7\n\t"
+	"fadd fr15,fr15\n\t"
+	"fmov.s @r3+,fr9\n\t"
+	"fsub fr5,fr12\n\t"
+	"fsub fr10,fr13\n\t"
+	"fsub fr11,fr14\n\t"
+	"fsub fr6,fr15\n\t"
+	"fadd fr8,fr6\n\t"
+	"fadd fr8,fr11\n\t"
+	"fadd fr8,fr10\n\t"
+	"fadd fr8,fr5\n\t"
+	"fadd fr8,fr12\n\t"
+	"mov r6,r7\n\t"
+	"add #-16,r7\n\t"
+	"fadd fr8,fr13\n\t"
+	"fmov.s fr6,@-r7\n\t"
+	"fadd fr8,fr14\n\t"
+	"fmov.s fr11,@-r7\n\t"
+	"fadd fr8,fr15\n\t"
+	"fmov.s fr10,@-r7\n\t"
+	"fmov.s fr5,@-r7\n\t"
+	"ftrv xmtrx,fv0\n\t"
+	"fmov.s fr12,@-r6\n\t"
+	"fmov.s fr13,@-r6\n\t"
+	"fmov.s fr14,@-r6\n\t"
+	"fmov.s fr15,@-r6\n\t"
+	"add #48,r6\n\t"
+	"fadd fr0,fr4\n\t"
+	"fmov.s @r3+,fr5\n\t"
+	"fadd fr1,fr7\n\t"
+	"fmov.s @r2+,fr12\n\t"
+	"fadd fr2,fr9\n\t"
+	"fmov.s @r2+,fr13\n\t"
+	"fadd fr3,fr5\n\t"
+	"fmov.s @r2+,fr14\n\t"
+	"fadd fr0,fr0\n\t"
+	"fmov.s @r2+,fr15\n\t"
+	"fadd fr1,fr1\n\t"
+	"fmov.s @r3+,fr6\n\t"
+	"fadd fr2,fr2\n\t"
+	"fmov.s @r3+,fr10\n\t"
+	"fadd fr3,fr3\n\t"
+	"fmov.s @r3+,fr11\n\t"
+	"fsub fr4,fr0\n\t"
+	"fsub fr7,fr1\n\t"
+	"fsub fr9,fr2\n\t"
+	"fsub fr5,fr3\n\t"
+	"fadd fr8,fr5\n\t"
+	"fadd fr8,fr9\n\t"
+	"fadd fr8,fr7\n\t"
+	"fadd fr8,fr4\n\t"
+	"fadd fr8,fr0\n\t"
+	"mov r6,r7\n\t"
+	"add #-16,r7\n\t"
+	"fadd fr8,fr1\n\t"
+	"fmov.s fr5,@-r7\n\t"
+	"fadd fr8,fr2\n\t"
+	"fmov.s fr9,@-r7\n\t"
+	"fadd fr8,fr3\n\t"
+	"fmov.s fr7,@-r7\n\t"
+	"fmov.s fr4,@-r7\n\t"
+	"ftrv xmtrx,fv12\n\t"
+	"fmov.s fr0,@-r6\n\t"
+	"fmov.s fr1,@-r6\n\t"
+	"fmov.s fr2,@-r6\n\t"
+	"fmov.s fr3,@-r6\n\t"
+	"add #48,r6\n\t"
+	"fadd fr12,fr6\n\t"
+	"fmov.s @r3+,fr4\n\t"
+	"fadd fr13,fr10\n\t"
+	"fadd fr14,fr11\n\t"
+	"fadd fr15,fr4\n\t"
+	"fadd fr12,fr12\n\t"
+	"fadd fr13,fr13\n\t"
+	"fadd fr14,fr14\n\t"
+	"fadd fr15,fr15\n\t"
+	"fsub fr6,fr12\n\t"
+	"fsub fr10,fr13\n\t"
+	"fsub fr11,fr14\n\t"
+	"fsub fr4,fr15\n\t"
+	"fadd fr8,fr4\n\t"
+	"fadd fr8,fr11\n\t"
+	"fadd fr8,fr10\n\t"
+	"fadd fr8,fr6\n\t"
+	"fadd fr8,fr12\n\t"
+	"mov r6,r7\n\t"
+	"add #-16,r7\n\t"
+	"fadd fr8,fr13\n\t"
+	"fmov.s fr4,@-r7\n\t"
+	"fadd fr8,fr14\n\t"
+	"fmov.s fr11,@-r7\n\t"
+	"fadd fr8,fr15\n\t"
+	"fmov.s fr10,@-r7\n\t"
+	"fmov.s fr6,@-r7\n\t"
+	"fmov.s fr12,@-r6\n\t"
+	"fmov.s fr13,@-r6\n\t"
+	"fmov.s fr14,@-r6\n\t"
+	"fmov.s fr15,@-r6\n\t"
+	"add #12,r15\n\t"
+	"fmov.s @r15+,fr15\n\t"
+	"fmov.s @r15+,fr14\n\t"
+	"fmov.s @r15+,fr13\n\t"
+	"fmov.s @r15+,fr12\n\t"
+	"mov.l @r15+,r14\n\t"
+	"mov.l @r15+,r13\n\t"
+	"mov.l @r15+,r12\n\t"
+	"mov.l @r15+,r11\n\t"
+	"mov.l @r15+,r10\n\t"
+	"mov.l @r15+,r9\n\t"
+	"rts\n\t"
+	"mov.l @r15+,r8\n"
+	"\t.text\n"
+);
+
+
+
 static inline uint8_t plm_clamp(int n) {
 	return clamp_table[n];
 }
@@ -3269,9 +4081,39 @@ void plm_video_decode_motion_vectors(plm_video_t *self);
 void plm_video_predict_macroblock(plm_video_t *self);
 void plm_video_copy_macroblock(uint32_t *dest, plm_frame_t *reference, int motion_h, int motion_v);
 void plm_video_interpolate_macroblock(uint32_t *dest, plm_frame_t *reference, int motion_h, int motion_v);
-void plm_video_scatter_macroblock(plm_video_t *self);
-void plm_video_decode_block(plm_video_t *self, int block, uint32_t *mb_display);
-void plm_video_idct(int *block);
+// Dequantise one AC coefficient (or a non-intra DC); qm = quantizer_scale * matrix entry.
+static inline int plm_dequant(int level, int qm, int non_intra) {
+	// ISO/IEC 11172-2: (2 level + Sign(level)*non_intra) * q * W / 16 with truncation toward zero,
+	// then even values move one step toward zero, then clip to [-2048, 2047]
+	int neg = level < 0;
+	int m = neg ? -level : level;
+	m = ((2 * m + non_intra) * qm) >> 4;
+	if (m > 0 && (m & 1) == 0) {
+		m--;
+	}
+	if (m > 2047) {
+		m = neg ? 2048 : 2047;
+	}
+	return neg ? -m : m;
+}
+static int plm_video_decode_mb_coefs(plm_video_t *self, int cbp);
+static void plm_video_output_block(plm_video_t *self, int block, uint32_t *mb_display, float *coefs, int n);
+#ifndef PLM_HOT
+// Per-macroblock functions share one section so they sit together and contend for the SH-4's
+// 8 KB direct-mapped instruction cache predictably instead of being scattered across .text.
+#define PLM_HOT __attribute__((section(".text.plm_hot")))
+#endif
+
+// Allocate the 12 cache lines of a macroblock's 384-byte display entry without reading memory
+// (SH-4 movca.l). Only for entries that are then completely overwritten: motion-compensated
+// prediction and intra macroblocks (all six blocks coded). Saves 12 line fills per macroblock.
+static inline __attribute__((always_inline)) void plm_mb_alloc_lines(uint32_t *d) {
+	register uint32_t z __asm__("r0") = 0;
+	for (int i = 0; i < 96; i += 8) {
+		__asm__ __volatile__("movca.l %0,@%1" : : "z"(z), "r"(d + i) : "memory");
+	}
+}
+
 
 static inline void plm_video_advance_macroblock(plm_video_t *self) {
 	self->macroblock_address++;
@@ -3282,13 +4124,743 @@ static inline void plm_video_advance_macroblock(plm_video_t *self) {
 	}
 }
 
+
+// ---------------------------------------------------------------------------
+// SH-4 assembly output stage for one 8x8 block (64 contiguous bytes at d) with the float IDCT.
+// cl is the clamp table pointer biased by -0x4b400000, r the IDCT results as float bit
+// patterns 0x4b400000 + value (zeroed afterwards with 64-bit stores, ready for the next block):
+//   plm_sh4_out_add(d, r, cl):  d[i] = cl[d[i] + r[i]]   (predicted block plus residual)
+//   plm_sh4_out_put(d, r, cl):  d[i] = cl[r[i]]          (intra block)
+//   plm_sh4_out_dc(d, clv):     d[i] = clv[d[i]]         (DC-only residual; clv = clamp + DC value)
+// Two pixels are interleaved so the indexed clamp loads (which need r0) do not serialise the loop.
+void plm_sh4_out_add(uint8_t *d, uint32_t *r, const uint8_t *cl);
+void plm_sh4_out_put(uint8_t *d, uint32_t *r, const uint8_t *cl);
+void plm_sh4_out_dc(uint8_t *d, const uint8_t *clv);
+#define PLM_SH4_ZERO256 /* r5 = end of the 256-byte block: 32 paired zero stores */ \
+"	fschg\n" \
+"	fldi0	fr0\n" \
+"	fldi0	fr1\n" \
+"	mov	#8,r1\n" \
+"1:\n" \
+"	fmov	dr0,@-r5\n" \
+"	fmov	dr0,@-r5\n" \
+"	dt	r1\n" \
+"	fmov	dr0,@-r5\n" \
+"	bf/s	1b\n" \
+"	fmov	dr0,@-r5\n" \
+"	fschg\n"
+__asm__(
+"	.section .text.plm_hot,\"ax\"\n"
+"	.align	5\n"
+"	.global	_plm_sh4_out_add\n"
+"_plm_sh4_out_add:\n"
+/* 4 pixels per iteration. The four prediction bytes come from one word (r1, shifted down a byte at
+   a time); each clamp load is indexed, r0 = residual plus (cl + prediction), so one add per pixel.
+   The results (r8-r11) are stored during the next iteration, backwards from the group's end (r12),
+   which lets the stores pair with the next group's arithmetic: the first group is computed before
+   the loop and the last one stored after it. Order from the SH7091 pipeline model (16 cycles per
+   iteration; the previous loop was 19). */
+"	mov.l	r8,@-r15\n"
+"	mov.l	r9,@-r15\n"
+"	mov.l	r10,@-r15\n"
+"	mov.l	r11,@-r15\n"
+"	mov.l	r12,@-r15\n"
+"	mov	r4,r12\n"
+"	add	#4,r12\n"
+"	mov	#15,r7\n"
+"	mov.l	@r4+,r1\n"
+"	mov.l	@r5+,r0\n"
+"	extu.b	r1,r2\n"
+"	shlr8	r1\n"
+"	add	r6,r2\n"
+"	mov.b	@(r0,r2),r8\n"
+"	mov.l	@r5+,r0\n"
+"	extu.b	r1,r3\n"
+"	shlr8	r1\n"
+"	add	r6,r3\n"
+"	mov.b	@(r0,r3),r9\n"
+"	mov.l	@r5+,r0\n"
+"	extu.b	r1,r2\n"
+"	shlr8	r1\n"
+"	add	r6,r2\n"
+"	mov.b	@(r0,r2),r10\n"
+"	mov.l	@r5+,r0\n"
+"	add	r6,r1\n"
+"	mov.b	@(r0,r1),r11\n"
+"2:\n"
+"	mov.l	@r4+,r1\n"
+"	mov.l	@r5+,r0\n"
+"	extu.b	r1,r2\n"
+"	mov.b	r11,@-r12\n"
+"	mov.b	r10,@-r12\n"
+"	shlr8	r1\n"
+"	add	r6,r2\n"
+"	mov.b	r9,@-r12\n"
+"	mov.b	r8,@-r12\n"
+"	extu.b	r1,r3\n"
+"	shlr8	r1\n"
+"	mov.b	@(r0,r2),r8\n"
+"	mov.l	@r5+,r0\n"
+"	add	#8,r12\n"
+"	add	r6,r3\n"
+"	dt	r7\n"
+"	mov.b	@(r0,r3),r9\n"
+"	extu.b	r1,r2\n"
+"	mov.l	@r5+,r0\n"
+"	add	r6,r2\n"
+"	shlr8	r1\n"
+"	mov.b	@(r0,r2),r10\n"
+"	mov.l	@r5+,r0\n"
+"	add	r6,r1\n"
+"	bf/s	2b\n"
+"	mov.b	@(r0,r1),r11\n"
+"	mov.b	r11,@-r12\n"
+"	mov.b	r10,@-r12\n"
+"	mov.b	r9,@-r12\n"
+"	mov.b	r8,@-r12\n"
+PLM_SH4_ZERO256
+"	mov.l	@r15+,r12\n"
+"	mov.l	@r15+,r11\n"
+"	mov.l	@r15+,r10\n"
+"	mov.l	@r15+,r9\n"
+"	rts\n"
+"	mov.l	@r15+,r8\n"
+"	.align	5\n"
+"	.global	_plm_sh4_out_put\n"
+"_plm_sh4_out_put:\n"
+/* 4 pixels per iteration: r0-r3 hold residual, then clamp address, then result. Order from the
+   SH7091 pipeline model (12 cycles per iteration). */
+"	mov	#16,r7\n"
+"2:\n"
+"	mov.l	@r5+,r0\n"
+"	dt	r7\n"
+"	mov.l	@r5+,r1\n"
+"	add	r6,r0\n"
+"	mov.l	@r5+,r2\n"
+"	add	r6,r1\n"
+"	mov.l	@r5+,r3\n"
+"	mov.b	@r0,r0\n"
+"	add	r6,r2\n"
+"	mov.b	@r1,r1\n"
+"	mov.b	r0,@r4\n"
+"	add	#1,r4\n"
+"	mov.b	r1,@r4\n"
+"	add	#1,r4\n"
+"	mov.b	@r2,r2\n"
+"	add	r6,r3\n"
+"	mov.b	@r3,r3\n"
+"	mov.b	r2,@r4\n"
+"	add	#1,r4\n"
+"	mov.b	r3,@r4\n"
+"	bf/s	2b\n"
+"	add	#1,r4\n"
+PLM_SH4_ZERO256
+"	rts\n"
+"	nop\n"
+"	.align	5\n"
+"	.global	_plm_sh4_out_dc\n"
+"_plm_sh4_out_dc:\n"
+/* 4 pixels per iteration, as plm_sh4_out_add: the prediction bytes come from one word (r1), each
+   clamp load is indexed with the byte in r0 (the last one through r1 itself), and the results
+   (r2, r3, r8, r9) are stored during the next iteration, backwards from the group's end (r6).
+   12 cycles per iteration in the SH7091 pipeline model; the previous loop was 15. */
+"	mov.l	r8,@-r15\n"
+"	mov.l	r9,@-r15\n"
+"	mov	r4,r6\n"
+"	add	#4,r6\n"
+"	mov	#15,r7\n"
+"	mov.l	@r4+,r1\n"
+"	extu.b	r1,r0\n"
+"	shlr8	r1\n"
+"	mov.b	@(r0,r5),r2\n"
+"	extu.b	r1,r0\n"
+"	shlr8	r1\n"
+"	mov.b	@(r0,r5),r3\n"
+"	extu.b	r1,r0\n"
+"	shlr8	r1\n"
+"	mov.b	@(r0,r5),r8\n"
+"	add	r5,r1\n"
+"	mov.b	@r1,r9\n"
+"2:\n"
+"	mov.l	@r4+,r1\n"
+"	mov.b	r9,@-r6\n"
+"	mov.b	r8,@-r6\n"
+"	dt	r7\n"
+"	mov.b	r3,@-r6\n"
+"	extu.b	r1,r0\n"
+"	shlr8	r1\n"
+"	mov.b	r2,@-r6\n"
+"	mov.b	@(r0,r5),r2\n"
+"	extu.b	r1,r0\n"
+"	shlr8	r1\n"
+"	mov.b	@(r0,r5),r3\n"
+"	extu.b	r1,r0\n"
+"	shlr8	r1\n"
+"	mov.b	@(r0,r5),r8\n"
+"	add	#8,r6\n"
+"	add	r5,r1\n"
+"	bf/s	2b\n"
+"	mov.b	@r1,r9\n"
+"	mov.b	r9,@-r6\n"
+"	mov.b	r8,@-r6\n"
+"	mov.b	r3,@-r6\n"
+"	mov.b	r2,@-r6\n"
+"	mov.l	@r15+,r9\n"
+"	rts\n"
+"	mov.l	@r15+,r8\n"
+"	.text\n"
+);
+
+// ---------------------------------------------------------------------------
+// SH-4 assembly: all DCT coefficients of one macroblock. For every block set in cbp
+// it decodes the intra DC (size code, differential, predictor) or the first non-intra token, then
+// the AC tokens up to end_of_block, dequantised exactly as the C loop and stored as floats in
+// blocks[b] (float-IDCT layout); nb[b] = index after the last coefficient. The bit reader keeps
+// two 32-bit words. Codes longer than the 9-bit table return status 1 with b, n and P
+// at the code; C decodes that token and calls again with resume = 1. 0 = done, -1 = invalid.
+int plm_sh4_mb_coefs(plm_mbc_t *st);
+__asm__(
+"	.section .text.plm_hot,\"ax\"\n"
+"	.align	5\n"
+"	.global	_plm_sh4_mb_coefs\n"
+"_plm_sh4_mb_coefs:\n"
+"	mov.l	r8,@-r15\n"
+"	mov.l	r9,@-r15\n"
+"	mov.l	r10,@-r15\n"
+"	mov.l	r11,@-r15\n"
+"	mov.l	r12,@-r15\n"
+"	mov.l	r13,@-r15\n"
+"	mov.l	r14,@-r15\n"
+"	mov.l	r4,@-r15\n"          /* @r15 = ctx */
+"	mov.l	@(0,r4),r2\n"        /* P */
+"	mov.l	@(4,r4),r6\n"        /* base */
+"	mov.l	@(8,r4),r7\n"        /* mask */
+"	mov	r2,r0\n"
+"	shlr2	r0\n"
+"	shlr2	r0\n"
+"	shlr	r0\n"
+"	shll2	r0\n"                /* byte index of the word holding bit P */
+"	mov	r0,r8\n"
+"	and	r7,r0\n"
+"	mov.l	@(r0,r6),r1\n"
+"	mov	r8,r0\n"
+"	add	#4,r0\n"
+"	and	r7,r0\n"
+"	mov.l	@(r0,r6),r0\n"
+"	swap.b	r1,r1\n"
+"	swap.w	r1,r1\n"
+"	swap.b	r1,r1\n"
+"	mov	#31,r3\n"
+"	and	r2,r3\n"             /* bits consumed in that word */
+"	shld	r3,r1\n"             /* cur */
+"	add	#-32,r3\n"           /* c */
+"	mov	r0,r2\n"
+"	swap.b	r2,r2\n"
+"	swap.w	r2,r2\n"
+"	swap.b	r2,r2\n"             /* nxt */
+"	add	#8,r8\n"             /* widx */
+"	mov.l	@(16,r4),r9\n"        /* REST */
+"	mov.w	.Lm_2047,r11\n"
+"	mov	#-23,r12\n"
+"	mov.l	@(28,r4),r13\n"       /* ni */
+"	mov.l	@(56,r4),r0\n"
+"	tst	r0,r0\n"
+"	bt	.Lm_next\n"
+"	mov.l	@(48,r4),r0\n"        /* resume block b at n */
+"	shll8	r0\n"
+"	mov.l	@(36,r4),r10\n"
+"	add	r0,r10\n"
+"	mov.l	@(52,r4),r5\n"
+"	mov.l	@(24,r4),r0\n"
+"	shll2	r5\n"
+"	add	r0,r5\n"                /* qz + 4n */
+"	bra	.Lm_first\n"
+"	mov	r9,r4\n"
+"	.align	2\n"
+".Lm_2047:\n"
+"	.short	2047\n"
+"	.short	0\n"
+".Lm_done_near:\n"
+"	bra	.Lm_done\n"
+"	nop\n"
+".Lm_next:\n"                 /* next coded block */
+"	mov.l	@r15,r4\n"
+"	mov.l	@(48,r4),r0\n"
+".Lm_next2:\n"                /* r4 = ctx, r0 = b */
+"	mov.l	@(32,r4),r6\n"       /* blocks still to decode, the next one in bit 31 */
+"	tst	r6,r6\n"
+"	bt	.Lm_done_near\n"
+"1:\n"
+"	shll	r6\n"
+"	bf/s	1b\n"
+"	add	#1,r0\n"
+"	mov.l	r6,@(32,r4)\n"
+"	mov.l	r0,@(48,r4)\n"
+"	mov	r0,r7\n"
+"	shll8	r7\n"
+"	mov.l	@(36,r4),r10\n"
+"	add	r7,r10\n"               /* blocks[b] */
+"	mov.l	@(24,r4),r5\n"        /* qz entry of coefficient 0 */
+"	tst	r13,r13\n"
+"	bt/s	.Lm_first\n"           /* non-intra (r13 = 0): first token from the FIRST table */
+"	mov.l	@(12,r4),r4\n"
+/* intra DC: plane = b < 4 ? 0 : b - 3 */
+"	mov	#0,r5\n"
+"	mov	#3,r7\n"
+"	cmp/gt	r7,r0\n"
+"	bf	1f\n"
+"	mov	r0,r5\n"
+"	add	#-3,r5\n"
+"1:\n"
+"	mov.l	@r15,r4\n"
+"	mov.l	@(44,r4),r7\n"
+"	mov	r5,r0\n"
+"	shll8	r0\n"
+"	shll2	r0\n"
+"	add	r0,r7\n"                /* this plane's 256-entry dct_dc_size table */
+"	shll2	r5\n"                 /* predictor offset */
+"	mov	r2,r0\n"
+"	shld	r3,r0\n"
+"	or	r1,r0\n"
+"	shlr16	r0\n"
+"	shlr8	r0\n"
+"	shll2	r0\n"
+"	mov.l	@(r0,r7),r7\n"        /* size | len << 16 | leaf << 24 */
+"	extu.b	r7,r6\n"             /* dct_dc_size */
+"	shlr16	r7\n"
+"	extu.b	r7,r0\n"             /* code length */
+"	add	r0,r3\n"
+"	cmp/pz	r3\n"
+"	bt/s	.Lm_x1\n"
+"	shld	r0,r1\n"
+".Lm_c1:\n"
+"	mov	#0,r7\n"                /* differential */
+"	tst	r6,r6\n"
+"	bt	.Lm_dcz\n"
+"	mov	r2,r0\n"
+"	shld	r3,r0\n"
+"	or	r1,r0\n"
+"	mov	r6,r14\n"
+"	add	#-32,r14\n"
+"	shld	r14,r0\n"              /* the top dct_dc_size bits */
+"	mov	r0,r7\n"
+"	mov	r6,r14\n"
+"	neg	r14,r14\n"
+"	add	#1,r14\n"
+"	shld	r14,r0\n"              /* their leading bit */
+"	tst	#1,r0\n"
+"	bf	.Lm_dcp\n"
+"	mov	#1,r14\n"
+"	shld	r6,r14\n"
+"	sub	r14,r7\n"
+"	add	#1,r7\n"                /* leading 0: bits - (2^size - 1) */
+".Lm_dcp:\n"
+"	mov	r6,r0\n"
+"	add	r0,r3\n"
+"	cmp/pz	r3\n"
+"	bt/s	.Lm_x2\n"
+"	shld	r0,r1\n"
+".Lm_dcz:\n"
+"	mov.l	@r15,r4\n"
+"	mov.l	@(40,r4),r14\n"
+"	mov	r5,r0\n"
+"	mov.l	@(r0,r14),r6\n"
+"	add	r7,r6\n"                /* dc = predictor + differential */
+"	mov.l	r6,@(r0,r14)\n"
+"	shll2	r6\n"
+"	add	r6,r6\n"                /* * 8 */
+"	lds	r6,fpul\n"
+"	mov.l	@(24,r4),r5\n"
+"	float	fpul,fr0\n"
+"	add	#4,r5\n"                /* qz entry of coefficient 1 */
+"	fmov.s	fr0,@r10\n"
+"	mov	r9,r4\n"
+".Lm_first:\n"                /* look up the next token with table r4: r14 = its entry */
+"	mov	r2,r14\n"
+"	shld	r3,r14\n"
+"	or	r1,r14\n"
+"	shld	r12,r14\n"
+"	shll2	r14\n"
+"	add	r4,r14\n"
+/* A token with nothing pending (the first of a block, or one found in the second or third level):
+   load its entry as .Lm_tok does. */
+".Lm_tok_np:\n"
+"	mov.b	@r14+,r7\n"           /* 4 * run */
+"	add	r7,r5\n"                /* this coefficient's qz entry */
+"	mov.b	@r14+,r7\n"           /* length, or kind */
+"	mov.b	@r14+,r6\n"           /* 2|level| + 1 */
+"	cmp/pz	r7\n"
+"	bt/s	.Lm_tokx\n"
+"	mov.b	@r14+,r4\n"           /* sign */
+".Lm_special:\n"              /* r7 = kind; nothing consumed, nothing pending */
+"	mov	r7,r0\n"
+"	tst	#1,r0\n"
+"	bt	.Lm_special2\n"
+"	mov	#2,r0\n"                /* end_of_block: consume 2 bits, record n, next block */
+"	add	r0,r3\n"
+"	cmp/pz	r3\n"
+"	bt/s	.Lm_x3\n"
+"	shld	r0,r1\n"
+".Lm_c3:\n"
+"	mov.l	@r15,r4\n"
+"	mov.l	@(24,r4),r0\n"
+"	mov	r4,r6\n"
+"	sub	r0,r5\n"
+"	mov.l	@(48,r4),r0\n"
+"	shlr2	r5\n"                 /* n = index after the last coefficient */
+"	add	#64,r6\n"
+"	bra	.Lm_next2\n"
+"	mov.b	r5,@(r0,r6)\n"
+/* The token loop, one coefficient per pass, in the order the SH7091 pipeline model scores best
+   (26 cycles). MPEG-1: v = (2|level| + non_intra) * q * W / 16 (truncating), even v -> v - 1 (0
+   stays 0), sign restored, clipped to [-2048, 2047].
+   The previous coefficient is finished while this token's table entry loads: on entry r6 = its
+   magnitude after oddification and the clip test, r4 = its sign, r0 = its block offset; the sign,
+   the conversion to float and the store pair with the four byte loads. The store is done before
+   the special-entry branch, so every exit from the loop leaves nothing pending.
+   r5 walks the qz table (quantiser product, block offset per coefficient index); an index past 63
+   reads an entry whose offset is negative. r14 holds the entry pointer, then the next token's
+   window. r11 = 2047, r12 = -23. */
+".Lm_tok:\n"
+"	xor	r4,r6\n"
+"	sub	r4,r6\n"                /* sign */
+"	mov.b	@r14+,r7\n"           /* 4 * run */
+"	lds	r6,fpul\n"
+"	add	r7,r5\n"                /* this coefficient's qz entry */
+"	mov.b	@r14+,r7\n"           /* length, or kind */
+"	float	fpul,fr0\n"
+"	mov.b	@r14+,r6\n"           /* 2|level| + 1 */
+"	mov.b	@r14+,r4\n"           /* sign */
+"	cmp/pz	r7\n"
+"	fmov.s	fr0,@(r0,r10)\n"
+"	bf	.Lm_special\n"
+".Lm_tokx:\n"                 /* r7 = length, r6 = 2|level| + 1, r4 = sign, r5 = qz entry */
+"	mov.w	@r5+,r0\n"            /* q * W */
+"	add	r7,r3\n"
+"	cmp/pz	r3\n"
+"	add	r13,r6\n"               /* 2|level| + 1, or 2|level| intra (r13 = -1) */
+"	mul.l	r0,r6\n"
+"	bt/s	.Lm_cross\n"
+"	shld	r7,r1\n"
+".Lm_consumed:\n"
+"	mov	r2,r14\n"               /* look up the next token now; it is loaded at the top of the next pass */
+"	sts	macl,r6\n"
+"	shld	r3,r14\n"
+"	mov.w	@r5+,r0\n"            /* block offset; r5 = next index's entry */
+"	or	r1,r14\n"
+"	cmp/pz	r0\n"                /* negative: coefficient index past 63 */
+"	shlr2	r6\n"
+"	shlr2	r6\n"
+"	bf	.Lm_inv_near\n"
+"	cmp/pl	r6\n"
+"	shld	r12,r14\n"
+"	movt	r7\n"
+"	sub	r7,r6\n"
+"	or	r7,r6\n"                 /* oddify toward zero */
+"	shll2	r14\n"
+"	cmp/gt	r11,r6\n"
+"	bt	.Lm_hi\n"
+".Lm_hi_back:\n"
+"	bra	.Lm_tok\n"
+"	add	r9,r14\n"
+".Lm_hi:\n"                   /* magnitude that the sign step turns into 2047, or -2048 */
+"	mov	r11,r6\n"
+"	bra	.Lm_hi_back\n"
+"	sub	r4,r6\n"
+".Lm_inv_near:\n"
+"	bra	.Lm_invalid\n"
+"	nop\n"
+".Lm_cross:\n"
+"	mov	r2,r1\n"
+"	shld	r3,r1\n"
+"	mov.l	@r15,r2\n"
+"	mov.l	@(8,r2),r0\n"
+"	mov.l	@(4,r2),r2\n"
+"	and	r8,r0\n"
+"	mov.l	@(r0,r2),r2\n"
+"	add	#4,r8\n"
+"	swap.b	r2,r2\n"
+"	swap.w	r2,r2\n"
+"	swap.b	r2,r2\n"
+"	bra	.Lm_consumed\n"
+"	add	#-32,r3\n"
+".Lm_x1:\n"
+"	mov	r2,r1\n"
+"	shld	r3,r1\n"
+"	mov.l	@r15,r2\n"
+"	mov.l	@(8,r2),r0\n"
+"	mov.l	@(4,r2),r2\n"
+"	and	r8,r0\n"
+"	mov.l	@(r0,r2),r2\n"
+"	add	#4,r8\n"
+"	swap.b	r2,r2\n"
+"	swap.w	r2,r2\n"
+"	swap.b	r2,r2\n"
+"	bra	.Lm_c1\n"
+"	add	#-32,r3\n"
+".Lm_x2:\n"
+"	mov	r2,r1\n"
+"	shld	r3,r1\n"
+"	mov.l	@r15,r2\n"
+"	mov.l	@(8,r2),r0\n"
+"	mov.l	@(4,r2),r2\n"
+"	and	r8,r0\n"
+"	mov.l	@(r0,r2),r2\n"
+"	add	#4,r8\n"
+"	swap.b	r2,r2\n"
+"	swap.w	r2,r2\n"
+"	swap.b	r2,r2\n"
+"	bra	.Lm_dcz\n"
+"	add	#-32,r3\n"
+".Lm_x3:\n"
+"	mov	r2,r1\n"
+"	shld	r3,r1\n"
+"	mov.l	@r15,r2\n"
+"	mov.l	@(8,r2),r0\n"
+"	mov.l	@(4,r2),r2\n"
+"	and	r8,r0\n"
+"	mov.l	@(r0,r2),r2\n"
+"	add	#4,r8\n"
+"	swap.b	r2,r2\n"
+"	swap.w	r2,r2\n"
+"	swap.b	r2,r2\n"
+"	bra	.Lm_c3\n"
+"	add	#-32,r3\n"
+".Lm_special2:\n"             /* r0 = kind */
+"	tst	#2,r0\n"
+"	bf	.Lm_esc\n"
+"	tst	#4,r0\n"
+"	bf	.Lm_long\n"
+"	tst	#8,r0\n"
+"	bf	.Lm_l3\n"
+"	mov.l	@r15,r4\n"            /* not a valid code: C reports it */
+"	mov.l	@(24,r4),r0\n"
+"	sub	r0,r5\n"
+"	shlr2	r5\n"
+"	mov.l	r5,@(52,r4)\n"
+"	bra	.Lm_exit\n"
+"	mov	#1,r6\n"
+".Lm_esc:\n"                  /* escape: 6 bits, run 6 bits, level 8 or 16 bits */
+"	mov	r2,r0\n"
+"	shld	r3,r0\n"
+"	or	r1,r0\n"
+"	mov	r0,r6\n"
+"	shlr8	r6\n"
+"	shlr2	r6\n"
+"	shlr2	r6\n"
+"	extu.b	r6,r14\n"
+"	shlr8	r6\n"
+"	mov	#63,r7\n"
+"	and	r6,r7\n"
+"	shll2	r7\n"
+"	add	r7,r5\n"                /* this coefficient's qz entry */
+"	tst	r14,r14\n"
+"	bt	.Lm_esc0\n"
+"	exts.b	r14,r6\n"
+"	cmp/pz	r6\n"
+"	bt	.Lm_esc_pos\n"
+"	mov	r6,r14\n"
+"	mov	#-128,r6\n"
+"	cmp/eq	r6,r14\n"
+"	bt	.Lm_esc128\n"
+".Lm_esc_pos:\n"
+"	mov	#20,r7\n"
+".Lm_esc_enc:\n"              /* r14 = signed level, r7 = length */
+"	mov	r14,r4\n"
+"	shll	r4\n"
+"	subc	r4,r4\n"               /* sign */
+"	mov	r14,r6\n"
+"	xor	r4,r6\n"
+"	sub	r4,r6\n"                /* |level| */
+"	add	r6,r6\n"
+"	bra	.Lm_tokx\n"
+"	add	#1,r6\n"
+".Lm_esc0:\n"
+"	shlr2	r0\n"
+"	shlr2	r0\n"
+"	extu.b	r0,r14\n"
+"	bra	.Lm_esc_enc\n"
+"	mov	#28,r7\n"
+".Lm_esc128:\n"
+"	shlr2	r0\n"
+"	shlr2	r0\n"
+"	extu.b	r0,r14\n"
+"	mov.w	.Lm_256,r6\n"
+"	sub	r6,r14\n"
+"	bra	.Lm_esc_enc\n"
+"	mov	#28,r7\n"
+".Lm_long:\n"                 /* the code starts 000000: second-level table on the next 8 bits */
+"	mov	r2,r0\n"
+"	shld	r3,r0\n"
+"	or	r1,r0\n"
+"	mov.l	@r15,r4\n"
+"	shll2	r0\n"
+"	shll2	r0\n"
+"	shll2	r0\n"
+"	mov.l	@(60,r4),r7\n"
+"	shlr16	r0\n"
+"	shlr8	r0\n"
+"	shll2	r0\n"
+"	add	r7,r0\n"
+"	bra	.Lm_tok_np\n"           /* up to 13 bits + sign: an ordinary token */
+"	mov	r0,r14\n"
+".Lm_l3:\n"                   /* starts with nine zeros: third level on bits 9..16 (l2 + 1024) */
+"	mov	r2,r0\n"
+"	shld	r3,r0\n"
+"	or	r1,r0\n"
+"	mov.l	@r15,r4\n"
+"	shll8	r0\n"
+"	shll	r0\n"
+"	mov.l	@(60,r4),r7\n"
+"	shlr16	r0\n"
+"	shlr8	r0\n"
+"	mov.w	.Lm_1024,r6\n"
+"	shll2	r0\n"
+"	add	r6,r7\n"
+"	add	r7,r0\n"
+"	bra	.Lm_tok_np\n"           /* 14 to 16 bits + sign */
+"	mov	r0,r14\n"
+".Lm_invalid:\n"
+"	bra	.Lm_exit\n"
+"	mov	#-1,r6\n"
+".Lm_done:\n"
+"	mov	#0,r6\n"
+".Lm_exit:\n"
+"	mov.l	@r15+,r4\n"
+"	add	#-8,r8\n"
+"	shll2	r8\n"
+"	shll	r8\n"                  /* (widx - 8) * 8 */
+"	add	#32,r3\n"
+"	add	r3,r8\n"
+"	mov.l	r8,@(0,r4)\n"         /* P */
+"	mov	r6,r0\n"
+"	mov.l	@r15+,r14\n"
+"	mov.l	@r15+,r13\n"
+"	mov.l	@r15+,r12\n"
+"	mov.l	@r15+,r11\n"
+"	mov.l	@r15+,r10\n"
+"	mov.l	@r15+,r9\n"
+"	rts\n"
+"	mov.l	@r15+,r8\n"
+"	.align	2\n"
+".Lm_1024:\n"
+"	.short	1024\n"
+".Lm_256:\n"
+"	.short	256\n"
+"	.text\n"
+);
+
+// Macroblock-level codes: 8-bit tables (1 KB each) resolve almost every code in one lookup.
+#define PLM_MB_LUT_BITS 8
+// Tables used for every macroblock, in one block at a fixed place in the 16 KB direct-mapped
+// D-cache. Without this, adding or resizing any static moved them, and when one landed on the same
+// cache lines as the stack (which KOS puts just below 0x8d000000, the top of the cache's 16 KB
+// window) decoding was up to 10% slower with no code change. The block takes cache offsets
+// 0..~13.3 KB; the top 2.7 KB are left to the stack of a decoder running on the main thread.
+#ifndef PLM_HOT_TABLE_ALIGN
+#define PLM_HOT_TABLE_ALIGN 16384
+#endif
+typedef struct {
+	plm_coef_lut_t coef_rest[1 << PLM_COEF_LUT_BITS];     // 0x0000 2 KB
+	plm_coef_lut_t coef_first[1 << PLM_COEF_LUT_BITS];    // 0x0800 2 KB
+	plm_coef_lut_t coef_l2[1 << PLM_COEF_L2_BITS];        // 0x1000 1 KB
+	plm_coef_lut_t coef_l3[256];                          // 0x1400 1 KB, must follow coef_l2 (the assembly uses l2 + 1024)
+	uint8_t clamp_wide[1024];                             // 0x1800 clamps -384..639
+	plm_vlc_lut_t dct_size[3][1 << PLM_MB_LUT_BITS];      // 0x1c00 3 KB
+	plm_vlc_lut_t cbp[1 << PLM_MB_LUT_BITS];              // 0x2800
+	plm_vlc_lut_t mb_addr_inc[1 << PLM_MB_LUT_BITS];      // 0x2c00
+	plm_vlc_lut_t motion[1 << PLM_MB_LUT_BITS];           // 0x3000
+	float fidct_mtx[36] __attribute__((aligned(32)));     // 0x3400
+	uint8_t fidct_zz_pos[128];                            // 0x3490 zigzag scan index -> float block position; 64..127: 0x80 (invalid)
+} plm_hot_tables_t;
+static plm_hot_tables_t plm_hot_tables __attribute__((aligned(PLM_HOT_TABLE_ALIGN)));
+#define PLM_VIDEO_COEF_REST_LUT (plm_hot_tables.coef_rest)
+#define PLM_VIDEO_COEF_FIRST_LUT (plm_hot_tables.coef_first)
+#define PLM_VIDEO_COEF_L2_LUT (plm_hot_tables.coef_l2)
+#define PLM_VIDEO_COEF_L3_LUT (plm_hot_tables.coef_l3)
+#define plm_clamp_wide_table (plm_hot_tables.clamp_wide)
+#define PLM_VIDEO_DCT_SIZE_LUT (plm_hot_tables.dct_size)
+#define PLM_VIDEO_CBP_LUT (plm_hot_tables.cbp)
+#define PLM_VIDEO_MB_ADDR_INC_LUT (plm_hot_tables.mb_addr_inc)
+#define PLM_VIDEO_MOTION_LUT (plm_hot_tables.motion)
+#define plm_fidct_mtx (plm_hot_tables.fidct_mtx)
+#define plm_fidct_zz_pos (plm_hot_tables.fidct_zz_pos)
+// Used once per picture type, or only for the rare codes longer than the coefficient tables.
+__attribute__((aligned(32))) static plm_vlc_lut_t PLM_VIDEO_MB_TYPE_LUT[4][1 << PLM_MB_LUT_BITS];
+__attribute__((aligned(32))) static plm_vlc_lut_t PLM_VIDEO_DCT_COEFF_LUT[1 << PLM_VLC_LUT_BITS];
+static int plm_video_luts_ready = 0;
+
+static void plm_video_init_luts(void) {
+	if (plm_video_luts_ready) {
+		return;
+	}
+	plm_vlc_lut_build((const plm_vlc_t *)PLM_VIDEO_DCT_COEFF, PLM_VIDEO_DCT_COEFF_LUT);
+	plm_fidct_init(plm_fidct_mtx);
+	for (int n = 0; n < 128; n++) plm_fidct_zz_pos[n] = n < 64 ? PLM_FIDCT_POS(PLM_VIDEO_ZIG_ZAG[n]) : 0x80;
+	for (int v = 0; v < 1024; v++) plm_clamp_wide_table[v] = v < 384 ? 0 : v > 384 + 255 ? 255 : v - 384;
+	plm_coef_lut_build((const plm_vlc_t *)PLM_VIDEO_DCT_COEFF, PLM_VIDEO_COEF_FIRST_LUT, 0);
+	plm_coef_lut_build((const plm_vlc_t *)PLM_VIDEO_DCT_COEFF, PLM_VIDEO_COEF_REST_LUT, 1);
+	plm_coef_ln_build((const plm_vlc_t *)PLM_VIDEO_DCT_COEFF, PLM_VIDEO_COEF_L2_LUT, 6, PLM_COEF_L2_BITS, PLM_COEF_L3);
+	plm_coef_ln_build((const plm_vlc_t *)PLM_VIDEO_DCT_COEFF, PLM_VIDEO_COEF_L3_LUT, 9, 8, PLM_COEF_INV);   // 14- to 16-bit codes
+	plm_vlc_lut_build_n(PLM_VIDEO_MACROBLOCK_ADDRESS_INCREMENT, PLM_VIDEO_MB_ADDR_INC_LUT, PLM_MB_LUT_BITS);
+	for (int t = 1; t < 4; t++) {
+		plm_vlc_lut_build_n(PLM_VIDEO_MACROBLOCK_TYPE[t], PLM_VIDEO_MB_TYPE_LUT[t], PLM_MB_LUT_BITS);
+	}
+	plm_vlc_lut_build_n(PLM_VIDEO_CODE_BLOCK_PATTERN, PLM_VIDEO_CBP_LUT, PLM_MB_LUT_BITS);
+	plm_vlc_lut_build_n(PLM_VIDEO_MOTION, PLM_VIDEO_MOTION_LUT, PLM_MB_LUT_BITS);
+	for (int t = 0; t < 3; t++) {
+		plm_vlc_lut_build_n(PLM_VIDEO_DCT_SIZE[t], PLM_VIDEO_DCT_SIZE_LUT[t], PLM_MB_LUT_BITS);
+	}
+	plm_video_luts_ready = 1;
+}
+
+#ifndef PLM_VIDEO_DCACHE_OFFSET
+#if defined(__sh__)
+#define PLM_VIDEO_DCACHE_OFFSET 0x2000   // a multiple of 32; -1: wherever the allocator puts it
+#else
+#define PLM_VIDEO_DCACHE_OFFSET -1
+#endif
+#endif
+#if PLM_VIDEO_DCACHE_OFFSET >= 0
+typedef char plm_video_dcache_offset_check[(PLM_VIDEO_DCACHE_OFFSET % 32 == 0 && PLM_VIDEO_DCACHE_OFFSET < 16384) ? 1 : -1];
+#endif
 plm_video_t * plm_video_create_with_buffer(plm_buffer_t *buffer, int destroy_when_done) {
-	plm_video_t *self = (plm_video_t *)PLM_MALLOC(sizeof(plm_video_t));
-	if(!self) {
+	plm_video_init_luts();
+	// 32-byte aligned: mb_blocks' cache lines are allocated with movca.l, which must not share a
+	// line with other fields
+	// PLM_VIDEO_DCACHE_OFFSET: the struct (its tables and mb_blocks are read for every block) is put
+	// at this offset within the SH-4's 16 KB direct-mapped data cache, because where malloc happens
+	// to put it changes decode time by up to 15%. Measured on one 640x368 stream, decoding on the
+	// main thread, struct start at each 1 KB step: 24.9 ms per frame from 0x1b00 to 0x2600,
+	// 28.3-28.8 ms at 0x3000-0x3400, 25.4-27.0 ms elsewhere. Costs 16 KB.
+	size_t place = 0;
+#if PLM_VIDEO_DCACHE_OFFSET >= 0
+	place = 16384;
+#endif
+	uint8_t *base = (uint8_t *)PLM_MEMALIGN(32, sizeof(plm_video_t) + place);
+	if(!base) {
 		fprintf(stderr, "Out of memory for self. [plm_video_create_with_buffer]\n");
 		return NULL;
 	}
+	plm_video_t *self = (plm_video_t *)base;
+#if PLM_VIDEO_DCACHE_OFFSET >= 0
+	self = (plm_video_t *)(base + (((uintptr_t)PLM_VIDEO_DCACHE_OFFSET - (uintptr_t)base) & 16383));
+#endif
 	PLM_MEMZERO(self, sizeof(plm_video_t));
+	self->alloc_base = base;
+	for (int n = 0; n < 128; n++) {
+		int16_t z4 = (int16_t)(n < 64 ? 4 * PLM_FIDCT_POS(PLM_VIDEO_ZIG_ZAG[n]) : -4);
+		self->qz_intra[n][1] = z4;
+		self->qz_non_intra[n][1] = z4;
+	}
+	self->qm_cached_scale[0] = self->qm_cached_scale[1] = -1;
+	// The token decoder's context: the parts that never change
+	self->mbc.first = PLM_VIDEO_COEF_FIRST_LUT;
+	self->mbc.rest = PLM_VIDEO_COEF_REST_LUT;
+	self->mbc.blocks = &self->mb_blocks[0][0];
+	self->mbc.dcp = self->dc_predictor;
+	self->mbc.dclut = PLM_VIDEO_DCT_SIZE_LUT;
+	self->mbc.l2 = PLM_VIDEO_COEF_L2_LUT;
 
 	self->buffer = buffer;
 	self->destroy_buffer_when_done = destroy_when_done;
@@ -3314,7 +4886,7 @@ void plm_video_destroy(plm_video_t *self) {
 		self->frames_data = NULL;
 	}
 
-	PLM_FREE(self);
+	PLM_FREE(self->alloc_base);
 }
 
 double plm_video_get_framerate(plm_video_t *self) {
@@ -3339,6 +4911,36 @@ int plm_video_get_height(plm_video_t *self) {
 	return plm_video_has_header(self)
 		? self->height
 		: 0;
+}
+
+void plm_video_set_skip_b_frames(plm_video_t *self, int skip) {
+	self->skip_b_frames = skip;
+}
+
+void plm_video_set_skip_to_intra(plm_video_t *self) {
+	self->skip_to_intra = 2;
+}
+
+void plm_video_set_slice_callback(plm_video_t *self, plm_video_slice_callback fp, void *user) {
+	self->slice_callback = fp;
+	self->slice_callback_user_data = user;
+}
+
+void plm_video_set_display_stride_exact(plm_video_t *self, int exact) {
+	self->display_stride_exact = exact;
+	if (!self->has_sequence_header) {
+		return;   // applied when the sequence header is decoded
+	}
+
+	// The frames were allocated for the padded layout, which is the larger one
+	int stride = self->mb_width;
+	while (!exact && (stride & (stride - 1))) {
+		stride += stride & -stride;
+	}
+	self->display_stride_mbs = stride;
+	self->frame_current.display_stride_mbs = (unsigned int)stride;
+	self->frame_forward.display_stride_mbs = (unsigned int)stride;
+	self->frame_backward.display_stride_mbs = (unsigned int)stride;
 }
 
 void plm_video_set_no_delay(plm_video_t *self, int no_delay) {
@@ -3366,7 +4968,15 @@ int plm_video_has_ended(plm_video_t *self) {
 	return plm_buffer_has_ended(self->buffer);
 }
 
+static plm_frame_t *plm_video_decode_keep_xmtrx(plm_video_t *self);
 plm_frame_t *plm_video_decode(plm_video_t *self) {
+	float saved[16] __attribute__((aligned(8)));
+	plm_xmtrx_save(saved);
+	plm_frame_t *frame = plm_video_decode_keep_xmtrx(self);
+	plm_xmtrx_restore(saved);
+	return frame;
+}
+static plm_frame_t *plm_video_decode_keep_xmtrx(plm_video_t *self) {
 	if (!plm_video_has_header(self)) {
 		return NULL;
 	}
@@ -3401,7 +5011,13 @@ plm_frame_t *plm_video_decode(plm_video_t *self) {
 		// of the next picture. Also, if we didn't find the start code for the
 		// next picture, but the source has ended, we assume that this last
 		// picture is in the buffer.
+		// With a load callback this scan is also what pulls the whole picture into the ring, which
+		// the assembly bit reader (it never refills) relies on, and the end-of-stream handling
+		// depends on its side effects. Only a buffer with no callback whose source has ended holds
+		// all the data already; the scan cannot fail then and is skipped. It reads the whole
+		// picture a byte or word at a time, about 0.7 ms per frame at 7.5 Mbit/s.
 		if (
+			!(plm_buffer_has_ended(self->buffer) && !self->buffer->load_callback) &&
 			plm_buffer_has_start_code(self->buffer, PLM_START_PICTURE) == -1 &&
 			!plm_buffer_has_ended(self->buffer)
 		) {
@@ -3410,6 +5026,14 @@ plm_frame_t *plm_video_decode(plm_video_t *self) {
 		plm_buffer_discard_read_bytes(self->buffer);
 
 		plm_video_decode_picture(self);
+
+		if (self->picture_skipped) {
+			// its display slot passes without a frame
+			self->picture_skipped = FALSE;
+			self->frames_decoded++;
+			self->time = (double)self->frames_decoded / self->framerate;
+			continue;
+		}
 
 		if (self->assume_no_b_frames) {
 			frame = &self->frame_backward;
@@ -3522,17 +5146,31 @@ int plm_video_decode_sequence_header(plm_video_t *self) {
 	size_t chroma_plane_size = self->chroma_width * self->chroma_height;
 	size_t frame_data_size = (luma_plane_size + 2 * chroma_plane_size);
 
+	// Display rows (macroblock layout) are display_stride_mbs macroblocks apart: the texture's width
+	// in macroblocks (next power of two), so the player can send a whole frame to the PVR YUV
+	// converter in one DMA. The padding blocks at each row's end are part of the buffer and are
+	// never written.
+	// (plm_video_set_display_stride_exact() asks for unpadded rows; the memory is the same.)
+	int stride = self->mb_width;
+	while (stride & (stride - 1)) {
+		stride += stride & -stride;
+	}
+	self->display_stride_mbs = self->display_stride_exact ? self->mb_width : stride;
+	size_t display_size = (size_t)self->mb_height * (size_t)stride * 384;
+	size_t frame_bytes = frame_data_size + display_size;
+
 	// DCL DIFF
-	self->frames_data = (uint8_t *)PLM_MEMALIGN(32, frame_data_size * 3 * 2);
+	self->frames_data = (uint8_t *)PLM_MEMALIGN(32, frame_bytes * 3);
 	if(!self->frames_data) {
 		fprintf(stderr, "Out of memory for self->frames_data. [plm_video_decode_sequence_header]\n");
 		return FALSE;
 	}
 
-	plm_video_init_frame(self, &self->frame_current, self->frames_data + frame_data_size * 0);
-	plm_video_init_frame(self, &self->frame_forward, self->frames_data + frame_data_size * 2);
-	plm_video_init_frame(self, &self->frame_backward, self->frames_data + frame_data_size * 4);
+	plm_video_init_frame(self, &self->frame_current, self->frames_data + frame_bytes * 0);
+	plm_video_init_frame(self, &self->frame_forward, self->frames_data + frame_bytes * 1);
+	plm_video_init_frame(self, &self->frame_backward, self->frames_data + frame_bytes * 2);
 
+	self->qm_cached_scale[0] = self->qm_cached_scale[1] = -1;   // matrices may have changed
 	self->has_sequence_header = TRUE;
 	return TRUE;
 }
@@ -3557,6 +5195,7 @@ void plm_video_init_frame(plm_video_t *self, plm_frame_t *frame, uint8_t *base) 
 
 	// DCL DIFF
 	frame->display = (uint32_t *)(base + luma_plane_size + chroma_plane_size * 2);
+	frame->display_stride_mbs = (unsigned int)self->display_stride_mbs;
 }
 
 void plm_video_decode_picture(plm_video_t *self) {
@@ -3566,6 +5205,22 @@ void plm_video_decode_picture(plm_video_t *self) {
 
 	// D frames or unknown coding type
 	if (self->picture_type <= 0 || self->picture_type > PLM_VIDEO_PICTURE_TYPE_B) {
+		return;
+	}
+
+	// Dropped picture: plm_video_decode looks for the next one
+	if (self->skip_to_intra == 2 && self->picture_type == PLM_VIDEO_PICTURE_TYPE_INTRA) {
+		self->skip_to_intra = 1;
+	}
+	if (self->skip_to_intra == 1 && self->picture_type == PLM_VIDEO_PICTURE_TYPE_PREDICTIVE) {
+		self->skip_to_intra = 0;
+	}
+	if (
+		self->skip_to_intra == 2 ||
+		(self->picture_type == PLM_VIDEO_PICTURE_TYPE_B && (self->skip_b_frames || self->skip_to_intra))
+	) {
+		self->picture_skipped = TRUE;
+		self->start_code = -1;
 		return;
 	}
 
@@ -3613,6 +5268,9 @@ void plm_video_decode_picture(plm_video_t *self) {
 	// Decode all slices
 	while (PLM_START_IS_SLICE(self->start_code)) {
 		plm_video_decode_slice(self, self->start_code & 0x000000FF);
+		if (self->slice_callback) {
+			self->slice_callback(self, self->slice_callback_user_data);
+		}
 		if (self->macroblock_address >= self->mb_size - 1) {
 			break;
 		}
@@ -3629,7 +5287,7 @@ void plm_video_decode_picture(plm_video_t *self) {
 	}
 }
 
-void plm_video_decode_slice(plm_video_t *self, int slice) {
+PLM_HOT void plm_video_decode_slice(plm_video_t *self, int slice) {
 	self->slice_begin = TRUE;
 	self->macroblock_address = (slice - 1) * self->mb_width - 1;
 	self->mb_row = slice - 1;
@@ -3657,19 +5315,19 @@ void plm_video_decode_slice(plm_video_t *self, int slice) {
 	);
 }
 
-void plm_video_decode_macroblock(plm_video_t *self) {
+PLM_HOT void plm_video_decode_macroblock(plm_video_t *self) {
 	// Decode increment
 	int increment = 0;
-	int t = plm_buffer_read_vlc(self->buffer, PLM_VIDEO_MACROBLOCK_ADDRESS_INCREMENT);
+	int t = plm_buffer_read_vlc_lut_n(self->buffer, PLM_VIDEO_MACROBLOCK_ADDRESS_INCREMENT, PLM_VIDEO_MB_ADDR_INC_LUT, PLM_MB_LUT_BITS);
 
 	while (t == 34) {
 		// macroblock_stuffing
-		t = plm_buffer_read_vlc(self->buffer, PLM_VIDEO_MACROBLOCK_ADDRESS_INCREMENT);
+		t = plm_buffer_read_vlc_lut_n(self->buffer, PLM_VIDEO_MACROBLOCK_ADDRESS_INCREMENT, PLM_VIDEO_MB_ADDR_INC_LUT, PLM_MB_LUT_BITS);
 	}
 	while (t == 35) {
 		// macroblock_escape
 		increment += 33;
-		t = plm_buffer_read_vlc(self->buffer, PLM_VIDEO_MACROBLOCK_ADDRESS_INCREMENT);
+		t = plm_buffer_read_vlc_lut_n(self->buffer, PLM_VIDEO_MACROBLOCK_ADDRESS_INCREMENT, PLM_VIDEO_MB_ADDR_INC_LUT, PLM_MB_LUT_BITS);
 	}
 	increment += t;
 
@@ -3703,10 +5361,7 @@ void plm_video_decode_macroblock(plm_video_t *self) {
 		// Predict skipped macroblocks
 		while (increment > 1) {
 			plm_video_advance_macroblock(self);
-			plm_video_predict_macroblock(self);
-			if (self->picture_type != PLM_VIDEO_PICTURE_TYPE_B) {
-				plm_video_scatter_macroblock(self);
-			}
+		plm_video_predict_macroblock(self);
 			increment--;
 		}
 		plm_video_advance_macroblock(self);
@@ -3723,7 +5378,7 @@ void plm_video_decode_macroblock(plm_video_t *self) {
 
 	// Process the current macroblock
 	const plm_vlc_t *table = PLM_VIDEO_MACROBLOCK_TYPE[self->picture_type];
-	self->macroblock_type = plm_buffer_read_vlc(self->buffer, table);
+	self->macroblock_type = plm_buffer_read_vlc_lut_n(self->buffer, table, PLM_VIDEO_MB_TYPE_LUT[self->picture_type], PLM_MB_LUT_BITS);
 
 	self->macroblock_intra = (self->macroblock_type & 0x01);
 	self->motion_forward.is_set = (self->macroblock_type & 0x08);
@@ -3751,28 +5406,28 @@ void plm_video_decode_macroblock(plm_video_t *self) {
 
 	// Decode blocks
 	int cbp = ((self->macroblock_type & 0x02) != 0)
-		? plm_buffer_read_vlc(self->buffer, PLM_VIDEO_CODE_BLOCK_PATTERN)
+		? plm_buffer_read_vlc_lut_n(self->buffer, PLM_VIDEO_CODE_BLOCK_PATTERN, PLM_VIDEO_CBP_LUT, PLM_MB_LUT_BITS)
 		: (self->macroblock_intra ? 0x3f : 0);
 
 	if (cbp != 0) {
-		uint32_t *mb_display = self->frame_current.display + self->macroblock_address * 96;
-		for (int block = 0, mask = 0x20; block < 6; block++) {
-			if ((cbp & mask) != 0) {
-				plm_video_decode_block(self, block, mb_display);
-			}
-			mask >>= 1;
+		uint32_t *mb_display = self->frame_current.display + (self->mb_row * self->display_stride_mbs + self->mb_col) * 96;
+		if (self->macroblock_intra) {
+			plm_mb_alloc_lines(mb_display);   // intra: all six blocks overwrite the entry
 		}
-	}
-
-	// Scatter display buffer to Y/Cb/Cr planes while data is cache-hot
-	if (self->picture_type != PLM_VIDEO_PICTURE_TYPE_B) {
-		plm_video_scatter_macroblock(self);
+		if (!plm_video_decode_mb_coefs(self, cbp)) {
+			return;   // invalid
+		}
+		for (int block = 0, mask = 0x20; block < 6; block++, mask >>= 1) {
+			if ((cbp & mask) != 0) {
+				plm_video_output_block(self, block, mb_display, self->mb_blocks[block], self->mbc.nb[block]);
+			}
+		}
 	}
 }
 
-static inline int plm_video_decode_motion_vector(plm_video_t *self, int r_size, int motion) {
+static __attribute__((noinline)) PLM_HOT int plm_video_decode_motion_vector(plm_video_t *self, int r_size, int motion) {   // one copy, not four inlined
 	int fscale = 1 << r_size;
-	int m_code = plm_buffer_read_vlc(self->buffer, PLM_VIDEO_MOTION);
+	int m_code = plm_buffer_read_vlc_lut_n(self->buffer, PLM_VIDEO_MOTION, PLM_VIDEO_MOTION_LUT, PLM_MB_LUT_BITS);
 	int r = 0;
 	int d;
 
@@ -3799,7 +5454,7 @@ static inline int plm_video_decode_motion_vector(plm_video_t *self, int r_size, 
 	return motion;
 }
 
-void plm_video_decode_motion_vectors(plm_video_t *self) {
+PLM_HOT void plm_video_decode_motion_vectors(plm_video_t *self) {
 
 	// Forward
 	if (self->motion_forward.is_set) {
@@ -3821,8 +5476,9 @@ void plm_video_decode_motion_vectors(plm_video_t *self) {
 }
 
 // DCL DIFF
-void plm_video_predict_macroblock(plm_video_t *self) {
-	uint32_t *d = self->frame_current.display + self->macroblock_address * 96;
+PLM_HOT void plm_video_predict_macroblock(plm_video_t *self) {
+	uint32_t *d = self->frame_current.display + (self->mb_row * self->display_stride_mbs + self->mb_col) * 96;
+	plm_mb_alloc_lines(d);
 	int fw_h = self->motion_forward.h;
 	int fw_v = self->motion_forward.v;
 
@@ -3862,7 +5518,180 @@ void plm_video_predict_macroblock(plm_video_t *self) {
 }
 
 // DCL DIFF
-void plm_video_copy_macroblock(
+// Reference frames are read from their macroblock-ordered display buffer (U, V, Y0 Y1 Y2 Y3 per
+// macroblock, each 8x8 block 64 contiguous bytes), so the planar Y/Cb/Cr copies are not needed.
+// Any 8-pixel row inside an 8x8 block is 8 contiguous, 8-byte-aligned bytes.
+static inline __attribute__((always_inline)) const uint32_t *plm_mb_luma_row(const uint32_t *disp, int mbw, int tx, int y) {
+	const uint8_t *e = (const uint8_t *)(disp + ((y >> 4) * mbw + (tx >> 1)) * 96);
+	return (const uint32_t *)(e + 128 + ((((y >> 3) & 1) << 1) + (tx & 1)) * 64 + (y & 7) * 8);
+}
+static inline __attribute__((always_inline)) const uint32_t *plm_mb_chroma_row(const uint32_t *disp, int mbw, int tx, int y, int plane) {
+	const uint8_t *e = (const uint8_t *)(disp + ((y >> 3) * mbw + tx) * 96);
+	return (const uint32_t *)(e + plane * 64 + (y & 7) * 8);
+}
+// Copy n 8-byte rows from one, two or three 8x8 blocks (rows 8 bytes apart) into a scratch with a
+// 24- or 16-byte stride, 64 bits per move (FPSCR.SZ=1). dend points one past the first scratch row's
+// last copied byte; stores go backwards, then adv moves to the next row's end.
+#define PLM_GATHER_ASM_HEAD "fschg\n1:\n\t"
+#define PLM_GATHER_ASM_TAIL "bf/s 1b\n\tadd %[adv],%[d]\n\tfschg\n"
+static inline __attribute__((always_inline)) void plm_gather3(const uint8_t *a, const uint8_t *b, const uint8_t *c, uint8_t *d, int n, int adv) {
+	__asm__ volatile(PLM_GATHER_ASM_HEAD
+		"fmov @%[a]+,dr0\n\tfmov @%[b]+,dr2\n\tfmov @%[c]+,dr4\n\tdt %[n]\n\t"
+		"fmov dr4,@-%[d]\n\tfmov dr2,@-%[d]\n\tfmov dr0,@-%[d]\n\t" PLM_GATHER_ASM_TAIL
+		: [a]"+r"(a), [b]"+r"(b), [c]"+r"(c), [d]"+r"(d), [n]"+r"(n) : [adv]"r"(adv)
+		: "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "memory", "t");
+}
+static inline __attribute__((always_inline)) void plm_gather2(const uint8_t *a, const uint8_t *b, uint8_t *d, int n, int adv) {
+	__asm__ volatile(PLM_GATHER_ASM_HEAD
+		"fmov @%[a]+,dr0\n\tfmov @%[b]+,dr2\n\tdt %[n]\n\t"
+		"fmov dr2,@-%[d]\n\tfmov dr0,@-%[d]\n\t" PLM_GATHER_ASM_TAIL
+		: [a]"+r"(a), [b]"+r"(b), [d]"+r"(d), [n]"+r"(n) : [adv]"r"(adv)
+		: "fr0", "fr1", "fr2", "fr3", "memory", "t");
+}
+static inline __attribute__((always_inline)) void plm_gather1(const uint8_t *a, uint8_t *d, int n, int adv) {
+	__asm__ volatile(PLM_GATHER_ASM_HEAD
+		"fmov @%[a]+,dr0\n\tdt %[n]\n\t"
+		"fmov dr0,@-%[d]\n\t" PLM_GATHER_ASM_TAIL
+		: [a]"+r"(a), [d]"+r"(d), [n]"+r"(n) : [adv]"r"(adv)
+		: "fr0", "fr1", "memory", "t");
+}
+// Luma source rows vp..vp+rows-1, block columns hp>>3 onward (ncols = 2 or 3), into dst (stride 24).
+// Block rows are walked band by band (8 rows of one block row), so addresses are computed once per band.
+static void plm_mb_gather_luma(const uint32_t *disp, int mbw, int hp, int vp, int rows, int ncols, uint8_t *dst) {
+	int tx = hp >> 3;
+	int bottom = (vp >> 3) & 1;
+	const uint8_t *base = (const uint8_t *)disp + ((vp >> 4) * mbw + (tx >> 1)) * 384 + 128 + ((bottom << 1) + (tx & 1)) * 64;
+	int s1 = (tx & 1) ? 320 : 64;     // column tx -> tx+1: next block in the macroblock, or the next macroblock's
+	int s2 = 384 - s1;                // column tx+1 -> tx+2
+	int down = mbw * 384 - 128;       // bottom band -> top band of the next macroblock row
+	int r0 = vp & 7;
+	for (;;) {
+		int n = 8 - r0;
+		if (n > rows) n = rows;
+		const uint8_t *a = base + r0 * 8;
+		if (ncols == 3) plm_gather3(a, a + s1, a + s1 + s2, dst + 24, n, 48);
+		else plm_gather2(a, a + s1, dst + 16, n, 40);
+		rows -= n;
+		if (!rows) break;
+		dst += n * 24;
+		base += bottom ? down : 128;
+		bottom ^= 1;
+		r0 = 0;
+	}
+}
+// Chroma rows of both planes (U at +0, V at +64 in each entry) into du / dv (stride 16).
+static void plm_mb_gather_chroma(const uint32_t *disp, int mbw, int hp, int vp, int rows, int ncols, uint8_t *du, uint8_t *dv) {
+	const uint8_t *base = (const uint8_t *)disp + ((vp >> 3) * mbw + (hp >> 3)) * 384;
+	int down = mbw * 384;
+	int r0 = vp & 7;
+	for (;;) {
+		int n = 8 - r0;
+		if (n > rows) n = rows;
+		const uint8_t *a = base + r0 * 8;
+		if (ncols == 2) {
+			plm_gather2(a, a + 384, du + 16, n, 32);
+			plm_gather2(a + 64, a + 448, dv + 16, n, 32);
+		} else {
+			plm_gather1(a, du + 8, n, 24);
+			plm_gather1(a + 64, dv + 8, n, 24);
+		}
+		rows -= n;
+		if (!rows) break;
+		du += n * 16;
+		dv += n * 16;
+		base += down;
+		r0 = 0;
+	}
+}
+
+// 8x8 prediction kernels: s = first source row at the prediction's offset, d = 64-byte destination
+// block, stride = source row stride. copy, h: (a + b + 1) >> 1 across, v: down, hv: (a+b+c+d+2) >> 2.
+typedef void (*plm_mc8_fn)(const uint8_t *s, uint8_t *d, int stride);
+void plm_mc8_copy(const uint8_t *s, uint8_t *d, int stride);
+void plm_mc8_h(const uint8_t *s, uint8_t *d, int stride);
+void plm_mc8_v(const uint8_t *s, uint8_t *d, int stride);
+void plm_mc8_hv(const uint8_t *s, uint8_t *d, int stride);
+// The same four kernels on 32-bit words, four pixels at a time. Rows are read as aligned words and
+// lined up with SH-4 shld, whose semantics make one formula cover every byte offset r: shld by -8r
+// (0 when r == 0) and by 32 - 8r, or by -32 when r == 0 (shld by -32 gives 0; by 32 it would shift
+// by 0). The pixel-to-the-right words come from the aligned ones with fixed shifts. Exact:
+//   h, v:  (a + b + 1) >> 1 = (a | b) - (((a ^ b) >> 1) & 0x7f7f7f7f)   per byte
+//   hv:    (a + b + c + d + 2) >> 2 = sum(x >> 2) + ((sum(x & 3) + 2) >> 2)   per byte
+// They read up to 3 words of each row from the aligned address below s (bytes that the gather may
+// not have written are shifted out). Rows: copy and h 8, v and hv 9.
+static inline __attribute__((always_inline)) uint32_t plm_shld(uint32_t x, int n) {
+	__asm__("shld %1,%0" : "+r"(x) : "r"(n));
+	return x;
+}
+#define PLM_AVGU4(a, b) (((a) | (b)) - ((((a) ^ (b)) >> 1) & 0x7f7f7f7f))
+#define PLM_MC8_SETUP \
+	int r = (int)((uintptr_t)s & 3); \
+	const uint32_t *p = (const uint32_t *)(s - r); \
+	int ra = -8 * r, la = r ? 32 - 8 * r : -32; \
+	int ws = stride >> 2; \
+	uint32_t *o = (uint32_t *)d;
+#define PLM_MC8_ROW(A0, A1, A2) do { \
+	uint32_t w0_ = p[0], w1_ = p[1], w2_ = p[2]; \
+	A0 = plm_shld(w0_, ra) | plm_shld(w1_, la); \
+	A1 = plm_shld(w1_, ra) | plm_shld(w2_, la); \
+	A2 = plm_shld(w2_, ra); \
+	p += ws; \
+} while (0)
+static PLM_HOT void plm_mc8_copy_w(const uint8_t *s, uint8_t *d, int stride) {
+	PLM_MC8_SETUP
+	for (int y = 0; y < 8; y++) {
+		uint32_t a0, a1, a2;
+		PLM_MC8_ROW(a0, a1, a2);
+		(void)a2;
+		o[0] = a0; o[1] = a1; o += 2;
+	}
+}
+static PLM_HOT void plm_mc8_h_w(const uint8_t *s, uint8_t *d, int stride) {
+	PLM_MC8_SETUP
+	for (int y = 0; y < 8; y++) {
+		uint32_t a0, a1, a2;
+		PLM_MC8_ROW(a0, a1, a2);
+		uint32_t b0 = (a0 >> 8) | (a1 << 24), b1 = (a1 >> 8) | (a2 << 24);
+		o[0] = PLM_AVGU4(a0, b0); o[1] = PLM_AVGU4(a1, b1); o += 2;
+	}
+}
+static PLM_HOT void plm_mc8_v_w(const uint8_t *s, uint8_t *d, int stride) {
+	PLM_MC8_SETUP
+	uint32_t a0, a1, a2;
+	PLM_MC8_ROW(a0, a1, a2);
+	(void)a2;
+	for (int y = 0; y < 8; y++) {
+		uint32_t c0, c1, c2;
+		PLM_MC8_ROW(c0, c1, c2);
+		(void)c2;
+		o[0] = PLM_AVGU4(a0, c0); o[1] = PLM_AVGU4(a1, c1); o += 2;
+		a0 = c0; a1 = c1;
+	}
+}
+static PLM_HOT void plm_mc8_hv_w(const uint8_t *s, uint8_t *d, int stride) {
+	PLM_MC8_SETUP
+	const uint32_t m3f = 0x3f3f3f3f, m03 = 0x03030303;
+	uint32_t a0, a1, a2;
+	PLM_MC8_ROW(a0, a1, a2);
+	uint32_t b0 = (a0 >> 8) | (a1 << 24), b1 = (a1 >> 8) | (a2 << 24);
+	uint32_t h0 = ((a0 >> 2) & m3f) + ((b0 >> 2) & m3f), l0 = (a0 & m03) + (b0 & m03);
+	uint32_t h1 = ((a1 >> 2) & m3f) + ((b1 >> 2) & m3f), l1 = (a1 & m03) + (b1 & m03);
+	for (int y = 0; y < 8; y++) {
+		PLM_MC8_ROW(a0, a1, a2);
+		b0 = (a0 >> 8) | (a1 << 24); b1 = (a1 >> 8) | (a2 << 24);
+		uint32_t g0 = ((a0 >> 2) & m3f) + ((b0 >> 2) & m3f), k0 = (a0 & m03) + (b0 & m03);
+		uint32_t g1 = ((a1 >> 2) & m3f) + ((b1 >> 2) & m3f), k1 = (a1 & m03) + (b1 & m03);
+		o[0] = h0 + g0 + (((l0 + k0 + 0x02020202) >> 2) & m03);
+		o[1] = h1 + g1 + (((l1 + k1 + 0x02020202) >> 2) & m03);
+		o += 2;
+		h0 = g0; l0 = k0; h1 = g1; l1 = k1;
+	}
+}
+#undef PLM_MC8_ROW
+#undef PLM_MC8_SETUP
+static const plm_mc8_fn plm_mc8_tab[4] = {plm_mc8_copy_w, plm_mc8_h_w, plm_mc8_v_w, plm_mc8_hv_w};
+
+PLM_HOT void plm_video_copy_macroblock(
 	uint32_t *dest, plm_frame_t *reference, int motion_h, int motion_v
 ) {
 	int dw = reference->y.width;
@@ -3871,8 +5700,55 @@ void plm_video_copy_macroblock(
 	int vp = motion_v < 0 ? (dh + (motion_v >> 1)) : (motion_v >> 1);
 	int odd_h = (motion_h & 1) == 1;
 	int odd_v = (motion_v & 1) == 1;
-	uint8_t *src = reference->y.data;
-	unsigned int si = vp * dw + hp;
+
+	// A motion vector of whole macroblocks (zero motion included) predicts exactly another
+	// macroblock of the reference frame, which its display buffer already holds as 384 contiguous
+	// bytes in this layout (I and P frames write every entry; the player only reads it). One
+	// contiguous copy reads 12 cache lines instead of ~32 half-used ones from the planes.
+	if (!odd_h && !odd_v && !(hp & 15) && !(vp & 15)) {
+		const uint32_t *ms = reference->display + ((vp >> 4) * (int)reference->display_stride_mbs + (hp >> 4)) * 96;
+		// 12 lines, 64 bits per move (FPSCR.SZ=1); stores run backwards from each line's end.
+		const uint32_t *pf = ms + 16;
+		uint32_t *de = dest + 8;
+		int n = 12;
+		__asm__ volatile("fschg\n1:\n\t"
+			"pref @%[pf]\n\t"
+			"fmov @%[s]+,dr0\n\tfmov @%[s]+,dr2\n\tfmov @%[s]+,dr4\n\tfmov @%[s]+,dr6\n\t"
+			"add #32,%[pf]\n\tdt %[n]\n\t"
+			"fmov dr6,@-%[d]\n\tfmov dr4,@-%[d]\n\tfmov dr2,@-%[d]\n\tfmov dr0,@-%[d]\n\t"
+			"bf/s 1b\n\tadd #64,%[d]\n\tfschg\n"
+			: [s]"+r"(ms), [d]"+r"(de), [pf]"+r"(pf), [n]"+r"(n) :
+			: "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7", "memory", "t");
+		return;
+	}
+
+	uint8_t lscratch[18 * 24] __attribute__((aligned(8)));
+	plm_mb_gather_luma(reference->display, (int)reference->display_stride_mbs, hp, vp, 16 + odd_v, ((hp & 7) | odd_h) ? 3 : 2, lscratch);
+	int dw_real = dw;
+	{
+		const uint8_t *ls = lscratch + (hp & 7);
+		uint8_t *yd = (uint8_t *)dest + 128;
+		plm_mc8_fn k = plm_mc8_tab[(odd_v << 1) | odd_h];
+		k(ls, yd, 24);
+		k(ls + 8, yd + 64, 24);
+		k(ls + 8 * 24, yd + 128, 24);
+		k(ls + 8 * 24 + 8, yd + 192, 24);
+		int cdw = dw_real >> 1, cdh = dh >> 1;
+		int cmh = motion_h / 2, cmv = motion_v / 2;
+		int chp = cmh < 0 ? (cdw + (cmh >> 1)) : (cmh >> 1);
+		int cvp = cmv < 0 ? (cdh + (cmv >> 1)) : (cmv >> 1);
+		int codd_h = (cmh & 1) == 1, codd_v = (cmv & 1) == 1;
+		uint8_t cus[9 * 16] __attribute__((aligned(8)));
+		uint8_t cvs[9 * 16] __attribute__((aligned(8)));
+		plm_mb_gather_chroma(reference->display, (int)reference->display_stride_mbs, chp, cvp, 8 + codd_v, ((chp & 7) | codd_h) ? 2 : 1, cus, cvs);
+		k = plm_mc8_tab[(codd_v << 1) | codd_h];
+		k(cus + (chp & 7), (uint8_t *)dest, 16);
+		k(cvs + (chp & 7), (uint8_t *)dest + 64, 16);
+		return;
+	}
+	dw = 24;                       // the kernels below read the scratch with this stride
+	uint8_t *src = lscratch;
+	unsigned int si = hp & 7;
 
 	// Y block
 	dest += 32;
@@ -3888,8 +5764,6 @@ void plm_video_copy_macroblock(
 		{
 			for (int j = 8; j; j--)
 			{
-				__asm__("pref @%0" : : "r"(s1 + scan));
-				__asm__("pref @%0" : : "r"(s2 + scan));
 				d[0] = (s1[0] + s1[1] + s2[0] + s2[1] + 2) >> 2;
 				d[1] = (s1[1] + s1[2] + s2[1] + s2[2] + 2) >> 2;
 				d[2] = (s1[2] + s1[3] + s2[2] + s2[3] + 2) >> 2;
@@ -3923,8 +5797,6 @@ void plm_video_copy_macroblock(
 		{
 			for (int j = 8; j; j--)
 			{
-				__asm__("pref @%0" : : "r"(s1 + scan));
-				__asm__("pref @%0" : : "r"(s2 + scan));
 				d[0] = (s1[0] + s2[0] + 1) >> 1;
 				d[1] = (s1[1] + s2[1] + 1) >> 1;
 				d[2] = (s1[2] + s2[2] + 1) >> 1;
@@ -3957,7 +5829,6 @@ void plm_video_copy_macroblock(
 		{
 			for (int j = 8; j; j--)
 			{
-				__asm__("pref @%0" : : "r"(s + scan));
 				d[0] = (s[0] + s[1] + 1) >> 1;
 				d[1] = (s[1] + s[2] + 1) >> 1;
 				d[2] = (s[2] + s[3] + 1) >> 1;
@@ -3982,7 +5853,7 @@ void plm_video_copy_macroblock(
 	}
 	else
 	{
-		if (hp & 1)
+		// whole-pixel, any alignment: byte copy (aligned whole-MB moves take the display-copy path)
 		{
 			uint8_t *d = (uint8_t *)dest;
 			uint8_t *s = (uint8_t *)(src + si);
@@ -3991,7 +5862,6 @@ void plm_video_copy_macroblock(
 			{
 				for (int j = 8; j; j--)
 				{
-					__asm__("pref @%0" : : "r"(s + scan));
 					d[0] = s[0];
 					d[1] = s[1];
 					d[2] = s[2];
@@ -4014,55 +5884,12 @@ void plm_video_copy_macroblock(
 				d += 64;
 			}
 		}
-		else if (hp & 2)
-		{
-			uint16_t *d = (uint16_t *)dest;
-			uint16_t *s = (uint16_t *)(src + si);
-			int scan = dw >> 1;
-			for (int i = 2; i; i--)
-			{
-				for (int j = 8; j; j--)
-				{
-					__asm__("pref @%0" : : "r"(s + scan));
-					d[0] = s[0];
-					d[1] = s[1];
-					d[2] = s[2];
-					d[3] = s[3];
-					d[32] = s[4];
-					d[33] = s[5];
-					d[34] = s[6];
-					d[35] = s[7];
-					d += 4;
-					s += scan;
-				}
-				d += 32;
-			}
-		}
-		else
-		{
-			uint32_t *d = (uint32_t *)dest;
-			uint32_t *s = (uint32_t *)(src + si);
-			int scan = dw >> 2;
-			for (int i = 2; i; i--)
-			{
-				for (int j = 8; j; j--)
-				{
-					__asm__("pref @%0" : : "r"(s + scan));
-					d[0] = s[0];
-					d[1] = s[1];
-					d[16] = s[2];
-					d[17] = s[3];
-					d += 2;
-					s += scan;
-				}
-				d += 16;
-			}
-		}
 	}
 
 	// Cb, Cr blocks
 	dest -= 32;
 	__asm__("pref @%0" : : "r"(dest));
+	dw = dw_real;
 	src = reference->cb.data;
 	dw >>= 1;
 	dh >>= 1;
@@ -4073,6 +5900,14 @@ void plm_video_copy_macroblock(
 	odd_h = (motion_h & 1) == 1;
 	odd_v = (motion_v & 1) == 1;
 	si = vp * dw + hp;
+	uint8_t *src_cr = reference->cr.data;
+	uint8_t uscratch[9 * 16] __attribute__((aligned(8)));
+	uint8_t vscratch[9 * 16] __attribute__((aligned(8)));
+	plm_mb_gather_chroma(reference->display, (int)reference->display_stride_mbs, hp, vp, 8 + odd_v, ((hp & 7) | odd_h) ? 2 : 1, uscratch, vscratch);
+	src = uscratch;
+	src_cr = vscratch;
+	si = hp & 7;
+	dw = 16;
 
 	for (int i = 2; i; i--)
 	{
@@ -4084,8 +5919,6 @@ void plm_video_copy_macroblock(
 			int scan = dw;
 			for (int j = 8; j; j--)
 			{
-				__asm__("pref @%0" : : "r"(s1 + scan));
-				__asm__("pref @%0" : : "r"(s2 + scan));
 				d[0] = (s1[0] + s1[1] + s2[0] + s2[1] + 2) >> 2;
 				d[1] = (s1[1] + s1[2] + s2[1] + s2[2] + 2) >> 2;
 				d[2] = (s1[2] + s1[3] + s2[2] + s2[3] + 2) >> 2;
@@ -4107,8 +5940,6 @@ void plm_video_copy_macroblock(
 			int scan = dw;
 			for (int j = 8; j; j--)
 			{
-				__asm__("pref @%0" : : "r"(s1 + scan));
-				__asm__("pref @%0" : : "r"(s2 + scan));
 				d[0] = (s1[0] + s2[0] + 1) >> 1;
 				d[1] = (s1[1] + s2[1] + 1) >> 1;
 				d[2] = (s1[2] + s2[2] + 1) >> 1;
@@ -4129,7 +5960,6 @@ void plm_video_copy_macroblock(
 			int scan = dw;
 			for (int j = 8; j; j--)
 			{
-				__asm__("pref @%0" : : "r"(s + scan));
 				d[0] = (s[0] + s[1] + 1) >> 1;
 				d[1] = (s[1] + s[2] + 1) >> 1;
 				d[2] = (s[2] + s[3] + 1) >> 1;
@@ -4144,14 +5974,13 @@ void plm_video_copy_macroblock(
 		}
 		else
 		{
-			if (hp & 1)
+			// whole-pixel, any alignment: byte copy
 			{
 				uint8_t *d = (uint8_t *)dest;
 				uint8_t *s = (uint8_t *)(src + si);
 				int scan = dw;
 				for (int j = 8; j; j--)
 				{
-					__asm__("pref @%0" : : "r"(s + scan));
 					d[0] = s[0];
 					d[1] = s[1];
 					d[2] = s[2];
@@ -4164,45 +5993,15 @@ void plm_video_copy_macroblock(
 					s += scan;
 				}
 			}
-			else if (hp & 2)
-			{
-				uint16_t *d = (uint16_t *)dest;
-				uint16_t *s = (uint16_t *)(src + si);
-				int scan = dw >> 1;
-				for (int j = 8; j; j--)
-				{
-					__asm__("pref @%0" : : "r"(s + scan));
-					d[0] = s[0];
-					d[1] = s[1];
-					d[2] = s[2];
-					d[3] = s[3];
-					d += 4;
-					s += scan;
-				}
-			}
-			else
-			{
-				uint32_t *d = (uint32_t *)dest;
-				uint32_t *s = (uint32_t *)(src + si);
-				int scan = dw >> 2;
-				for (int j = 8; j; j--)
-				{
-					__asm__("pref @%0" : : "r"(s + scan));
-					d[0] = s[0];
-					d[1] = s[1];
-					d += 2;
-					s += scan;
-				}
-			}
 		}
 		dest += 16;
 		__asm__("pref @%0" : : "r"(dest));
-		src = reference->cr.data;
+		src = src_cr;
 	}
 }
 
 // DCL DIFF
-void plm_video_interpolate_macroblock(
+PLM_HOT void plm_video_interpolate_macroblock(
 	uint32_t *dest, plm_frame_t *reference, int motion_h, int motion_v
 ) {
 	__attribute__((aligned(8))) static uint32_t buffer[96];
@@ -4213,352 +6012,187 @@ void plm_video_interpolate_macroblock(
 	for (int i = 0; i < 96; i += 8) {
 		__asm__("pref @%0" : : "r"(dest + i + 8));
 		__asm__("pref @%0" : : "r"(buffer + i + 8));
-		dest[i + 0] = (((dest[i + 0] >> 1) & 0x7f7f7f7f) + ((buffer[i + 0] >> 1) & 0x7f7f7f7f));
-		dest[i + 1] = (((dest[i + 1] >> 1) & 0x7f7f7f7f) + ((buffer[i + 1] >> 1) & 0x7f7f7f7f));
-		dest[i + 2] = (((dest[i + 2] >> 1) & 0x7f7f7f7f) + ((buffer[i + 2] >> 1) & 0x7f7f7f7f));
-		dest[i + 3] = (((dest[i + 3] >> 1) & 0x7f7f7f7f) + ((buffer[i + 3] >> 1) & 0x7f7f7f7f));
-		dest[i + 4] = (((dest[i + 4] >> 1) & 0x7f7f7f7f) + ((buffer[i + 4] >> 1) & 0x7f7f7f7f));
-		dest[i + 5] = (((dest[i + 5] >> 1) & 0x7f7f7f7f) + ((buffer[i + 5] >> 1) & 0x7f7f7f7f));
-		dest[i + 6] = (((dest[i + 6] >> 1) & 0x7f7f7f7f) + ((buffer[i + 6] >> 1) & 0x7f7f7f7f));
-		dest[i + 7] = (((dest[i + 7] >> 1) & 0x7f7f7f7f) + ((buffer[i + 7] >> 1) & 0x7f7f7f7f));
+		dest[i + 0] = PLM_AVG4(dest[i + 0], buffer[i + 0]);
+		dest[i + 1] = PLM_AVG4(dest[i + 1], buffer[i + 1]);
+		dest[i + 2] = PLM_AVG4(dest[i + 2], buffer[i + 2]);
+		dest[i + 3] = PLM_AVG4(dest[i + 3], buffer[i + 3]);
+		dest[i + 4] = PLM_AVG4(dest[i + 4], buffer[i + 4]);
+		dest[i + 5] = PLM_AVG4(dest[i + 5], buffer[i + 5]);
+		dest[i + 6] = PLM_AVG4(dest[i + 6], buffer[i + 6]);
+		dest[i + 7] = PLM_AVG4(dest[i + 7], buffer[i + 7]);
 	}
 }
 
-void plm_video_scatter_macroblock(plm_video_t *self) {
-	int scan = self->luma_width >> 2;
-	int scan_half = self->chroma_width >> 2;
-
-	uint32_t *s = self->frame_current.display + self->macroblock_address * 96;
-
-	uint32_t *d_cb = (uint32_t *)self->frame_current.cb.data
-		+ self->mb_row * 8 * scan_half + self->mb_col * 2;
-	uint32_t *d_cr = (uint32_t *)self->frame_current.cr.data
-		+ self->mb_row * 8 * scan_half + self->mb_col * 2;
-	uint32_t *d_y = (uint32_t *)self->frame_current.y.data
-		+ self->mb_row * 16 * scan + self->mb_col * 4;
-
-	__asm__("pref @%0" : : "r"(s));
-
-	// Cb and Cr blocks (display offsets 0-15 and 16-31)
-	__asm__("pref @%0" : : "r"(s + 16));
-	for (int y = 0; y < 8; y++) {
-		d_cb[0] = s[0];
-		d_cb[1] = s[1];
-		d_cr[0] = s[16];
-		d_cr[1] = s[17];
-		d_cb += scan_half;
-		d_cr += scan_half;
-		s += 2;
+// One token whose code is longer than the 9-bit table (never end_of_block or escape), at bit m->P,
+// for block m->b at coefficient index m->n: the C tree walk and the same dequantisation as the assembly.
+static int plm_video_long_token(plm_video_t *self, plm_mbc_t *m) {
+	uint32_t P = m->P;
+	const uint8_t *bb = m->base;
+	uint32_t mask = m->mask;
+	uint32_t byte = P >> 3, sh = P & 7;
+	uint32_t win = plm_buffer_load_u32be(&bb[byte & mask]) << sh;
+	if (sh) {
+		win |= (uint32_t)bb[(byte + 4) & mask] >> (8 - sh);
 	}
-	s += 16; // skip Cr block, advance to Y0
-
-	// Y upper half: Y0 (offsets 32-47) and Y1 (48-63)
-	__asm__("pref @%0" : : "r"(s + 16));
-	for (int y = 0; y < 8; y++) {
-		d_y[0] = s[0];
-		d_y[1] = s[1];
-		d_y[2] = s[16];
-		d_y[3] = s[17];
-		d_y += scan;
-		s += 2;
-	}
-	s += 16; // skip Y1 block, advance to Y2
-
-	// Y lower half: Y2 (offsets 64-79) and Y3 (80-95)
-	__asm__("pref @%0" : : "r"(s + 16));
-	for (int y = 0; y < 8; y++) {
-		d_y[0] = s[0];
-		d_y[1] = s[1];
-		d_y[2] = s[16];
-		d_y[3] = s[17];
-		d_y += scan;
-		s += 2;
-	}
-}
-
-void plm_video_decode_block(plm_video_t *self, int block, uint32_t *mb_display) {
-
-	int n = 0;
-	uint8_t *quant_matrix;
-
-	// Decode DC coefficient of intra-coded blocks
-	if (self->macroblock_intra) {
-		int predictor;
-		int dct_size;
-
-		// DC prediction
-		int plane_index = block > 3 ? block - 3 : 0;
-		predictor = self->dc_predictor[plane_index];
-		dct_size = plm_buffer_read_vlc(self->buffer, PLM_VIDEO_DCT_SIZE[plane_index]);
-
-		// Read DC coeff
-		if (dct_size > 0) {
-			int differential = plm_buffer_read(self->buffer, dct_size);
-			if ((differential & (1 << (dct_size - 1))) != 0) {
-				self->block_data[0] = predictor + differential;
-			}
-			else {
-				self->block_data[0] = predictor + (-(1 << dct_size) | (differential + 1));
-			}
-		}
-		else {
-			self->block_data[0] = predictor;
-		}
-
-		// Save predictor value
-		self->dc_predictor[plane_index] = self->block_data[0];
-
-		// Dequantize + premultiply
-		self->block_data[0] <<= (3 + 5);
-
-		quant_matrix = self->intra_quant_matrix;
-		n = 1;
+	plm_vlc_lut_t e = PLM_VIDEO_DCT_COEFF_LUT[win >> (32 - PLM_VLC_LUT_BITS)];
+	int len;
+	uint16_t coeff;
+	if (e.leaf) {
+		coeff = (uint16_t)e.value;
+		len = e.len;
 	}
 	else {
-		quant_matrix = self->non_intra_quant_matrix;
+		const plm_vlc_t *tree = (const plm_vlc_t *)PLM_VIDEO_DCT_COEFF;
+		int index = e.value;
+		plm_vlc_t st;
+		len = PLM_VLC_LUT_BITS;
+		while (TRUE) {
+			st = tree[index + (int)((win >> (31 - len)) & 1)];
+			len++;
+			if (st.index <= 0) {
+				break;
+			}
+			index = st.index;
+		}
+		coeff = (uint16_t)st.value;
 	}
-	const uint8_t *zig_zag = PLM_VIDEO_ZIG_ZAG;
-	const uint8_t *premultiplier = PLM_VIDEO_PREMULTIPLIER_MATRIX;
+	if (coeff == 0xffff || coeff == 0x0001) {
+		return 0;   // cannot happen: the assembly decodes these
+	}
+	int run = coeff >> 8;
+	int level = coeff & 0xff;
+	if ((win >> (31 - len)) & 1) {
+		level = -level;
+	}
+	len++;
+	int n = m->n + run;
+	if (n < 0 || n >= 64) {
+		return 0;
+	}
+	int z = plm_fidct_zz_pos[n];
+	level = plm_dequant(level, m->qz[2 * n], !self->macroblock_intra);
+	((plm_float_alias *)self->mb_blocks[m->b])[z] = (float)level;
+	m->n = n + 1;
+	m->P = P + len;
+	return 1;
+}
+
+// All coefficients of the current macroblock into self->mb_blocks (see plm_sh4_mb_coefs).
+static int plm_video_decode_mb_coefs(plm_video_t *self, int cbp) {
 	int quantizer_scale = self->quantizer_scale;
-	int non_intra = !self->macroblock_intra;
-
-	// Decode AC coefficients (+DC for non-intra)
-	int level = 0;
+	int intra = self->macroblock_intra != 0;
+	int16_t (*qz)[2] = intra ? self->qz_intra : self->qz_non_intra;
+	if (quantizer_scale != self->qm_cached_scale[intra]) {
+		// Only this macroblock type's table: the other one is rebuilt if and when it is needed
+		const uint8_t *w = intra ? self->intra_quant_matrix : self->non_intra_quant_matrix;
+		for (int n = 0; n < 64; n++) {
+			qz[n][0] = (int16_t)(quantizer_scale * w[PLM_VIDEO_ZIG_ZAG[n]]);
+		}
+		self->qm_cached_scale[intra] = (int16_t)quantizer_scale;
+	}
+	plm_buffer_t *buf = self->buffer;
+	plm_mbc_t *m = &self->mbc;   // first, rest, blocks, dcp, dclut and l2 are set once, at creation
+	uint32_t base_bits = (uint32_t)buf->read_byte_pos * 8;
+	m->P = base_bits + (uint32_t)buf->bit_index;
+	m->base = buf->bytes;
+	m->mask = (uint32_t)(buf->capacity - 1);
+	m->qz = &qz[0][0];
+	m->ni = -intra;   // added to 2|level| + 1
+	m->cbp = (uint32_t)cbp << 26;   // block 0 in bit 31; the assembly shifts the blocks out
+	m->b = -1;
+	m->resume = 0;
+	int ok = 1;
 	while (TRUE) {
-		int run = 0;
-		uint16_t coeff = plm_buffer_read_vlc_uint(self->buffer, PLM_VIDEO_DCT_COEFF);
-
-		if ((coeff == 0x0001) && (n > 0) && (plm_buffer_read(self->buffer, 1) == 0)) {
-			// end_of_block
+		int status = plm_sh4_mb_coefs(m);
+		if (status == 0) {
 			break;
 		}
-		if (coeff == 0xffff) {
-			// escape
-			run = plm_buffer_read(self->buffer, 6);
-			level = plm_buffer_read(self->buffer, 8);
-			if (level == 0) {
-				level = plm_buffer_read(self->buffer, 8);
-			}
-			else if (level == 128) {
-				level = plm_buffer_read(self->buffer, 8) - 256;
-			}
-			else if (level > 128) {
-				level = level - 256;
-			}
+		if (status < 0 || !plm_video_long_token(self, m)) {
+			ok = 0;
+			break;
 		}
-		else {
-			run = coeff >> 8;
-			level = coeff & 0xff;
-			if (plm_buffer_read(self->buffer, 1)) {
-				level = -level;
-			}
-		}
-
-		n += run;
-		if (n < 0 || n >= 64) {
-			return; // invalid
-		}
-
-		int de_zig_zagged = zig_zag[n];
-		n++;
-
-		// Dequantize, oddify, clip
-		level <<= 1;
-		if (non_intra) {
-			level += (level < 0 ? -1 : 1);
-		}
-		level = (level * quantizer_scale * quant_matrix[de_zig_zagged]) >> 4;
-		if ((level & 1) == 0) {
-			level -= level > 0 ? 1 : -1;
-		}
-		if (level > 2047) {
-			level = 2047;
-		}
-		else if (level < -2048) {
-			level = -2048;
-		}
-
-		// Save premultiplied coefficient
-		self->block_data[de_zig_zagged] = level * premultiplier[de_zig_zagged];
+		m->resume = 1;
 	}
+	buf->bit_index = m->P - base_bits;
+	return ok;
+}
 
-	// Move block to its place
+// IDCT of a block whose only coefficients are (0,0), (0,1) and (1,0) (n <= 3: 37-46% of the coded
+// non-DC blocks at 4 Mbit/s). The same operations as plm_fidct_sh4_v2 on that input, with each FTRV
+// reduced to its one non-zero product: pass 1 columns 0 and 1, pass 2 rows with the butterfly
+// a = e + o, b = 2e - a and the magic number added last. No multiply-add contraction, so every
+// product and sum is rounded as the assembly rounds it. Output in place, as the full IDCT's.
+// Pass 2 when pass 1 left only columns 0 and 1 non-zero: every row's even and odd FTRV inputs have
+// one non-zero entry, so each reduces to one product (as the full kernel rounds it).
+static inline __attribute__((always_inline)) void plm_fidct_pass2_c01(const float *y0, const float *y1, float *blk, const float *mtx) {
+	const float E0 = mtx[0], E1 = mtx[1], E2 = mtx[2], E3 = mtx[3];
+	const float O0 = mtx[16], O1 = mtx[17], O2 = mtx[18], O3 = mtx[19];
+	const float magic = mtx[32];
+	plm_float_alias *out = (plm_float_alias *)blk;
+	for (int r = 0; r < 8; r++, out += 8) {
+		float u = y0[r], v = y1[r];
+		float e0 = E0 * u, e1 = E1 * u, e2 = E2 * u, e3 = E3 * u;
+		float o0 = O0 * v, o1 = O1 * v, o2 = O2 * v, o3 = O3 * v;
+		float a0 = e0 + o0, a1 = e1 + o1, a2 = e2 + o2, a3 = e3 + o3;
+		float b0 = (e0 + e0) - a0, b1 = (e1 + e1) - a1, b2 = (e2 + e2) - a2, b3 = (e3 + e3) - a3;
+		out[0] = a0 + magic; out[1] = a1 + magic; out[2] = a2 + magic; out[3] = a3 + magic;
+		out[7] = b0 + magic; out[6] = b1 + magic; out[5] = b2 + magic; out[4] = b3 + magic;
+	}
+}
+static PLM_HOT __attribute__((optimize("fp-contract=off"))) void plm_fidct_sparse3(float *blk, const float *mtx) {
+	const float E0 = mtx[0], E1 = mtx[1], E2 = mtx[2], E3 = mtx[3];
+	const float O0 = mtx[16], O1 = mtx[17], O2 = mtx[18], O3 = mtx[19];
+	float f00 = blk[PLM_FIDCT_POS(0)], f01 = blk[PLM_FIDCT_POS(1)], f10 = blk[PLM_FIDCT_POS(8)];
+	float y0[8], y1[8];
+#define PLM_SP3_P1(K, EK, OK) do { \
+		float e = EK * f00, o = OK * f10, a = e + o, e1 = EK * f01; \
+		y0[K] = a; y0[7 - K] = (e + e) - a; \
+		y1[K] = e1; y1[7 - K] = (e1 + e1) - e1; \
+	} while (0)
+	PLM_SP3_P1(0, E0, O0); PLM_SP3_P1(1, E1, O1); PLM_SP3_P1(2, E2, O2); PLM_SP3_P1(3, E3, O3);
+#undef PLM_SP3_P1
+	plm_fidct_pass2_c01(y0, y1, blk, mtx);
+}
+
+PLM_HOT static void plm_video_output_block(plm_video_t *self, int block, uint32_t *mb_display, float *coefs, int n) {
 	int block_offset = (block < 4) ? (32 + (block << 4)) : (block == 4 ? 0 : 16);
 	uint32_t *display = mb_display + block_offset;
-
-	int *s = self->block_data;
-	const uint8_t *clamp = clamp_table;
-	__asm__("pref @%0" : : "r"(s));
-
-	if (self->macroblock_intra) {
-		// Overwrite (no prediction)
-		if (n == 1) {
-			int clamped = clamp[(s[0] + 128) >> 8];
+	plm_float_alias *fs = (plm_float_alias *)coefs;
+	const uint8_t *clamp = plm_clamp_wide_table + 384;
+	uint8_t *d = (uint8_t *)display;
+	if (n == 1) {
+		// DC only: every pixel is DC / 8, rounded half up
+		int value = ((int)fs[0] + 4) >> 3;
+		((uint32_t *)coefs)[0] = 0;
+		if (self->macroblock_intra) {
+			int clamped = clamp[value];
 			clamped |= (clamped << 24) | (clamped << 16) | (clamped << 8);
 			for (int y = 8; y; y--) {
 				*display++ = clamped;
 				*display++ = clamped;
 			}
-			s[0] = 0;
 		}
 		else {
-			plm_video_idct(s);
-			uint8_t *d = (uint8_t *)display;
-
-			for (int y = 8; y; y--) {
-				d[0] = clamp[s[0]];
-				d[1] = clamp[s[1]];
-				d[2] = clamp[s[2]];
-				d[3] = clamp[s[3]];
-				d[4] = clamp[s[4]];
-				d[5] = clamp[s[5]];
-				d[6] = clamp[s[6]];
-				d[7] = clamp[s[7]];
-				d += 8;
-				s += 8;
-			}
-			for (int i = 0; i < 64; i += 8) {
-				self->block_data[i + 0] = 0;
-				self->block_data[i + 1] = 0;
-				self->block_data[i + 2] = 0;
-				self->block_data[i + 3] = 0;
-				self->block_data[i + 4] = 0;
-				self->block_data[i + 5] = 0;
-				self->block_data[i + 6] = 0;
-				self->block_data[i + 7] = 0;
-			}
+			plm_sh4_out_dc(d, clamp + value);
 		}
 	}
 	else {
-		// Add data to the predicted macroblock
-		uint8_t *d = (uint8_t *)display;
-		if (n == 1) {
-			int value = (s[0] + 128) >> 8;
-
-			for (int y = 8; y; y--) {
-				d[0] = clamp[d[0] + value];
-				d[1] = clamp[d[1] + value];
-				d[2] = clamp[d[2] + value];
-				d[3] = clamp[d[3] + value];
-				d[4] = clamp[d[4] + value];
-				d[5] = clamp[d[5] + value];
-				d[6] = clamp[d[6] + value];
-				d[7] = clamp[d[7] + value];
-				d += 8;
-			}
-			s[0] = 0;
+		if (n <= 3) {
+			plm_fidct_sparse3(coefs, plm_fidct_mtx);
+		}
+		else
+		{
+			float ftmp[64] __attribute__((aligned(8)));
+			plm_fidct_sh4_v2(coefs, ftmp, (uint32_t *)coefs, plm_fidct_mtx);
+		}
+		const uint8_t *cl = (const uint8_t *)((uintptr_t)clamp - PLM_FIDCT_MAGIC_BITS);
+		if (self->macroblock_intra) {
+			plm_sh4_out_put(d, (uint32_t *)coefs, cl);
 		}
 		else {
-			plm_video_idct(s);
-
-			for (int y = 8; y; y--) {
-				d[0] = clamp[d[0] + s[0]];
-				d[1] = clamp[d[1] + s[1]];
-				d[2] = clamp[d[2] + s[2]];
-				d[3] = clamp[d[3] + s[3]];
-				d[4] = clamp[d[4] + s[4]];
-				d[5] = clamp[d[5] + s[5]];
-				d[6] = clamp[d[6] + s[6]];
-				d[7] = clamp[d[7] + s[7]];
-				d += 8;
-				s += 8;
-			}
-			for (int i = 0; i < 64; i += 8) {
-				self->block_data[i + 0] = 0;
-				self->block_data[i + 1] = 0;
-				self->block_data[i + 2] = 0;
-				self->block_data[i + 3] = 0;
-				self->block_data[i + 4] = 0;
-				self->block_data[i + 5] = 0;
-				self->block_data[i + 6] = 0;
-				self->block_data[i + 7] = 0;
-			}
+			plm_sh4_out_add(d, (uint32_t *)coefs, cl);
 		}
 	}
-}
-
-void plm_video_idct(int *block) {
-    int x0, x1, x2, x3, x4, y3, y4, y5, y6, y7;
-    int b1, b3, b4, b6, b7, tmp1, tmp2, m0;
-    int i;
-
-    // Column pass - skip all-zero columns
-    for (i = 0; i < 8; ++i) {
-        int *p = block + i;
-
-        // Zero-column skip: if entire column is zero, output stays zero
-        if (unlikely(!(p[0] | p[8] | p[16] | p[24] | p[32] | p[40] | p[48] | p[56]))) {
-			continue;
-		}
-
-        tmp1 = p[1 * 8] + p[7 * 8];
-        tmp2 = p[3 * 8] + p[5 * 8];
-        b6 = p[1 * 8] - p[7 * 8];
-        b7 = tmp1 + tmp2;
-        m0 = p[0 * 8];
-        b4 = p[5 * 8] - p[3 * 8];
-        b1 = p[4 * 8];
-        b3 = p[2 * 8] + p[6 * 8];
-
-        x4 = ((b6 * 473 - b4 * 196 + 128) >> 8) - b7;
-        x0 = x4 - (((tmp1 - tmp2) * 362 + 128) >> 8);
-        x1 = m0 - b1;
-        x2 = (((p[2 * 8] - p[6 * 8]) * 362 + 128) >> 8) - b3;
-        x3 = m0 + b1;
-        y3 = x1 + x2;
-        y4 = x3 + b3;
-        y5 = x1 - x2;
-        y6 = x3 - b3;
-        y7 = -x0 - ((b4 * 473 + b6 * 196 + 128) >> 8);
-
-        p[0 * 8] = b7 + y4;
-        p[1 * 8] = x4 + y3;
-        p[2 * 8] = y5 - x0;
-        p[3 * 8] = y6 - y7;
-        p[4 * 8] = y6 + y7;
-        p[5 * 8] = x0 + y5;
-        p[6 * 8] = y3 - x4;
-        p[7 * 8] = y4 - b7;
-    }
-
-    // Row pass - skip all-zero rows
-    for (i = 0; i < 64; i += 8) {
-        int *p = block + i;
-
-        // Zero-row skip: if entire row is zero, output stays zero
-        if (unlikely(!(p[0] | p[1] | p[2] | p[3] | p[4] | p[5] | p[6] | p[7]))) {
-            continue;
-        }
-
-        tmp1 = p[1] + p[7];
-        tmp2 = p[3] + p[5];
-        b6 = p[1] - p[7];
-        b7 = tmp1 + tmp2;
-        m0 = p[0];
-        b4 = p[5] - p[3];
-        b1 = p[4];
-        b3 = p[2] + p[6];
-
-        x4 = ((b6 * 473 - b4 * 196 + 128) >> 8) - b7;
-        x0 = x4 - (((tmp1 - tmp2) * 362 + 128) >> 8);
-        x1 = m0 - b1;
-        x2 = (((p[2] - p[6]) * 362 + 128) >> 8) - b3;
-        x3 = m0 + b1;
-        y3 = x1 + x2;
-        y4 = x3 + b3;
-        y5 = x1 - x2;
-        y6 = x3 - b3;
-        y7 = -x0 - ((b4 * 473 + b6 * 196 + 128) >> 8);
-
-        p[0] = (b7 + y4 + 128) >> 8;
-        p[1] = (x4 + y3 + 128) >> 8;
-        p[2] = (y5 - x0 + 128) >> 8;
-        p[3] = (y6 - y7 + 128) >> 8;
-        p[4] = (y6 + y7 + 128) >> 8;
-        p[5] = (x0 + y5 + 128) >> 8;
-        p[6] = (y3 - x4 + 128) >> 8;
-        p[7] = (y4 - b7 + 128) >> 8;
-    }
 }
 
 // YCbCr conversion following the BT.601 standard:
@@ -4797,29 +6431,32 @@ typedef struct plm_quantizer_spec_t {
 	unsigned short recip;   // 65536/levels + 1 (for fast div by levels)
 	unsigned short scale;   // 65536 / (levels + 1) (for postmultiply)
 	unsigned short adj_half; // ((levels + 1) >> 1) - 1
+	float fscale;           // 65536 / levels: the exact ISO 11172-3 step (2 / levels), float requantisation
 } plm_quantizer_spec_t;
 
  __attribute__((aligned(32))) static const plm_quantizer_spec_t PLM_AUDIO_QUANT_TAB[] = {
 	//  levels, group, bits, recip,  scale, adj_half
-	{     3, 1,  5, 21846, 16384,     1 },  //  1
-	{     5, 1,  7, 13108, 10923,     2 },  //  2
-	{     7, 0,  3,  9363,  8192,     3 },  //  3
-	{     9, 1, 10,  7282,  6554,     4 },  //  4
-	{    15, 0,  4,  4370,  4096,     7 },  //  5
-	{    31, 0,  5,  2114,  2048,    15 },  //  6
-	{    63, 0,  6,  1041,  1024,    31 },  //  7
-	{   127, 0,  7,   516,   512,    63 },  //  8
-	{   255, 0,  8,   257,   256,   127 },  //  9
-	{   511, 0,  9,   128,   128,   255 },  // 10
-	{  1023, 0, 10,    64,    64,   511 },  // 11
-	{  2047, 0, 11,    32,    32,  1023 },  // 12
-	{  4095, 0, 12,    16,    16,  2047 },  // 13
-	{  8191, 0, 13,     8,     8,  4095 },  // 14
-	{ 16383, 0, 14,     4,     4,  8191 },  // 15
-	{ 32767, 0, 15,     2,     2, 16383 },  // 16
-	{ 65535, 0, 16,     1,     1, 32767 }   // 17
+	{     3, 1,  5, 21846, 16384,     1, 21845.3333f },  //  1
+	{     5, 1,  7, 13108, 10923,     2, 13107.2f },  //  2
+	{     7, 0,  3,  9363,  8192,     3, 9362.28571f },  //  3
+	{     9, 1, 10,  7282,  6554,     4, 7281.77778f },  //  4
+	{    15, 0,  4,  4370,  4096,     7, 4369.06667f },  //  5
+	{    31, 0,  5,  2114,  2048,    15, 2114.06452f },  //  6
+	{    63, 0,  6,  1041,  1024,    31, 1040.25397f },  //  7
+	{   127, 0,  7,   516,   512,    63, 516.031496f },  //  8
+	{   255, 0,  8,   257,   256,   127, 257.003922f },  //  9
+	{   511, 0,  9,   128,   128,   255, 128.250489f },  // 10
+	{  1023, 0, 10,    64,    64,   511, 64.0625611f },  // 11
+	{  2047, 0, 11,    32,    32,  1023, 32.0156326f },  // 12
+	{  4095, 0, 12,    16,    16,  2047, 16.0039072f },  // 13
+	{  8191, 0, 13,     8,     8,  4095, 8.00097668f },  // 14
+	{ 16383, 0, 14,     4,     4,  8191, 4.00024416f },  // 15
+	{ 32767, 0, 15,     2,     2, 16383, 2.00006104f },  // 16
+	{ 65535, 0, 16,     1,     1, 32767, 1.00001526f }   // 17
 };
 
+#define PLM_AUDIO_D_SCALE (-32767.0f / 1073741824.0f)   /* -U * 32767 / 2^30 (upstream: / 1090519040, 1.6% low) */
+typedef float plm_audio_sample_t;
 struct plm_audio_t {
 	plm_buffer_t *buffer;
 	int bound;
@@ -4831,10 +6468,12 @@ struct plm_audio_t {
 	const plm_quantizer_spec_t *allocation[2][32];
 	uint8_t scale_factor_info[2][32];
 	int scale_factor[2][32][3];
-	int sample[2][32][3];
-	plm_samples_t samples;
-	float D[1024];
+	plm_audio_sample_t sample[2][32][3];
+	// Synthesis window and state first, then the PCM output: 4 + 8 + 4.6 KB. With the output in the
+	// middle (as before) the 17.5 KB block wrapped the 16 KB D-cache onto V's end.
+	float D[1024] __attribute__((aligned(32)));
 	float V[2][1024];
+	plm_samples_t samples;
 
 	double time;
 	int samples_decoded;
@@ -4843,14 +6482,26 @@ struct plm_audio_t {
 	int next_frame_data_size;
 	int has_header;
 	int destroy_buffer_when_done;
+
+	// CRI ADX (ADPCM) instead of MPEG audio, as in Sofdec (.sfd) files: see plm_audio_adx_header()
+	int adx;
+	int adx_channels;
+	int adx_samplerate;
+	int adx_coef[2];
+	int adx_hist[2][2];
+	int adx_ended;
 };
 
+static int plm_audio_adx_header(plm_audio_t *self);
+static void plm_audio_adx_decode_frame(plm_audio_t *self);
+static inline int plm_audio_rate(plm_audio_t *self) {
+	return self->adx ? self->adx_samplerate : PLM_AUDIO_SAMPLE_RATE[self->samplerate_index];
+}
 int plm_audio_find_frame_sync(plm_audio_t *self);
 int plm_audio_decode_header(plm_audio_t *self);
 void plm_audio_decode_frame(plm_audio_t *self);
 const plm_quantizer_spec_t *plm_audio_read_allocation(plm_audio_t *self, int sb, int tab3);
 void plm_audio_read_samples(plm_audio_t *self, int ch, int sb, int part);
-void plm_audio_idct36(int s[32][3], int ss, float *d, int dp);
 
 // Precomputed scalefactor values for sf=0..62.
 // Each entry = (PLM_AUDIO_SCALEFACTOR_BASE[sf%3] + ((1<<(sf/3))>>1)) >> (sf/3)
@@ -4907,7 +6558,7 @@ static inline int plm_audio_decode_scalefactor_value(int sf) {
 }
 
 plm_audio_t *plm_audio_create_with_buffer(plm_buffer_t *buffer, int destroy_when_done) {
-	plm_audio_t *self = (plm_audio_t *)PLM_MALLOC(sizeof(plm_audio_t));
+	plm_audio_t *self = (plm_audio_t *)PLM_MEMALIGN(32, sizeof(plm_audio_t));
 	if(!self) {
 		fprintf(stderr, "Out of memory for self. [plm_audio_create_with_buffer]\n");
 		return NULL;
@@ -4929,22 +6580,22 @@ plm_audio_t *plm_audio_create_with_buffer(plm_buffer_t *buffer, int destroy_when
 	{
 		for (int j = 0; j < 2; j++)
 		{
-			*d++ = s[0];
-			*d++ = s[32];
-			*d++ = s[64];
-			*d++ = s[96];
-			*d++ = s[128];
-			*d++ = s[160];
-			*d++ = s[192];
-			*d++ = s[224];
-			*d++ = s[256];
-			*d++ = s[288];
-			*d++ = s[320];
-			*d++ = s[352];
-			*d++ = s[384];
-			*d++ = s[416];
-			*d++ = s[448];
-			*d++ = s[480];
+			*d++ = s[0] * PLM_AUDIO_D_SCALE;
+			*d++ = s[32] * PLM_AUDIO_D_SCALE;
+			*d++ = s[64] * PLM_AUDIO_D_SCALE;
+			*d++ = s[96] * PLM_AUDIO_D_SCALE;
+			*d++ = s[128] * PLM_AUDIO_D_SCALE;
+			*d++ = s[160] * PLM_AUDIO_D_SCALE;
+			*d++ = s[192] * PLM_AUDIO_D_SCALE;
+			*d++ = s[224] * PLM_AUDIO_D_SCALE;
+			*d++ = s[256] * PLM_AUDIO_D_SCALE;
+			*d++ = s[288] * PLM_AUDIO_D_SCALE;
+			*d++ = s[320] * PLM_AUDIO_D_SCALE;
+			*d++ = s[352] * PLM_AUDIO_D_SCALE;
+			*d++ = s[384] * PLM_AUDIO_D_SCALE;
+			*d++ = s[416] * PLM_AUDIO_D_SCALE;
+			*d++ = s[448] * PLM_AUDIO_D_SCALE;
+			*d++ = s[480] * PLM_AUDIO_D_SCALE;
 		}
 		s++;
 	}
@@ -4976,7 +6627,7 @@ int plm_audio_has_header(plm_audio_t *self) {
 
 int plm_audio_get_samplerate(plm_audio_t *self) {
 	return plm_audio_has_header(self)
-		? PLM_AUDIO_SAMPLE_RATE[self->samplerate_index]
+		? plm_audio_rate(self)
 		: 0;
 }
 
@@ -4986,7 +6637,7 @@ double plm_audio_get_time(plm_audio_t *self) {
 
 void plm_audio_set_time(plm_audio_t *self, double time) {
 	self->samples_decoded = time *
-		(double)PLM_AUDIO_SAMPLE_RATE[self->samplerate_index];
+		(double)plm_audio_rate(self);
 	self->time = time;
 }
 
@@ -4995,6 +6646,16 @@ void plm_audio_rewind(plm_audio_t *self) {
 	self->time = 0;
 	self->samples_decoded = 0;
 	self->next_frame_data_size = 0;
+	// Start the synthesis filter as a new decoder does: with the previous pass's history the first
+	// frame after a rewind came out different (up to 3732 of 32767 at a loop point: a click).
+	memset(self->V, 0, sizeof(self->V));
+	self->v_pos[0] = self->v_pos[1] = 0;
+	// An ADX stream starts with its header again
+	if (self->adx) {
+		self->adx = 0;
+		self->adx_ended = 0;
+		self->has_header = FALSE;
+	}
 }
 
 int plm_audio_has_ended(plm_audio_t *self) {
@@ -5014,23 +6675,405 @@ plm_samples_t *plm_audio_decode(plm_audio_t *self) {
 		self->next_frame_data_size = plm_audio_decode_header(self);
 	}
 
-	if (
-		self->next_frame_data_size == 0 ||
-		!plm_buffer_has(self->buffer, self->next_frame_data_size << 3)
-	) {
+	if (self->next_frame_data_size == 0) {
 		return NULL;
 	}
+	// One call asks the source for more data once, which may be a packet smaller than a frame:
+	// keep asking while it delivers.
+	while (!plm_buffer_has(self->buffer, self->next_frame_data_size << 3)) {
+		size_t had = self->buffer->length;
+		if (plm_buffer_has(self->buffer, self->next_frame_data_size << 3)) {
+			break;
+		}
+		if (self->buffer->length <= had) {
+			return NULL;
+		}
+	}
 
-	plm_audio_decode_frame(self);
+	if (self->adx) {
+		plm_audio_adx_decode_frame(self);
+	}
+	else {
+		plm_audio_decode_frame(self);
+	}
 	self->next_frame_data_size = 0;
 
 	self->samples.time = self->time;
 
 	self->samples_decoded += PLM_AUDIO_SAMPLES_PER_FRAME;
 	self->time = (double)self->samples_decoded /
-		(double)PLM_AUDIO_SAMPLE_RATE[self->samplerate_index];
+		(double)plm_audio_rate(self);
 
 	return &self->samples;
+}
+
+// -----------------------------------------------------------------------------
+// CRI ADX audio, the ADPCM format of Sofdec (.sfd) files, where it takes the place of the MPEG
+// audio stream. Written from the published description of the format; no CRI code was used.
+//
+// Header (big endian): 80 00, u16 offset of the data minus 4, u8 encoding (3), u8 block size (18),
+// u8 bits per sample (4), u8 channels, u32 sample rate, u32 sample count, u16 high-pass cutoff.
+// Data: blocks of 18 bytes, one per channel in turn: u16 scale, then 32 samples of 4 bits, high
+// nibble first. A scale with bit 15 set ends the stream.
+//   sample = nibble * (scale + 1) + ((c1 * previous + c2 * the one before) >> 12), clamped
+// (the + 1 is needed: real files have blocks with a stored scale of 0 and samples that are not).
+// c1 and c2 follow from the cutoff and the sample rate.
+//
+// A frame of PLM_AUDIO_SAMPLES_PER_FRAME (1152) samples is 36 blocks per channel.
+
+#define PLM_ADX_BLOCK 18
+#define PLM_ADX_BLOCKS_PER_FRAME (PLM_AUDIO_SAMPLES_PER_FRAME / 32)
+
+static inline int plm_audio_adx_byte(plm_buffer_t *b, size_t byte_off) {
+	return *plm_buffer_ptr_from_read(b, (b->bit_index >> 3) + byte_off);
+}
+
+// Is the stream ADX? Reads the header if it is (returns 1), or returns -1 if more data is needed.
+static int plm_audio_adx_header(plm_audio_t *self) {
+	plm_buffer_t *b = self->buffer;
+	if (plm_audio_adx_byte(b, 0) != 0x80 || plm_audio_adx_byte(b, 1) != 0x00) {
+		return 0;
+	}
+
+	size_t data = (size_t)((plm_audio_adx_byte(b, 2) << 8) | plm_audio_adx_byte(b, 3)) + 4;
+	if (data < 20) {
+		return 0;
+	}
+	if (!plm_buffer_has(b, data << 3)) {
+		return -1;
+	}
+
+	int channels = plm_audio_adx_byte(b, 7);
+	int rate = (plm_audio_adx_byte(b, 8) << 24) | (plm_audio_adx_byte(b, 9) << 16) |
+		(plm_audio_adx_byte(b, 10) << 8) | plm_audio_adx_byte(b, 11);
+	int cutoff = (plm_audio_adx_byte(b, 16) << 8) | plm_audio_adx_byte(b, 17);
+	if (
+		plm_audio_adx_byte(b, 4) != 3 || plm_audio_adx_byte(b, 5) != PLM_ADX_BLOCK ||
+		plm_audio_adx_byte(b, 6) != 4 || channels < 1 || channels > 2 || rate < 1000 || rate > 96000
+	) {
+		return 0;
+	}
+
+	// c = (a - sqrt((a + b)(a - b))) / b with a = sqrt(2) - cos(2 pi cutoff / rate), b = sqrt(2) - 1;
+	// c1 = 2c, c2 = -c^2, in 1/4096. cos by its series (the angle is small), sqrt by Newton's
+	// method, so no maths library is needed.
+	double x = 6.283185307179586 * (double)cutoff / (double)rate;
+	double x2 = x * x;
+	double cosx = 1.0 - x2 / 2.0 + x2 * x2 / 24.0 - x2 * x2 * x2 / 720.0 + x2 * x2 * x2 * x2 / 40320.0;
+	double a = 1.4142135623730951 - cosx;
+	double bb = 1.4142135623730951 - 1.0;
+	double v = (a + bb) * (a - bb);
+	double r = v > 0.0 ? 1.0 : 0.0;
+	for (int i = 0; i < 40 && r > 0.0; i++) {
+		r = 0.5 * (r + v / r);
+	}
+	double c = (a - r) / bb;
+	self->adx_coef[0] = (int)(c * 2.0 * 4096.0 + 0.5);
+	self->adx_coef[1] = -(int)(c * c * 4096.0 + 0.5);
+
+	self->adx = 1;
+	self->adx_ended = 0;
+	self->adx_channels = channels;
+	self->adx_samplerate = rate;
+	self->adx_hist[0][0] = self->adx_hist[0][1] = 0;
+	self->adx_hist[1][0] = self->adx_hist[1][1] = 0;
+	self->has_header = TRUE;
+	b->bit_index += data << 3;
+	return 1;
+}
+
+// Clamp to 16 bits; the test is one compare and almost never true
+#define PLM_ADX_CLAMP(s) \
+	if (__builtin_expect((unsigned)((s) + 32768) > 65535u, 0)) { \
+		(s) = (s) < 0 ? -32768 : 32767; \
+	}
+
+// The 16 values a nibble can stand for: nibble (as a signed 4-bit number) times the multiplier.
+// Built with additions, which leaves the multiplier to the predictor.
+static inline void plm_audio_adx_table(int *t, int scale) {
+	int v = 0;
+	for (int i = 0; i < 8; i++) {
+		t[i] = v;
+		v += scale;
+	}
+	v = -8 * scale;
+	for (int i = 8; i < 16; i++) {
+		t[i] = v;
+		v += scale;
+	}
+}
+
+// The stereo block in assembly. Every sample needs two multiplies (c1 * the sample before,
+// c2 * the one before that), and on the SH-4 a product has to be fetched from MACL before the
+// next multiply: about 5 cycles per multiply at best, which is what bounds the loop. So:
+// - c2 * (older sample) for the NEXT sample is computed as soon as its operand exists and waits
+//   in r13 (left) / r14 (right), which keeps it off the path from one sample to the next;
+// - the two channels alternate, each one's other work placed in the other's multiply time;
+// - a sample is clamped out of line (it almost never is).
+// 17 cycles per sample in the SH7091 pipeline model; the compiled loop measured about 25.
+//
+// void plm_adx_stereo_sh4(const uint8_t *in, short *out, int *ctx)
+//   in:  the left block's 16 sample bytes; the right block's are 18 bytes on
+//   out: 32 stereo samples
+//   ctx: [0..3] left newest, left older, right newest, right older (updated); [4] c1, [5] c2;
+//        [6..21] the left block's 16 nibble values, [22..37] the right block's
+#if defined(__sh__)
+void plm_adx_stereo_sh4(const uint8_t *in, short *out, int *ctx);
+__asm__(
+"	.section .text.plm_adx,\"ax\"\n"
+"	.align	5\n"
+"	.global	_plm_adx_stereo_sh4\n"
+"_plm_adx_stereo_sh4:\n"
+"	mov.l	r8,@-r15\n"
+"	mov.l	r9,@-r15\n"
+"	mov.l	r10,@-r15\n"
+"	mov.l	r11,@-r15\n"
+"	mov.l	r12,@-r15\n"
+"	mov.l	r13,@-r15\n"
+"	mov.l	r14,@-r15\n"
+"	mov	r5,r0\n"
+"	add	#64,r0\n"
+"	add	#64,r0\n"
+"	mov.l	r0,@-r15\n"          /* @(4,r15) in the loop: where the output ends */
+"	mov.l	@(16,r6),r8\n"       /* c1 */
+"	mov.l	@(20,r6),r9\n"       /* c2 */
+"	mov	r6,r10\n"
+"	add	#24,r10\n"            /* left nibble values */
+"	mov	r10,r11\n"
+"	add	#64,r11\n"            /* right nibble values */
+"	mov	#-12,r12\n"
+"	mov.l	@r6,r1\n"            /* left newest */
+"	mov.l	@(4,r6),r2\n"        /* left older */
+"	mov.l	@(8,r6),r3\n"        /* right newest */
+"	mov.l	@(12,r6),r7\n"       /* right older */
+"	mov.l	r6,@-r15\n"          /* @r15: ctx */
+"	mov	r4,r6\n"
+"	add	#18,r6\n"             /* the right block's bytes */
+"	mul.l	r9,r2\n"
+"	sts	macl,r13\n"
+"	mul.l	r9,r7\n"
+"	sts	macl,r14\n"
+"	.align	2\n"
+".Ladx_loop:\n"
+"	mul.l	r8,r1\n"
+"	mov.b	@r4,r0\n"
+"	shlr2	r0\n"
+"	and	#60,r0\n"
+"	sts	macl,r2\n"
+"	mul.l	r9,r1\n"
+"	add	r13,r2\n"
+"	mov.l	@(r0,r10),r0\n"
+"	shad	r12,r2\n"
+"	add	r0,r2\n"
+"	sts	macl,r13\n"
+"	mul.l	r8,r3\n"
+"	exts.w	r2,r0\n"
+"	cmp/eq	r0,r2\n"
+"	bf	.Ladx_c1l\n"
+".Ladx_r1l:\n"
+"	mov.b	@r6,r0\n"
+"	shlr2	r0\n"
+"	and	#60,r0\n"
+"	sts	macl,r7\n"
+"	mul.l	r9,r3\n"
+"	add	r14,r7\n"
+"	mov.l	@(r0,r11),r0\n"
+"	shad	r12,r7\n"
+"	add	r0,r7\n"
+"	sts	macl,r14\n"
+"	exts.w	r7,r0\n"
+"	cmp/eq	r0,r7\n"
+"	bf	.Ladx_c1r\n"
+".Ladx_r1r:\n"
+"	mov.w	r2,@r5\n"
+"	mov	r7,r0\n"
+"	mov.w	r0,@(2,r5)\n"
+"	mul.l	r8,r2\n"
+"	mov.b	@r4+,r0\n"
+"	shll2	r0\n"
+"	and	#60,r0\n"
+"	sts	macl,r1\n"
+"	mul.l	r9,r2\n"
+"	add	r13,r1\n"
+"	mov.l	@(r0,r10),r0\n"
+"	shad	r12,r1\n"
+"	add	r0,r1\n"
+"	sts	macl,r13\n"
+"	mul.l	r8,r7\n"
+"	exts.w	r1,r0\n"
+"	cmp/eq	r0,r1\n"
+"	bf	.Ladx_c2l\n"
+".Ladx_r2l:\n"
+"	mov.b	@r6+,r0\n"
+"	shll2	r0\n"
+"	and	#60,r0\n"
+"	sts	macl,r3\n"
+"	mul.l	r9,r7\n"
+"	add	r14,r3\n"
+"	mov.l	@(r0,r11),r0\n"
+"	shad	r12,r3\n"
+"	add	r0,r3\n"
+"	sts	macl,r14\n"
+"	exts.w	r3,r0\n"
+"	cmp/eq	r0,r3\n"
+"	bf	.Ladx_c2r\n"
+".Ladx_r2r:\n"
+"	mov	r1,r0\n"
+"	mov.w	r0,@(4,r5)\n"
+"	mov	r3,r0\n"
+"	mov.w	r0,@(6,r5)\n"
+"	add	#8,r5\n"
+"	mov.l	@(4,r15),r0\n"
+"	cmp/eq	r0,r5\n"
+"	bf	.Ladx_loop\n"
+"	mov.l	@r15+,r6\n"
+"	add	#4,r15\n"
+"	mov.l	r1,@r6\n"
+"	mov.l	r2,@(4,r6)\n"
+"	mov.l	r3,@(8,r6)\n"
+"	mov.l	r7,@(12,r6)\n"
+"	mov.l	@r15+,r14\n"
+"	mov.l	@r15+,r13\n"
+"	mov.l	@r15+,r12\n"
+"	mov.l	@r15+,r11\n"
+"	mov.l	@r15+,r10\n"
+"	mov.l	@r15+,r9\n"
+"	rts\n"
+"	mov.l	@r15+,r8\n"
+".Ladx_c1l:\n"
+"	cmp/pz	r2\n"
+"	mov.w	.Ladx_max,r2\n"
+"	bt	.Ladx_r1l\n"
+"	bra	.Ladx_r1l\n"
+"	not	r2,r2\n"
+".Ladx_c1r:\n"
+"	cmp/pz	r7\n"
+"	mov.w	.Ladx_max,r7\n"
+"	bt	.Ladx_r1r\n"
+"	bra	.Ladx_r1r\n"
+"	not	r7,r7\n"
+".Ladx_c2l:\n"
+"	cmp/pz	r1\n"
+"	mov.w	.Ladx_max,r1\n"
+"	bt	.Ladx_r2l\n"
+"	bra	.Ladx_r2l\n"
+"	not	r1,r1\n"
+".Ladx_c2r:\n"
+"	cmp/pz	r3\n"
+"	mov.w	.Ladx_max,r3\n"
+"	bt	.Ladx_r2r\n"
+"	bra	.Ladx_r2r\n"
+"	not	r3,r3\n"
+"	.align	1\n"
+".Ladx_max:\n"
+"	.word	32767\n"
+"	.text\n"
+);
+#endif
+
+// One block of each channel (in: the left block's 18 bytes, then the right's) to 32 stereo samples.
+// The two channels are worked on together: each sample needs the one before it, so one channel
+// alone is a single chain of multiplies, and two chains overlap.
+static __attribute__((unused)) void plm_audio_adx_block_stereo(const uint8_t *in, short *out, int *hist, int c1, int c2) {
+	int tl[16], tr[16];
+	plm_audio_adx_table(tl, (((in[0] << 8) | in[1]) & 0x1fff) + 1);
+	plm_audio_adx_table(tr, (((in[18] << 8) | in[19]) & 0x1fff) + 1);
+
+	int l1 = hist[0], l2 = hist[1], r1 = hist[2], r2 = hist[3];
+	for (int i = 2; i < 18; i++) {
+		unsigned bl = in[i], br = in[i + 18];
+		int l = tl[bl >> 4] + ((c1 * l1 + c2 * l2) >> 12);
+		int r = tr[br >> 4] + ((c1 * r1 + c2 * r2) >> 12);
+		PLM_ADX_CLAMP(l);
+		PLM_ADX_CLAMP(r);
+		out[0] = (short)l;
+		out[1] = (short)r;
+		l2 = tl[bl & 15] + ((c1 * l + c2 * l1) >> 12);
+		r2 = tr[br & 15] + ((c1 * r + c2 * r1) >> 12);
+		PLM_ADX_CLAMP(l2);
+		PLM_ADX_CLAMP(r2);
+		out[2] = (short)l2;
+		out[3] = (short)r2;
+		out += 4;
+		// l2/r2 hold the newest sample: swap the roles for the next pair
+		l1 = l2; l2 = l;
+		r1 = r2; r2 = r;
+	}
+	hist[0] = l1; hist[1] = l2; hist[2] = r1; hist[3] = r2;
+}
+
+// One block to 32 samples, written to every second place of out
+static void plm_audio_adx_block_mono(const uint8_t *in, short *out, int *hist, int c1, int c2) {
+	int t[16];
+	plm_audio_adx_table(t, (((in[0] << 8) | in[1]) & 0x1fff) + 1);
+
+	int s1 = hist[0], s2 = hist[1];
+	for (int i = 2; i < 18; i++) {
+		unsigned byte = in[i];
+		int s = t[byte >> 4] + ((c1 * s1 + c2 * s2) >> 12);
+		PLM_ADX_CLAMP(s);
+		out[0] = (short)s;
+		s2 = t[byte & 15] + ((c1 * s + c2 * s1) >> 12);
+		PLM_ADX_CLAMP(s2);
+		out[2] = (short)s2;
+		out += 4;
+		s1 = s2; s2 = s;
+	}
+	hist[0] = s1; hist[1] = s2;
+}
+
+static void plm_audio_adx_decode_frame(plm_audio_t *self) {
+	plm_buffer_t *b = self->buffer;
+	short *pcm = self->samples.pcm;
+	int channels = self->adx_channels;
+	int c1 = self->adx_coef[0], c2 = self->adx_coef[1];
+	size_t step = (size_t)(PLM_ADX_BLOCK * channels);
+
+	for (int blk = 0; blk < PLM_ADX_BLOCKS_PER_FRAME; blk++, pcm += 64) {
+		// The block(s) in one piece: the stream buffer is a ring
+		uint8_t wrapped[2 * PLM_ADX_BLOCK];
+		const uint8_t *in = plm_buffer_ptr_from_read(b, b->bit_index >> 3);
+		if (__builtin_expect(in + step > b->bytes + b->capacity, 0)) {
+			for (size_t i = 0; i < step; i++) {
+				wrapped[i] = (uint8_t)plm_audio_adx_byte(b, i);
+			}
+			in = wrapped;
+		}
+
+		// A scale with bit 15 set is the end marker: silence from here on
+		if (self->adx_ended || ((in[0] | in[step - PLM_ADX_BLOCK]) & 0x80)) {
+			self->adx_ended = 1;
+			memset(pcm, 0, 64 * sizeof(short));
+			continue;
+		}
+
+		if (channels == 2) {
+#if defined(__sh__)
+			int ctx[6 + 32];
+			ctx[0] = self->adx_hist[0][0]; ctx[1] = self->adx_hist[0][1];
+			ctx[2] = self->adx_hist[1][0]; ctx[3] = self->adx_hist[1][1];
+			ctx[4] = c1; ctx[5] = c2;
+			plm_audio_adx_table(ctx + 6, (((in[0] << 8) | in[1]) & 0x1fff) + 1);
+			plm_audio_adx_table(ctx + 22, (((in[18] << 8) | in[19]) & 0x1fff) + 1);
+			plm_adx_stereo_sh4(in + 2, pcm, ctx);
+			self->adx_hist[0][0] = ctx[0]; self->adx_hist[0][1] = ctx[1];
+			self->adx_hist[1][0] = ctx[2]; self->adx_hist[1][1] = ctx[3];
+#else
+			plm_audio_adx_block_stereo(in, pcm, &self->adx_hist[0][0], c1, c2);
+#endif
+		}
+		else {
+			plm_audio_adx_block_mono(in, pcm, &self->adx_hist[0][0], c1, c2);
+		}
+		b->bit_index += step << 3;
+	}
+
+	if (channels == 1) {
+		pcm = self->samples.pcm;
+		for (int i = 0; i < PLM_AUDIO_SAMPLES_PER_FRAME; i++) {
+			pcm[i * 2 + 1] = pcm[i * 2];
+		}
+	}
 }
 
 int plm_audio_find_frame_sync(plm_audio_t *self) {
@@ -5067,6 +7110,17 @@ int plm_audio_find_frame_sync(plm_audio_t *self) {
 int plm_audio_decode_header(plm_audio_t *self) {
 	if (!plm_buffer_has(self->buffer, 48)) {
 		return 0;
+	}
+
+	// CRI ADX in place of MPEG audio (Sofdec files). One "frame" is 36 blocks per channel.
+	if (!self->has_header && !self->adx) {
+		int adx = plm_audio_adx_header(self);
+		if (adx < 0) {
+			return 0;
+		}
+	}
+	if (self->adx) {
+		return self->adx_ended ? 0 : PLM_ADX_BLOCKS_PER_FRAME * PLM_ADX_BLOCK * self->adx_channels;
 	}
 
 	plm_buffer_skip_bytes(self->buffer, 0x00);
@@ -5149,7 +7203,1110 @@ int plm_audio_decode_header(plm_audio_t *self) {
 	return frame_size - (hasCRC ? 6 : 4);
 }
 
-void plm_audio_decode_frame(plm_audio_t *self) {
+// The audio decoder's per-frame code in one section, so its functions are contiguous and cannot
+// evict each other from the 8 KB direct-mapped I-cache (the window routine landing on idct36's
+// lines cost 27k cycles per audio frame).
+#define PLM_AUDIO_HOT __attribute__((section(".text.plm_audio")))
+// One synthesis step's windowing for one channel: 16 iterations of two outputs, each the sum of four
+// FIPRs over the transposed window (d) and the strided V entries (v1, v2), summed in the order of
+// the port's original C loop (shz_pl_inner_loop, by Falco Girgis): ((s2 + s1) + s3) + s4, scaled,
+// clamped and stored to out[0], out[2], ...
+// (stereo-interleaved). Runs in the primary bank (fr12-fr15 saved) with one partial sum parked in
+// FPUL, instead of two bank switches and a stack push/pop per output. Software-pipelined per the
+// SH7091 latencies (a load reaches FIPR at D=3, FIPR results at D=4): each FIPR issues while the next
+// group loads, and an output's conversion and store happen during the next output's loads. Outputs
+// are k = 0..31 (d + 32k floats, v1/v2 + k, out + 2k shorts); the last iteration preloads one group
+// past the end (reads only).
+// The MP2 synthesis matrixing (pl_mpeg's plm_audio_idct36: a fast 32-point DCT, Lee's algorithm)
+// in generated assembly. Same operations as pl_mpeg's C (x + y, x - y, x * c, -x, in the C's order
+// for each value; no multiply-add contraction): bit-identical to that C compiled with
+// -ffp-contract=off (GDB simulator, 2000 random blocks). Generated from the C's dataflow: statement
+// order with first-stage butterflies sunk to their first use and stores raised to just after each
+// final value, Belady register allocation (16 FP registers, 3 spills), constants read as one stream
+// in use order, then the order refined on the ornio.nilware.io SH7091 pipeline model. Against
+// GCC's build of the C, which contracts some multiply-adds into fmac, output differs in the last bit
+// on about 0.01% of samples.
+void plm_audio_idct36_sh4(plm_audio_sample_t s[32][3], int ss, float *d, int dp);
+__asm__(
+	"\t.section .text.plm_audio,\"ax\"\n"
+	"\t.align 5\n"
+	"\t.global _plm_audio_idct36_sh4\n"
+	"_plm_audio_idct36_sh4:\n\t"
+	"mov.l r8,@-r15\n\t"
+	"fmov.s fr12,@-r15\n\t"
+	"fmov.s fr13,@-r15\n\t"
+	"fmov.s fr14,@-r15\n\t"
+	"fmov.s fr15,@-r15\n\t"
+	"add #-12,r15\n\t"
+	"shll2 r5\n\t"
+	"add r4,r5\n\t"
+	"shll2 r7\n\t"
+	"add r6,r7\n\t"
+	"mov r7,r2\n\t"
+	"mov r2,r3\n\t"
+	"add #127,r3\n\t"
+	"add #1,r3\n\t"
+	"mov r5,r6\n\t"
+	"add #127,r6\n\t"
+	"add #1,r6\n\t"
+	"mov r6,r7\n\t"
+	"add #127,r7\n\t"
+	"add #1,r7\n\t"
+	"mov.l .Lca_idct36,r1\n\t"
+	"bra .Lgo_idct36\n\t"
+	"mov #0,r8\n\t"
+	"\t.align 2\n"
+	".Lca_idct36: .long .Lc_idct36\n"
+	".Lgo_idct36:\n\t"
+	"fmov.s @r1+,fr5\n\t"
+	"mov #116,r0\n\t"
+	"fmov.s @(r0,r7),fr1\n\t"
+	"mov #28,r0\n\t"
+	"fmov.s @(r0,r6),fr14\n\t"
+	"mov #24,r0\n\t"
+	"fmov.s @(r0,r5),fr12\n\t"
+	"mov #76,r0\n\t"
+	"fmov.s @(r0,r6),fr9\n\t"
+	"mov #0,r0\n\t"
+	"fmov.s @(r0,r5),fr0\n\t"
+	"mov #88,r0\n\t"
+	"fmov.s @(r0,r6),fr15\n\t"
+	"mov #40,r0\n\t"
+	"fmov.s @(r0,r6),fr8\n\t"
+	"mov #52,r0\n\t"
+	"fmov.s @(r0,r6),fr2\n\t"
+	"mov #12,r0\n\t"
+	"fmov.s @(r0,r5),fr6\n\t"
+	"mov #64,r0\n\t"
+	"fmov.s @(r0,r6),fr3\n\t"
+	"mov #104,r0\n\t"
+	"fmov.s @(r0,r7),fr7\n\t"
+	"fadd fr15,fr14\n\t"
+	"mov #68,r0\n\t"
+	"fmov.s @(r0,r7),fr15\n\t"
+	"mov #92,r0\n\t"
+	"fmov.s @(r0,r7),fr13\n\t"
+	"fadd fr1,fr0\n\t"
+	"fadd fr9,fr8\n\t"
+	"mov #100,r0\n\t"
+	"fmov.s @(r0,r6),fr9\n\t"
+	"fadd fr3,fr2\n\t"
+	"fadd fr13,fr12\n\t"
+	"fmov.s @r1+,fr11\n\t"
+	"fadd fr7,fr6\n\t"
+	"fmov fr0,fr4\n\t"
+	"fadd fr2,fr4\n\t"
+	"mov #16,r0\n\t"
+	"fmov.s @(r0,r6),fr7\n\t"
+	"fsub fr2,fr0\n\t"
+	"fmov fr6,fr10\n\t"
+	"fadd fr8,fr10\n\t"
+	"fmul fr5,fr0\n\t"
+	"fmov fr12,fr1\n\t"
+	"fadd fr14,fr1\n\t"
+	"mov #36,r0\n\t"
+	"fmov.s @(r0,r5),fr2\n\t"
+	"mov #80,r0\n\t"
+	"fmov.s @(r0,r7),fr5\n\t"
+	"fsub fr8,fr6\n\t"
+	"fmov.s @r1+,fr3\n\t"
+	"fadd fr9,fr7\n\t"
+	"fsub fr14,fr12\n\t"
+	"mov #48,r0\n\t"
+	"fmov.s @(r0,r5),fr13\n\t"
+	"mov #4,r0\n\t"
+	"fmov.s @(r0,r6),fr14\n\t"
+	"fadd fr5,fr2\n\t"
+	"fmul fr3,fr12\n\t"
+	"mov #112,r0\n\t"
+	"fmov.s @(r0,r6),fr3\n\t"
+	"fadd fr15,fr13\n\t"
+	"fmul fr11,fr6\n\t"
+	"fmov fr2,fr8\n\t"
+	"fadd fr7,fr8\n\t"
+	"fmov.s @r1+,fr11\n\t"
+	"fmov.s @r1+,fr9\n\t"
+	"fsub fr7,fr2\n\t"
+	"fadd fr3,fr14\n\t"
+	"mov #124,r0\n\t"
+	"fmov.s @(r0,r6),fr3\n\t"
+	"fmul fr11,fr2\n\t"
+	"mov #56,r0\n\t"
+	"fmov.s @(r0,r7),fr11\n\t"
+	"fmov fr13,fr5\n\t"
+	"fadd fr14,fr5\n\t"
+	"mov #120,r0\n\t"
+	"fmov.s @(r0,r5),fr15\n\t"
+	"mov #60,r0\n\t"
+	"fmov.s @(r0,r5),fr7\n\t"
+	"fadd fr3,fr15\n\t"
+	"fadd fr11,fr7\n\t"
+	"mov #72,r0\n\t"
+	"fmov.s @(r0,r5),fr11\n\t"
+	"mov #44,r0\n\t"
+	"fmov.s @(r0,r7),fr3\n\t"
+	"fsub fr14,fr13\n\t"
+	"fmov fr7,fr14\n\t"
+	"fadd fr15,fr14\n\t"
+	"fsub fr15,fr7\n\t"
+	"fmul fr9,fr13\n\t"
+	"mov #108,r0\n\t"
+	"fmov.s @(r0,r5),fr15\n\t"
+	"fmov.s @r1+,fr9\n\t"
+	"fadd fr3,fr11\n\t"
+	"fmul fr9,fr7\n\t"
+	"mov #8,r0\n\t"
+	"fmov.s @(r0,r7),fr9\n\t"
+	"mov #0,r0\n\t"
+	"fmov.s fr2,@(r0,r15)\n\t"
+	"fadd fr9,fr15\n\t"
+	"fmov.s @r1+,fr9\n\t"
+	"fmov fr11,fr3\n\t"
+	"fadd fr15,fr3\n\t"
+	"fsub fr15,fr11\n\t"
+	"mov #84,r0\n\t"
+	"fmov.s @(r0,r5),fr15\n\t"
+	"mov #20,r0\n\t"
+	"fmov.s @(r0,r7),fr2\n\t"
+	"fmul fr9,fr11\n\t"
+	"mov #32,r0\n\t"
+	"fmov.s @(r0,r7),fr9\n\t"
+	"fadd fr9,fr15\n\t"
+	"mov #96,r0\n\t"
+	"fmov.s @(r0,r5),fr9\n\t"
+	"fadd fr2,fr9\n\t"
+	"fmov fr15,fr2\n\t"
+	"fadd fr9,fr2\n\t"
+	"fsub fr9,fr15\n\t"
+	"fmov.s @r1+,fr9\n\t"
+	"fmul fr9,fr15\n\t"
+	"fmov fr4,fr9\n\t"
+	"fadd fr2,fr9\n\t"
+	"fsub fr2,fr4\n\t"
+	"fmov.s @r1+,fr2\n\t"
+	"fmul fr2,fr4\n\t"
+	"fmov fr10,fr2\n\t"
+	"fadd fr3,fr2\n\t"
+	"fsub fr3,fr10\n\t"
+	"fmov.s @r1+,fr3\n\t"
+	"fmul fr3,fr10\n\t"
+	"fmov fr1,fr3\n\t"
+	"fadd fr14,fr3\n\t"
+	"fsub fr14,fr1\n\t"
+	"fmov.s @r1+,fr14\n\t"
+	"fmul fr14,fr1\n\t"
+	"fmov fr8,fr14\n\t"
+	"fadd fr5,fr14\n\t"
+	"fsub fr5,fr8\n\t"
+	"fmov.s @r1+,fr5\n\t"
+	"fmul fr5,fr8\n\t"
+	"fmov fr9,fr5\n\t"
+	"fadd fr14,fr5\n\t"
+	"fsub fr14,fr9\n\t"
+	"fmov.s @r1+,fr14\n\t"
+	"fmul fr14,fr9\n\t"
+	"fmov fr2,fr14\n\t"
+	"fadd fr3,fr14\n\t"
+	"fsub fr3,fr2\n\t"
+	"fmov.s @r1+,fr3\n\t"
+	"fmul fr3,fr2\n\t"
+	"fmov fr5,fr3\n\t"
+	"fadd fr14,fr3\n\t"
+	"fsub fr14,fr5\n\t"
+	"fneg fr3\n\t"
+	"mov #64,r0\n\t"
+	"fmov.s fr3,@(r0,r3)\n\t"
+	"fmov.s @r1+,fr3\n\t"
+	"fmul fr3,fr5\n\t"
+	"fmov fr9,fr3\n\t"
+	"fadd fr2,fr3\n\t"
+	"mov #0,r0\n\t"
+	"fmov.s fr5,@(r0,r2)\n\t"
+	"fsub fr2,fr9\n\t"
+	"fmov fr5,fr14\n\t"
+	"fneg fr14\n\t"
+	"mov #0,r0\n\t"
+	"fmov.s fr14,@(r0,r3)\n\t"
+	"fmov.s @r1+,fr14\n\t"
+	"fmul fr14,fr9\n\t"
+	"fmov.s @r1+,fr14\n\t"
+	"fmov fr4,fr2\n\t"
+	"fadd fr8,fr2\n\t"
+	"fsub fr8,fr4\n\t"
+	"fmov fr9,fr5\n\t"
+	"fneg fr5\n\t"
+	"mov #96,r0\n\t"
+	"fmov.s fr5,@(r0,r2)\n\t"
+	"mov #32,r0\n\t"
+	"fmov.s fr9,@(r0,r2)\n\t"
+	"fadd fr9,fr3\n\t"
+	"fmov.s @r1+,fr9\n\t"
+	"fmov fr10,fr5\n\t"
+	"fadd fr1,fr5\n\t"
+	"fmov.s @r1+,fr8\n\t"
+	"fmul fr14,fr4\n\t"
+	"fneg fr3\n\t"
+	"fsub fr1,fr10\n\t"
+	"mov #96,r0\n\t"
+	"fmov.s fr3,@(r0,r3)\n\t"
+	"mov #32,r0\n\t"
+	"fmov.s fr3,@(r0,r3)\n\t"
+	"fmul fr9,fr10\n\t"
+	"fmov fr2,fr3\n\t"
+	"fadd fr5,fr3\n\t"
+	"fsub fr5,fr2\n\t"
+	"fmov fr4,fr14\n\t"
+	"fadd fr10,fr14\n\t"
+	"fmov.s @r1+,fr1\n\t"
+	"fsub fr10,fr4\n\t"
+	"fmov.s @r1+,fr10\n\t"
+	"fmul fr8,fr2\n\t"
+	"fmov fr0,fr8\n\t"
+	"fadd fr15,fr8\n\t"
+	"fmul fr1,fr4\n\t"
+	"fmov fr6,fr1\n\t"
+	"fadd fr11,fr1\n\t"
+	"mov #48,r0\n\t"
+	"fmov.s fr4,@(r0,r2)\n\t"
+	"fsub fr15,fr0\n\t"
+	"fadd fr4,fr14\n\t"
+	"fmov fr4,fr9\n\t"
+	"fneg fr9\n\t"
+	"mov #80,r0\n\t"
+	"fmov.s fr9,@(r0,r2)\n\t"
+	"fmov.s @r1+,fr9\n\t"
+	"fadd fr14,fr3\n\t"
+	"fadd fr2,fr14\n\t"
+	"fadd fr4,fr2\n\t"
+	"fneg fr3\n\t"
+	"mov #16,r0\n\t"
+	"fmov.s fr2,@(r0,r2)\n\t"
+	"mov #80,r0\n\t"
+	"fmov.s fr3,@(r0,r3)\n\t"
+	"mov #48,r0\n\t"
+	"fmov.s fr3,@(r0,r3)\n\t"
+	"fmov fr12,fr3\n\t"
+	"fadd fr7,fr3\n\t"
+	"fneg fr14\n\t"
+	"fmov fr2,fr5\n\t"
+	"fneg fr5\n\t"
+	"mov #112,r0\n\t"
+	"fmov.s fr5,@(r0,r2)\n\t"
+	"mov #16,r0\n\t"
+	"fmov.s fr14,@(r0,r3)\n\t"
+	"fsub fr7,fr12\n\t"
+	"fsub fr11,fr6\n\t"
+	"fmov fr1,fr11\n\t"
+	"fadd fr3,fr11\n\t"
+	"mov #0,r0\n\t"
+	"fmov.s @(r0,r15),fr4\n\t"
+	"mov #112,r0\n\t"
+	"fmov.s fr14,@(r0,r3)\n\t"
+	"fmul fr9,fr6\n\t"
+	"fmul fr10,fr0\n\t"
+	"fmov fr4,fr5\n\t"
+	"fadd fr13,fr5\n\t"
+	"fmov.s @r1+,fr14\n\t"
+	"fmov.s @r1+,fr2\n\t"
+	"fsub fr13,fr4\n\t"
+	"fmul fr14,fr12\n\t"
+	"fmov fr8,fr15\n\t"
+	"fadd fr5,fr15\n\t"
+	"fmov.s @r1+,fr10\n\t"
+	"fsub fr3,fr1\n\t"
+	"fsub fr5,fr8\n\t"
+	"fmov fr6,fr3\n\t"
+	"fadd fr12,fr3\n\t"
+	"fsub fr12,fr6\n\t"
+	"fmov.s @r1+,fr9\n\t"
+	"fmov.s @r1+,fr14\n\t"
+	"fmul fr2,fr4\n\t"
+	"fmov.s @r1+,fr2\n\t"
+	"fmul fr10,fr8\n\t"
+	"fmul fr9,fr1\n\t"
+	"fmov fr0,fr5\n\t"
+	"fadd fr4,fr5\n\t"
+	"fmov fr15,fr7\n\t"
+	"fadd fr11,fr7\n\t"
+	"fsub fr4,fr0\n\t"
+	"fmov.s @r1+,fr10\n\t"
+	"fsub fr11,fr15\n\t"
+	"fmov.s @r1+,fr9\n\t"
+	"fmov fr8,fr13\n\t"
+	"fadd fr1,fr13\n\t"
+	"fmul fr10,fr0\n\t"
+	"fmov fr5,fr11\n\t"
+	"fadd fr3,fr11\n\t"
+	"fsub fr3,fr5\n\t"
+	"mov #0,r0\n\t"
+	"fmov.s @(r0,r5),fr3\n\t"
+	"fmul fr9,fr6\n\t"
+	"fmul fr14,fr15\n\t"
+	"fsub fr1,fr8\n\t"
+	"fmov fr0,fr1\n\t"
+	"fadd fr6,fr1\n\t"
+	"fmov.s @r1+,fr14\n\t"
+	"fmul fr2,fr8\n\t"
+	"fmov.s @r1+,fr2\n\t"
+	"fsub fr6,fr0\n\t"
+	"fmov.s @r1+,fr6\n\t"
+	"fmul fr14,fr5\n\t"
+	"mov #116,r0\n\t"
+	"fmov.s @(r0,r7),fr14\n\t"
+	"fmul fr2,fr0\n\t"
+	"mov #52,r0\n\t"
+	"fmov.s @(r0,r6),fr2\n\t"
+	"mov #56,r0\n\t"
+	"fmov.s fr0,@(r0,r2)\n\t"
+	"fsub fr14,fr3\n\t"
+	"fadd fr0,fr1\n\t"
+	"fmov fr0,fr4\n\t"
+	"fneg fr4\n\t"
+	"fadd fr8,fr13\n\t"
+	"mov #72,r0\n\t"
+	"fmov.s fr4,@(r0,r2)\n\t"
+	"fadd fr1,fr11\n\t"
+	"fadd fr5,fr1\n\t"
+	"mov #64,r0\n\t"
+	"fmov.s @(r0,r6),fr4\n\t"
+	"fmul fr6,fr3\n\t"
+	"fadd fr11,fr7\n\t"
+	"fadd fr13,fr11\n\t"
+	"mov #24,r0\n\t"
+	"fmov.s @(r0,r5),fr14\n\t"
+	"fsub fr4,fr2\n\t"
+	"fneg fr7\n\t"
+	"mov #92,r0\n\t"
+	"fmov.s @(r0,r7),fr6\n\t"
+	"mov #72,r0\n\t"
+	"fmov.s fr7,@(r0,r3)\n\t"
+	"mov #56,r0\n\t"
+	"fmov.s fr7,@(r0,r3)\n\t"
+	"fadd fr0,fr5\n\t"
+	"fadd fr1,fr13\n\t"
+	"fneg fr11\n\t"
+	"fmov.s @r1+,fr7\n\t"
+	"mov #88,r0\n\t"
+	"fmov.s fr11,@(r0,r3)\n\t"
+	"mov #40,r0\n\t"
+	"fmov.s fr11,@(r0,r3)\n\t"
+	"fmul fr7,fr2\n\t"
+	"fneg fr13\n\t"
+	"mov #24,r0\n\t"
+	"fmov.s fr13,@(r0,r3)\n\t"
+	"fadd fr15,fr1\n\t"
+	"fsub fr6,fr14\n\t"
+	"fmov fr3,fr11\n\t"
+	"fadd fr2,fr11\n\t"
+	"mov #104,r0\n\t"
+	"fmov.s fr13,@(r0,r3)\n\t"
+	"fmov.s @r1+,fr13\n\t"
+	"fadd fr5,fr15\n\t"
+	"fneg fr1\n\t"
+	"mov #8,r0\n\t"
+	"fmov.s fr1,@(r0,r3)\n\t"
+	"fadd fr8,fr5\n\t"
+	"fsub fr2,fr3\n\t"
+	"fmov fr15,fr10\n\t"
+	"fneg fr10\n\t"
+	"mov #120,r0\n\t"
+	"fmov.s fr10,@(r0,r2)\n\t"
+	"mov #104,r0\n\t"
+	"fmov.s @(r0,r7),fr10\n\t"
+	"mov #28,r0\n\t"
+	"fmov.s @(r0,r6),fr7\n\t"
+	"mov #8,r0\n\t"
+	"fmov.s fr15,@(r0,r2)\n\t"
+	"mov #88,r0\n\t"
+	"fmov.s @(r0,r6),fr2\n\t"
+	"fadd fr0,fr8\n\t"
+	"fmov.s @r1+,fr15\n\t"
+	"mov #100,r0\n\t"
+	"fmov.s @(r0,r6),fr6\n\t"
+	"mov #24,r0\n\t"
+	"fmov.s fr5,@(r0,r2)\n\t"
+	"fmov fr5,fr12\n\t"
+	"fneg fr12\n\t"
+	"mov #76,r0\n\t"
+	"fmov.s @(r0,r6),fr5\n\t"
+	"mov #120,r0\n\t"
+	"fmov.s fr1,@(r0,r3)\n\t"
+	"mov #104,r0\n\t"
+	"fmov.s fr12,@(r0,r2)\n\t"
+	"mov #40,r0\n\t"
+	"fmov.s @(r0,r6),fr12\n\t"
+	"mov #12,r0\n\t"
+	"fmov.s @(r0,r5),fr1\n\t"
+	"fsub fr5,fr12\n\t"
+	"fmov.s @r1+,fr0\n\t"
+	"fmov fr8,fr9\n\t"
+	"fneg fr9\n\t"
+	"fsub fr10,fr1\n\t"
+	"fmul fr0,fr12\n\t"
+	"mov #40,r0\n\t"
+	"fmov.s fr8,@(r0,r2)\n\t"
+	"mov #88,r0\n\t"
+	"fmov.s fr9,@(r0,r2)\n\t"
+	"mov #36,r0\n\t"
+	"fmov.s @(r0,r5),fr5\n\t"
+	"fmul fr15,fr1\n\t"
+	"fmov.s @r1+,fr8\n\t"
+	"fsub fr2,fr7\n\t"
+	"fmov.s @r1+,fr4\n\t"
+	"fmul fr13,fr3\n\t"
+	"fmov fr1,fr9\n\t"
+	"fadd fr12,fr9\n\t"
+	"fmov.s @r1+,fr13\n\t"
+	"fmul fr4,fr14\n\t"
+	"mov #80,r0\n\t"
+	"fmov.s @(r0,r7),fr0\n\t"
+	"fmul fr13,fr7\n\t"
+	"fsub fr12,fr1\n\t"
+	"fmov.s @r1+,fr15\n\t"
+	"fsub fr0,fr5\n\t"
+	"fmov fr14,fr10\n\t"
+	"fadd fr7,fr10\n\t"
+	"fmov.s @r1+,fr12\n\t"
+	"fmul fr8,fr1\n\t"
+	"mov #16,r0\n\t"
+	"fmov.s @(r0,r6),fr8\n\t"
+	"fsub fr7,fr14\n\t"
+	"fmul fr12,fr5\n\t"
+	"fmov.s @r1+,fr4\n\t"
+	"fsub fr6,fr8\n\t"
+	"mov #112,r0\n\t"
+	"fmov.s @(r0,r6),fr6\n\t"
+	"fmov.s @r1+,fr13\n\t"
+	"mov #4,r0\n\t"
+	"fmov.s @(r0,r6),fr12\n\t"
+	"fmul fr4,fr8\n\t"
+	"fmul fr15,fr14\n\t"
+	"mov #68,r0\n\t"
+	"fmov.s @(r0,r7),fr15\n\t"
+	"mov #48,r0\n\t"
+	"fmov.s @(r0,r5),fr7\n\t"
+	"fsub fr6,fr12\n\t"
+	"fmov.s @r1+,fr0\n\t"
+	"fsub fr15,fr7\n\t"
+	"fmov.s @r1+,fr4\n\t"
+	"fmov fr5,fr2\n\t"
+	"fadd fr8,fr2\n\t"
+	"mov #60,r0\n\t"
+	"fmov.s @(r0,r5),fr15\n\t"
+	"fsub fr8,fr5\n\t"
+	"fmul fr0,fr7\n\t"
+	"mov #56,r0\n\t"
+	"fmov.s @(r0,r7),fr0\n\t"
+	"fmul fr4,fr12\n\t"
+	"fsub fr0,fr15\n\t"
+	"fmov fr7,fr8\n\t"
+	"fadd fr12,fr8\n\t"
+	"mov #120,r0\n\t"
+	"fmov.s @(r0,r5),fr4\n\t"
+	"fsub fr12,fr7\n\t"
+	"fmul fr13,fr5\n\t"
+	"fmov.s @r1+,fr13\n\t"
+	"fmov.s @r1+,fr6\n\t"
+	"mov #124,r0\n\t"
+	"fmov.s @(r0,r6),fr12\n\t"
+	"fmul fr13,fr7\n\t"
+	"fmov.s @r1+,fr13\n\t"
+	"fsub fr12,fr4\n\t"
+	"mov #72,r0\n\t"
+	"fmov.s @(r0,r5),fr12\n\t"
+	"fmul fr6,fr15\n\t"
+	"fmov.s @r1+,fr6\n\t"
+	"fmul fr13,fr4\n\t"
+	"mov #44,r0\n\t"
+	"fmov.s @(r0,r7),fr13\n\t"
+	"fmov fr15,fr0\n\t"
+	"fadd fr4,fr0\n\t"
+	"fsub fr4,fr15\n\t"
+	"fmov.s @r1+,fr4\n\t"
+	"fsub fr13,fr12\n\t"
+	"mov #8,r0\n\t"
+	"fmov.s @(r0,r7),fr13\n\t"
+	"fmul fr6,fr15\n\t"
+	"mov #108,r0\n\t"
+	"fmov.s @(r0,r5),fr6\n\t"
+	"fsub fr13,fr6\n\t"
+	"fmul fr4,fr12\n\t"
+	"fmov.s @r1+,fr4\n\t"
+	"fmul fr4,fr6\n\t"
+	"mov #4,r0\n\t"
+	"fmov.s fr5,@(r0,r15)\n\t"
+	"fmov.s @r1+,fr4\n\t"
+	"fmov fr12,fr13\n\t"
+	"fadd fr6,fr13\n\t"
+	"mov #20,r0\n\t"
+	"fmov.s @(r0,r7),fr5\n\t"
+	"fsub fr6,fr12\n\t"
+	"mov #84,r0\n\t"
+	"fmov.s @(r0,r5),fr6\n\t"
+	"fmul fr4,fr12\n\t"
+	"mov #32,r0\n\t"
+	"fmov.s @(r0,r7),fr4\n\t"
+	"fsub fr4,fr6\n\t"
+	"fmov.s @r1+,fr4\n\t"
+	"fmul fr4,fr6\n\t"
+	"mov #96,r0\n\t"
+	"fmov.s @(r0,r5),fr4\n\t"
+	"fsub fr5,fr4\n\t"
+	"fmov.s @r1+,fr5\n\t"
+	"fmul fr5,fr4\n\t"
+	"fmov fr6,fr5\n\t"
+	"fadd fr4,fr5\n\t"
+	"fsub fr4,fr6\n\t"
+	"fmov.s @r1+,fr4\n\t"
+	"fmul fr4,fr6\n\t"
+	"fmov fr11,fr4\n\t"
+	"fadd fr5,fr4\n\t"
+	"fsub fr5,fr11\n\t"
+	"fmov.s @r1+,fr5\n\t"
+	"fmul fr5,fr11\n\t"
+	"fmov fr9,fr5\n\t"
+	"fadd fr13,fr5\n\t"
+	"fsub fr13,fr9\n\t"
+	"fmov.s @r1+,fr13\n\t"
+	"fmul fr13,fr9\n\t"
+	"fmov fr10,fr13\n\t"
+	"fadd fr0,fr13\n\t"
+	"fsub fr0,fr10\n\t"
+	"fmov.s @r1+,fr0\n\t"
+	"fmul fr0,fr10\n\t"
+	"fmov fr2,fr0\n\t"
+	"fadd fr8,fr0\n\t"
+	"fsub fr8,fr2\n\t"
+	"fmov.s @r1+,fr8\n\t"
+	"fmul fr8,fr2\n\t"
+	"fmov fr4,fr8\n\t"
+	"fadd fr0,fr8\n\t"
+	"fsub fr0,fr4\n\t"
+	"fmov.s @r1+,fr0\n\t"
+	"fmul fr0,fr4\n\t"
+	"fmov fr5,fr0\n\t"
+	"fadd fr13,fr0\n\t"
+	"fsub fr13,fr5\n\t"
+	"fmov.s @r1+,fr13\n\t"
+	"fmul fr13,fr5\n\t"
+	"fmov fr8,fr13\n\t"
+	"fadd fr0,fr13\n\t"
+	"fsub fr0,fr8\n\t"
+	"fmov.s @r1+,fr0\n\t"
+	"fmul fr0,fr8\n\t"
+	"fmov fr4,fr0\n\t"
+	"fadd fr5,fr0\n\t"
+	"fsub fr5,fr4\n\t"
+	"fmov.s @r1+,fr5\n\t"
+	"fmul fr5,fr4\n\t"
+	"fmov fr11,fr5\n\t"
+	"fadd fr2,fr5\n\t"
+	"fsub fr2,fr11\n\t"
+	"fmov.s @r1+,fr2\n\t"
+	"fmul fr2,fr11\n\t"
+	"fmov fr9,fr2\n\t"
+	"fadd fr10,fr2\n\t"
+	"fsub fr10,fr9\n\t"
+	"fmov.s @r1+,fr10\n\t"
+	"fmul fr10,fr9\n\t"
+	"fmov fr5,fr10\n\t"
+	"fadd fr2,fr10\n\t"
+	"fsub fr2,fr5\n\t"
+	"fmov.s @r1+,fr2\n\t"
+	"fmul fr2,fr5\n\t"
+	"fmov fr11,fr2\n\t"
+	"fadd fr9,fr2\n\t"
+	"fsub fr9,fr11\n\t"
+	"fmov.s @r1+,fr9\n\t"
+	"fmul fr9,fr11\n\t"
+	"fmov fr3,fr9\n\t"
+	"fadd fr6,fr9\n\t"
+	"fsub fr6,fr3\n\t"
+	"fmov.s @r1+,fr6\n\t"
+	"fadd fr11,fr2\n\t"
+	"fmul fr6,fr3\n\t"
+	"fmov fr1,fr6\n\t"
+	"fadd fr12,fr6\n\t"
+	"mov #8,r0\n\t"
+	"fmov.s fr11,@(r0,r15)\n\t"
+	"fsub fr12,fr1\n\t"
+	"fmov.s @r1+,fr12\n\t"
+	"fmul fr12,fr1\n\t"
+	"fmov fr14,fr12\n\t"
+	"fadd fr15,fr12\n\t"
+	"fsub fr15,fr14\n\t"
+	"fmov.s @r1+,fr15\n\t"
+	"fmul fr15,fr14\n\t"
+	"mov #4,r0\n\t"
+	"fmov.s @(r0,r15),fr15\n\t"
+	"fadd fr2,fr10\n\t"
+	"fadd fr5,fr2\n\t"
+	"fadd fr11,fr5\n\t"
+	"fmov fr15,fr11\n\t"
+	"fadd fr7,fr11\n\t"
+	"fsub fr7,fr15\n\t"
+	"fmov.s @r1+,fr7\n\t"
+	"fmul fr7,fr15\n\t"
+	"fmov fr9,fr7\n\t"
+	"fadd fr11,fr7\n\t"
+	"fsub fr11,fr9\n\t"
+	"fmov.s @r1+,fr11\n\t"
+	"fmul fr11,fr9\n\t"
+	"fmov fr6,fr11\n\t"
+	"fadd fr12,fr11\n\t"
+	"fsub fr12,fr6\n\t"
+	"fmov.s @r1+,fr12\n\t"
+	"fmul fr12,fr6\n\t"
+	"fmov fr7,fr12\n\t"
+	"fadd fr11,fr12\n\t"
+	"fsub fr11,fr7\n\t"
+	"fmov.s @r1+,fr11\n\t"
+	"fmul fr11,fr7\n\t"
+	"fmov fr9,fr11\n\t"
+	"fadd fr6,fr11\n\t"
+	"fsub fr6,fr9\n\t"
+	"fmov.s @r1+,fr6\n\t"
+	"fadd fr4,fr0\n\t"
+	"fmul fr6,fr9\n\t"
+	"fmov fr3,fr6\n\t"
+	"fadd fr15,fr6\n\t"
+	"fsub fr15,fr3\n\t"
+	"fmov.s @r1+,fr15\n\t"
+	"fmul fr15,fr3\n\t"
+	"fmov fr1,fr15\n\t"
+	"fadd fr14,fr15\n\t"
+	"fsub fr14,fr1\n\t"
+	"fmov.s @r1+,fr14\n\t"
+	"fmul fr14,fr1\n\t"
+	"fmov fr6,fr14\n\t"
+	"fadd fr15,fr14\n\t"
+	"fsub fr15,fr6\n\t"
+	"fmov.s @r1+,fr15\n\t"
+	"fmul fr15,fr6\n\t"
+	"fmov fr3,fr15\n\t"
+	"fadd fr1,fr15\n\t"
+	"mov #64,r0\n\t"
+	"mov.l r8,@(r0,r2)\n\t"
+	"fsub fr1,fr3\n\t"
+	"fmov.s @r1+,fr1\n\t"
+	"fmul fr1,fr3\n\t"
+	"mov #60,r0\n\t"
+	"fmov.s fr3,@(r0,r2)\n\t"
+	"fadd fr9,fr11\n\t"
+	"fadd fr3,fr15\n\t"
+	"fadd fr15,fr14\n\t"
+	"fadd fr6,fr15\n\t"
+	"fadd fr3,fr6\n\t"
+	"fadd fr14,fr12\n\t"
+	"fmov fr3,fr1\n\t"
+	"fneg fr1\n\t"
+	"fadd fr11,fr14\n\t"
+	"fadd fr15,fr11\n\t"
+	"mov #68,r0\n\t"
+	"fmov.s fr1,@(r0,r2)\n\t"
+	"fadd fr12,fr13\n\t"
+	"fadd fr10,fr12\n\t"
+	"fadd fr14,fr10\n\t"
+	"fneg fr13\n\t"
+	"mov #60,r0\n\t"
+	"fmov.s fr13,@(r0,r3)\n\t"
+	"fadd fr0,fr14\n\t"
+	"fadd fr7,fr15\n\t"
+	"fneg fr10\n\t"
+	"fneg fr12\n\t"
+	"mov #52,r0\n\t"
+	"fmov.s fr12,@(r0,r3)\n\t"
+	"fadd fr6,fr7\n\t"
+	"fneg fr14\n\t"
+	"fadd fr9,fr6\n\t"
+	"fadd fr3,fr9\n\t"
+	"mov #68,r0\n\t"
+	"fmov.s fr13,@(r0,r3)\n\t"
+	"mov #84,r0\n\t"
+	"fmov.s fr10,@(r0,r3)\n\t"
+	"mov #92,r0\n\t"
+	"fmov.s fr14,@(r0,r3)\n\t"
+	"mov #36,r0\n\t"
+	"fmov.s fr14,@(r0,r3)\n\t"
+	"fadd fr11,fr0\n\t"
+	"fadd fr2,fr11\n\t"
+	"mov #76,r0\n\t"
+	"fmov.s fr12,@(r0,r3)\n\t"
+	"fadd fr15,fr2\n\t"
+	"fneg fr0\n\t"
+	"mov #44,r0\n\t"
+	"fmov.s fr10,@(r0,r3)\n\t"
+	"fneg fr2\n\t"
+	"mov #12,r0\n\t"
+	"fmov.s fr2,@(r0,r3)\n\t"
+	"fadd fr8,fr15\n\t"
+	"fneg fr11\n\t"
+	"mov #20,r0\n\t"
+	"fmov.s fr11,@(r0,r3)\n\t"
+	"fadd fr7,fr8\n\t"
+	"fneg fr15\n\t"
+	"mov #116,r0\n\t"
+	"fmov.s fr2,@(r0,r3)\n\t"
+	"fadd fr5,fr7\n\t"
+	"fadd fr6,fr5\n\t"
+	"fmov fr8,fr1\n\t"
+	"fneg fr1\n\t"
+	"fmov fr7,fr13\n\t"
+	"fneg fr13\n\t"
+	"mov #28,r0\n\t"
+	"fmov.s fr0,@(r0,r3)\n\t"
+	"mov #12,r0\n\t"
+	"fmov.s fr7,@(r0,r2)\n\t"
+	"fadd fr4,fr6\n\t"
+	"fadd fr9,fr4\n\t"
+	"fmov fr5,fr12\n\t"
+	"fneg fr12\n\t"
+	"mov #108,r0\n\t"
+	"fmov.s fr12,@(r0,r2)\n\t"
+	"mov #28,r0\n\t"
+	"fmov.s fr6,@(r0,r2)\n\t"
+	"fmov fr6,fr10\n\t"
+	"fneg fr10\n\t"
+	"mov #124,r0\n\t"
+	"fmov.s fr1,@(r0,r2)\n\t"
+	"mov #100,r0\n\t"
+	"fmov.s fr0,@(r0,r3)\n\t"
+	"mov #8,r0\n\t"
+	"fmov.s @(r0,r15),fr0\n\t"
+	"mov #4,r0\n\t"
+	"fmov.s fr15,@(r0,r3)\n\t"
+	"mov #20,r0\n\t"
+	"fmov.s fr5,@(r0,r2)\n\t"
+	"fadd fr0,fr9\n\t"
+	"fadd fr3,fr0\n\t"
+	"fmov fr4,fr14\n\t"
+	"fneg fr14\n\t"
+	"mov #92,r0\n\t"
+	"fmov.s fr14,@(r0,r2)\n\t"
+	"fmov fr0,fr2\n\t"
+	"fneg fr2\n\t"
+	"mov #108,r0\n\t"
+	"fmov.s fr11,@(r0,r3)\n\t"
+	"mov #76,r0\n\t"
+	"fmov.s fr2,@(r0,r2)\n\t"
+	"fmov fr9,fr11\n\t"
+	"fneg fr11\n\t"
+	"mov #36,r0\n\t"
+	"fmov.s fr4,@(r0,r2)\n\t"
+	"mov #52,r0\n\t"
+	"fmov.s fr0,@(r0,r2)\n\t"
+	"mov #100,r0\n\t"
+	"fmov.s fr10,@(r0,r2)\n\t"
+	"mov #116,r0\n\t"
+	"fmov.s fr13,@(r0,r2)\n\t"
+	"mov #4,r0\n\t"
+	"fmov.s fr8,@(r0,r2)\n\t"
+	"mov #124,r0\n\t"
+	"fmov.s fr15,@(r0,r3)\n\t"
+	"mov #84,r0\n\t"
+	"fmov.s fr11,@(r0,r2)\n\t"
+	"mov #44,r0\n\t"
+	"fmov.s fr9,@(r0,r2)\n\t"
+	"add #12,r15\n\t"
+	"fmov.s @r15+,fr15\n\t"
+	"fmov.s @r15+,fr14\n\t"
+	"fmov.s @r15+,fr13\n\t"
+	"fmov.s @r15+,fr12\n\t"
+	"rts\n\t"
+	"mov.l @r15+,r8\n\t"
+	"\n\t.align 2\n"
+	".Lc_idct36:\n"
+	"\t.long 0x3f009e8d\n"
+	"\t.long 0x3f05c278\n"
+	"\t.long 0x3f11233f\n"
+	"\t.long 0x3f25961d\n"
+	"\t.long 0x3f49c480\n"
+	"\t.long 0x3f87c449\n"
+	"\t.long 0x3fdc7926\n"
+	"\t.long 0x40a33c9c\n"
+	"\t.long 0x3f0281f7\n"
+	"\t.long 0x3f19f1bd\n"
+	"\t.long 0x3f6664d7\n"
+	"\t.long 0x402406cf\n"
+	"\t.long 0x3f0a8bd4\n"
+	"\t.long 0x3fa73d75\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f0a8bd4\n"
+	"\t.long 0x3fa73d75\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f0281f7\n"
+	"\t.long 0x3f19f1bd\n"
+	"\t.long 0x3f6664d7\n"
+	"\t.long 0x402406cf\n"
+	"\t.long 0x3f0a8bd4\n"
+	"\t.long 0x3fa73d75\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f0a8bd4\n"
+	"\t.long 0x3fa73d75\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f002785\n"
+	"\t.long 0x41230a46\n"
+	"\t.long 0x3f009e8d\n"
+	"\t.long 0x3f01668b\n"
+	"\t.long 0x405a1642\n"
+	"\t.long 0x3f05c278\n"
+	"\t.long 0x3f03f45b\n"
+	"\t.long 0x4003b2af\n"
+	"\t.long 0x3f11233f\n"
+	"\t.long 0x3f07f268\n"
+	"\t.long 0x3fbdf91b\n"
+	"\t.long 0x3f25961d\n"
+	"\t.long 0x3f0d9838\n"
+	"\t.long 0x3f95b035\n"
+	"\t.long 0x3f49c480\n"
+	"\t.long 0x3f153b3a\n"
+	"\t.long 0x3f78fa3b\n"
+	"\t.long 0x3f87c449\n"
+	"\t.long 0x3f1f5c6e\n"
+	"\t.long 0x3f56df9e\n"
+	"\t.long 0x3fdc7926\n"
+	"\t.long 0x3f2cc03d\n"
+	"\t.long 0x3f3e99ee\n"
+	"\t.long 0x40a33c9c\n"
+	"\t.long 0x3f0281f7\n"
+	"\t.long 0x3f19f1bd\n"
+	"\t.long 0x3f6664d7\n"
+	"\t.long 0x402406cf\n"
+	"\t.long 0x3f0a8bd4\n"
+	"\t.long 0x3fa73d75\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f0a8bd4\n"
+	"\t.long 0x3fa73d75\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f0281f7\n"
+	"\t.long 0x3f19f1bd\n"
+	"\t.long 0x3f6664d7\n"
+	"\t.long 0x402406cf\n"
+	"\t.long 0x3f0a8bd4\n"
+	"\t.long 0x3fa73d75\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f0a8bd4\n"
+	"\t.long 0x3fa73d75\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.long 0x3f3504f3\n"
+	"\t.text\n"
+);
+
+void plm_audio_window32(const float *d, const float *v1, const float *v2, short *out);
+__asm__(
+	"\t.section .text.plm_audio,\"ax\"\n"
+	"\t.align 5\n"
+	"\t.global _plm_audio_window32\n"
+	"_plm_audio_window32:\n\t"
+	"mov.l r8,@-r15\n\t"
+	"mov.l r9,@-r15\n\t"
+	"fmov.s fr12,@-r15\n\t"
+	"fmov.s fr13,@-r15\n\t"
+	"fmov.s fr14,@-r15\n\t"
+	"fmov.s fr15,@-r15\n\t"
+	"mov #2,r1\n\t"
+	"shll8 r1\n\t"
+	"mov.l r10,@-r15\n\t"
+	"mov #-1,r9\n\t"
+	"shlr16 r9\n\t"
+	"shlr r9\n\t"                                 /* 32767 */
+	"mov r9,r10\n\t"
+	"not r10,r10\n\t"                             /* -32768 */
+	"mov #31,r8\n\t"
+	"mov r5,r2\n\t"
+	"mov r6,r3\n\t"
+	"fmov.s @r4+,fr0\n\t"
+	"fmov.s @r4+,fr1\n\t"
+	"fmov.s @r4+,fr2\n\t"
+	"fmov.s @r4+,fr3\n\t"
+	"fmov.s @r2,fr4\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r3,fr5\n\t"
+	"add r1,r3\n\t"
+	"fmov.s @r2,fr6\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r3,fr7\n\t"
+	"add r1,r3\n\t"
+	/* output 0 */
+	"fmov.s @r4+,fr8\n\t"
+	"fmov.s @r4+,fr9\n\t"
+	"fmov.s @r4+,fr10\n\t"
+	"fmov.s @r4+,fr11\n\t"
+	"fipr fv0,fv4\n\t"
+	"fmov.s @r2,fr12\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r3,fr13\n\t"
+	"add r1,r3\n\t"
+	"fmov.s @r2,fr14\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r3,fr15\n\t"
+	"add r1,r3\n\t"
+	"flds fr7,fpul\n\t"
+	"fmov.s @r4+,fr0\n\t"
+	"fmov.s @r4+,fr1\n\t"
+	"fmov.s @r4+,fr2\n\t"
+	"fmov.s @r4+,fr3\n\t"
+	"fipr fv8,fv12\n\t"
+	"fmov.s @r2,fr4\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r3,fr5\n\t"
+	"add r1,r3\n\t"
+	"fmov.s @r2,fr6\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r3,fr7\n\t"
+	"add r1,r3\n\t"
+	"fsts fpul,fr11\n\t"
+	"fadd fr11,fr15\n\t"
+	"fmov.s @r4+,fr8\n\t"
+	"fmov.s @r4+,fr9\n\t"
+	"fmov.s @r4+,fr10\n\t"
+	"flds fr15,fpul\n\t"
+	"fmov.s @r4+,fr11\n\t"
+	"fipr fv0,fv4\n\t"
+	"fmov.s @r2,fr12\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r3,fr13\n\t"
+	"add r1,r3\n\t"
+	"fmov.s @r2,fr14\n\t"
+	"fmov.s @r3,fr15\n\t"
+	"fsts fpul,fr3\n\t"
+	"fadd fr7,fr3\n\t"
+	"add #64,r4\n\t"
+	"fipr fv8,fv12\n\t"
+	"flds fr3,fpul\n\t"
+	"add #4,r5\n\t"
+	"add #4,r6\n\t"
+	"mov r5,r2\n\t"
+	"mov r6,r3\n\t"
+	"fmov.s @r4+,fr0\n\t"
+	"fmov.s @r4+,fr1\n\t"
+	"fmov.s @r4+,fr2\n\t"
+	"fmov.s @r4+,fr3\n\t"
+	"fmov.s @r2,fr4\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r3,fr5\n\t"
+	"add r1,r3\n\t"
+	"fmov.s @r2,fr6\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r3,fr7\n\t"
+	"add r1,r3\n\t"
+	"fsts fpul,fr8\n\t"
+	"fadd fr15,fr8\n\t"
+	"ftrc fr8,fpul\n\t"
+	"1:\n\t"   /* one output per pass; order from a search on the ornio.nilware.io SH7091 model (49 -> 40 cycles, 50 -> 41 with the clamp branches); same operations and summation order */
+	"fmov.s @r3,fr13\n\t"
+	"fmov.s @r4+,fr8\n\t"
+	"fmov.s @r4+,fr9\n\t"
+	"fmov.s @r2,fr12\n\t"
+	"fmov.s @r4+,fr10\n\t"
+	"add r1,r3\n\t"
+	"fmov.s @r3,fr15\n\t"
+	"add r1,r3\n\t"
+	"sts fpul,r0\n\t"
+	"fmov.s @r4+,fr11\n\t"
+	"fipr fv0,fv4\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r4+,fr0\n\t"
+	"fmov.s @r2,fr14\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r4+,fr1\n\t"
+	"fmov.s @r2,fr4\n\t"
+	"cmp/gt r9,r0\n\t"
+	"bt .Lw_hi_a\n\t"
+	"cmp/gt r0,r10\n\t"
+	"bt .Lw_lo_a\n"
+	".Lw_ba:\n\t"
+	"flds fr7,fpul\n\t"
+	"fmov.s @r4+,fr2\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r3,fr5\n\t"
+	"add r1,r3\n\t"
+	"fmov.s @r2,fr6\n\t"
+	"fipr fv8,fv12\n\t"
+	"fsts fpul,fr11\n\t"
+	"fmov.s @r4+,fr3\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r4+,fr8\n\t"
+	"fmov.s @r3,fr7\n\t"
+	"fadd fr11,fr15\n\t"
+	"add r1,r3\n\t"
+	"fmov.s @r2,fr12\n\t"
+	"add #4,r6\n\t"
+	"fmov.s @r4+,fr9\n\t"
+	"fmov.s @r3,fr13\n\t"
+	"fipr fv0,fv4\n\t"
+	"fmov.s @r4+,fr10\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r4+,fr11\n\t"
+	"add r1,r3\n\t"
+	"add #4,r5\n\t"
+	"flds fr15,fpul\n\t"
+	"fsts fpul,fr3\n\t"
+	"fmov.s @r3,fr15\n\t"
+	"fadd fr7,fr3\n\t"
+	"fmov.s @r2,fr14\n\t"
+	"mov r5,r2\n\t"
+	"mov r6,r3\n\t"
+	"fmov.s @r3,fr5\n\t"
+	"fmov.s @r2,fr4\n\t"
+	"add r1,r3\n\t"
+	"add #64,r4\n\t"
+	"fmov.s @r3,fr7\n\t"
+	"fipr fv8,fv12\n\t"
+	"flds fr3,fpul\n\t"
+	"fsts fpul,fr8\n\t"
+	"fmov.s @r4+,fr0\n\t"
+	"add r1,r2\n\t"
+	"add r1,r3\n\t"
+	"fmov.s @r2,fr6\n\t"
+	"fadd fr15,fr8\n\t"
+	"fmov.s @r4+,fr1\n\t"
+	"add r1,r2\n\t"
+	"fmov.s @r4+,fr2\n\t"
+	"mov.w r0,@r7\n\t"
+	"add #4,r7\n\t"
+	"fmov.s @r4+,fr3\n\t"
+	"ftrc fr8,fpul\n\t"
+	"dt r8\n\t"
+	"bf 1b\n\t"
+	"sts fpul,r0\n\t"
+	"cmp/gt r9,r0\n\t"
+	"bt .Lw_hi_b\n\t"
+	"cmp/gt r0,r10\n\t"
+	"bt .Lw_lo_b\n"
+	".Lw_bb:\n\t"
+	"mov.w r0,@r7\n\t"
+	"mov.l @r15+,r10\n\t"
+	"fmov.s @r15+,fr15\n\t"
+	"fmov.s @r15+,fr14\n\t"
+	"fmov.s @r15+,fr13\n\t"
+	"fmov.s @r15+,fr12\n\t"
+	"mov.l @r15+,r9\n\t"
+	"rts\n\t"
+	"mov.l @r15+,r8\n"
+	".Lw_hi_a:\n\t"                               /* clamping, out of line (rare) */
+	"bra .Lw_ba\n\t"
+	"mov r9,r0\n"
+	".Lw_lo_a:\n\t"
+	"bra .Lw_ba\n\t"
+	"mov r10,r0\n"
+	".Lw_hi_b:\n\t"
+	"bra .Lw_bb\n\t"
+	"mov r9,r0\n"
+	".Lw_lo_b:\n\t"
+	"bra .Lw_bb\n\t"
+	"mov r10,r0\n"
+	"\t.text\n"
+);
+
+PLM_AUDIO_HOT void plm_audio_decode_frame(plm_audio_t *self) {
 	// Prepare the quantizer table lookups
 	int tab3 = 0;
 	int sblimit = 0;
@@ -5257,7 +8414,7 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 					// Shifting step
 					self->v_pos[ch] = (self->v_pos[ch] - 64) & 1023;
 
-					plm_audio_idct36(self->sample[ch], p, self->V[ch], self->v_pos[ch]);
+					plm_audio_idct36_sh4(self->sample[ch], p, self->V[ch], self->v_pos[ch]);
 
 					int d_index = (512 - (self->v_pos[ch] >> 1)) >> 5;
 					int v_index = (self->v_pos[ch] & 127) >> 1;
@@ -5266,16 +8423,7 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 					float *v2 = &self->V[ch][96 - v_index];
 					/* KOS stream splitter expects stereo pairs as L, R in memory. */
 					short *out_ch = out + ch;
-					for (int i = 16; i; --i) {
-						float u0 = shz_pl_inner_loop(d, v1, v2);
-						float u1 = shz_pl_inner_loop(d + 32, v1 + 1, v2 + 1);
-						d += 64;
-						v1 += 2;
-						v2 += 2;
-						out_ch[0] = (short)((int)u0 >> 16);
-						out_ch[2] = (short)((int)u1 >> 16);
-						out_ch += 4;
-					}
+					plm_audio_window32(d, v1, v2, out_ch);
 				}
 				out += 64;
 
@@ -5287,17 +8435,15 @@ void plm_audio_decode_frame(plm_audio_t *self) {
 	plm_buffer_align(self->buffer);
 }
 
-const plm_quantizer_spec_t *plm_audio_read_allocation(plm_audio_t *self, int sb, int tab3) {
+PLM_AUDIO_HOT const plm_quantizer_spec_t *plm_audio_read_allocation(plm_audio_t *self, int sb, int tab3) {
 	int tab4 = PLM_AUDIO_QUANT_LUT_STEP_3[tab3][sb];
 	int qtab = PLM_AUDIO_QUANT_LUT_STEP_4[tab4 & 15][plm_buffer_read(self->buffer, tab4 >> 4)];
 	return qtab ? (&PLM_AUDIO_QUANT_TAB[qtab - 1]) : 0;
 }
 
-void plm_audio_read_samples(plm_audio_t *self, int ch, int sb, int part) {
+PLM_AUDIO_HOT void plm_audio_read_samples(plm_audio_t *self, int ch, int sb, int part) {
 	const plm_quantizer_spec_t *q = self->allocation[ch][sb];
-	int sf = self->scale_factor[ch][sb][part];
-	int *sample = self->sample[ch][sb];
-	int val = 0;
+	float *sample = self->sample[ch][sb];
 
 	if (!q) {
 		// No bits allocated for this subband
@@ -5305,180 +8451,55 @@ void plm_audio_read_samples(plm_audio_t *self, int ch, int sb, int part) {
 		return;
 	}
 
-	// Decode samples
+	int s0, s1, s2;
 	int adj = q->levels;
+	int bits = q->bits;
+	// One 32-bit window (25 or more valid bits) serves all three samples when 3 * bits <= 25, i.e.
+	// every quantiser up to 8 bits; wider ones take a fresh window per sample. The bit position
+	// is written back once.
+	plm_buffer_t *buf = self->buffer;
+	uint32_t bi = (uint32_t)buf->bit_index;
+	uint32_t w = plm_buffer_load_u32be(plm_buffer_ptr_from_read(buf, bi >> 3)) << (bi & 7);
+	int sh = 32 - bits;
 	if (q->group) {
-		// Decode grouped samples — use reciprocal multiply instead of division
-		val = plm_buffer_read(self->buffer, q->bits);
+		// Grouped samples: reciprocal multiply instead of division
+		int val = (int)(w >> sh);
+		bi += (uint32_t)bits;
 		unsigned int recip = q->recip;
 		int quot = (unsigned int)((unsigned int)val * recip) >> 16;
-		sample[0] = val - quot * adj;
+		s0 = val - quot * adj;
 		val = quot;
 		quot = (unsigned int)((unsigned int)val * recip) >> 16;
-		sample[1] = val - quot * adj;
-		sample[2] = quot;
+		s1 = val - quot * adj;
+		s2 = quot;
+	}
+	else if (bits * 3 <= 25) {
+		s0 = (int)(w >> sh);
+		s1 = (int)((w << bits) >> sh);
+		s2 = (int)((w << (bits * 2)) >> sh);
+		bi += (uint32_t)(bits * 3);
 	}
 	else {
-		// Decode direct samples
-		sample[0] = plm_buffer_read(self->buffer, q->bits);
-		sample[1] = plm_buffer_read(self->buffer, q->bits);
-		sample[2] = plm_buffer_read(self->buffer, q->bits);
+		s0 = (int)(w >> sh);
+		bi += (uint32_t)bits;
+		w = plm_buffer_load_u32be(plm_buffer_ptr_from_read(buf, bi >> 3)) << (bi & 7);
+		s1 = (int)(w >> sh);
+		bi += (uint32_t)bits;
+		w = plm_buffer_load_u32be(plm_buffer_ptr_from_read(buf, bi >> 3)) << (bi & 7);
+		s2 = (int)(w >> sh);
+		bi += (uint32_t)bits;
 	}
+	buf->bit_index = bi;
 
-	// Postmultiply samples — use precomputed scale and adj_half
-	int scale = q->scale;
-	adj = q->adj_half;
-	int sf_hi = sf >> 12;
-	int sf_lo = sf & 4095;
-
-	val = (adj - sample[0]) * scale;
-	sample[0] = (val * sf_hi + ((val * sf_lo + 2048) >> 12)) >> 12;
-
-	val = (adj - sample[1]) * scale;
-	sample[1] = (val * sf_hi + ((val * sf_lo + 2048) >> 12)) >> 12;
-
-	val = (adj - sample[2]) * scale;
-	sample[2] = (val * sf_hi + ((val * sf_lo + 2048) >> 12)) >> 12;
-}
-
-void plm_audio_idct36(int s[32][3], int ss, float *d, int dp) {
-	float t01, t02, t03, t04, t05, t06, t07, t08, t09, t10, t11, t12,
-		t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24,
-		t25, t26, t27, t28, t29, t30, t31, t32, t33;
-
-	t01 = (float)(s[0][ss] + s[31][ss]); t02 = (float)(s[0][ss] - s[31][ss]) * 0.500602998235f;
-	t03 = (float)(s[1][ss] + s[30][ss]); t04 = (float)(s[1][ss] - s[30][ss]) * 0.505470959898f;
-	t05 = (float)(s[2][ss] + s[29][ss]); t06 = (float)(s[2][ss] - s[29][ss]) * 0.515447309923f;
-	t07 = (float)(s[3][ss] + s[28][ss]); t08 = (float)(s[3][ss] - s[28][ss]) * 0.53104259109f;
-	t09 = (float)(s[4][ss] + s[27][ss]); t10 = (float)(s[4][ss] - s[27][ss]) * 0.553103896034f;
-	t11 = (float)(s[5][ss] + s[26][ss]); t12 = (float)(s[5][ss] - s[26][ss]) * 0.582934968206f;
-	t13 = (float)(s[6][ss] + s[25][ss]); t14 = (float)(s[6][ss] - s[25][ss]) * 0.622504123036f;
-	t15 = (float)(s[7][ss] + s[24][ss]); t16 = (float)(s[7][ss] - s[24][ss]) * 0.674808341455f;
-	t17 = (float)(s[8][ss] + s[23][ss]); t18 = (float)(s[8][ss] - s[23][ss]) * 0.744536271002f;
-	t19 = (float)(s[9][ss] + s[22][ss]); t20 = (float)(s[9][ss] - s[22][ss]) * 0.839349645416f;
-	t21 = (float)(s[10][ss] + s[21][ss]); t22 = (float)(s[10][ss] - s[21][ss]) * 0.972568237862f;
-	t23 = (float)(s[11][ss] + s[20][ss]); t24 = (float)(s[11][ss] - s[20][ss]) * 1.16943993343f;
-	t25 = (float)(s[12][ss] + s[19][ss]); t26 = (float)(s[12][ss] - s[19][ss]) * 1.48416461631f;
-	t27 = (float)(s[13][ss] + s[18][ss]); t28 = (float)(s[13][ss] - s[18][ss]) * 2.05778100995f;
-	t29 = (float)(s[14][ss] + s[17][ss]); t30 = (float)(s[14][ss] - s[17][ss]) * 3.40760841847f;
-	t31 = (float)(s[15][ss] + s[16][ss]); t32 = (float)(s[15][ss] - s[16][ss]) * 10.1900081235f;
-
-	t33 = t01 + t31; t31 = (t01 - t31) * 0.502419286188f;
-	t01 = t03 + t29; t29 = (t03 - t29) * 0.52249861494f;
-	t03 = t05 + t27; t27 = (t05 - t27) * 0.566944034816f;
-	t05 = t07 + t25; t25 = (t07 - t25) * 0.64682178336f;
-	t07 = t09 + t23; t23 = (t09 - t23) * 0.788154623451f;
-	t09 = t11 + t21; t21 = (t11 - t21) * 1.06067768599f;
-	t11 = t13 + t19; t19 = (t13 - t19) * 1.72244709824f;
-	t13 = t15 + t17; t17 = (t15 - t17) * 5.10114861869f;
-	t15 = t33 + t13; t13 = (t33 - t13) * 0.509795579104f;
-	t33 = t01 + t11; t01 = (t01 - t11) * 0.601344886935f;
-	t11 = t03 + t09; t09 = (t03 - t09) * 0.899976223136f;
-	t03 = t05 + t07; t07 = (t05 - t07) * 2.56291544774f;
-	t05 = t15 + t03; t15 = (t15 - t03) * 0.541196100146f;
-	t03 = t33 + t11; t11 = (t33 - t11) * 1.30656296488f;
-	t33 = t05 + t03; t05 = (t05 - t03) * 0.707106781187f;
-	t03 = t15 + t11; t15 = (t15 - t11) * 0.707106781187f;
-	t03 += t15;
-	t11 = t13 + t07; t13 = (t13 - t07) * 0.541196100146f;
-	t07 = t01 + t09; t09 = (t01 - t09) * 1.30656296488f;
-	t01 = t11 + t07; t07 = (t11 - t07) * 0.707106781187f;
-	t11 = t13 + t09; t13 = (t13 - t09) * 0.707106781187f;
-	t11 += t13; t01 += t11;
-	t11 += t07; t07 += t13;
-	t09 = t31 + t17; t31 = (t31 - t17) * 0.509795579104f;
-	t17 = t29 + t19; t29 = (t29 - t19) * 0.601344886935f;
-	t19 = t27 + t21; t21 = (t27 - t21) * 0.899976223136f;
-	t27 = t25 + t23; t23 = (t25 - t23) * 2.56291544774f;
-	t25 = t09 + t27; t09 = (t09 - t27) * 0.541196100146f;
-	t27 = t17 + t19; t19 = (t17 - t19) * 1.30656296488f;
-	t17 = t25 + t27; t27 = (t25 - t27) * 0.707106781187f;
-	t25 = t09 + t19; t19 = (t09 - t19) * 0.707106781187f;
-	t25 += t19;
-	t09 = t31 + t23; t31 = (t31 - t23) * 0.541196100146f;
-	t23 = t29 + t21; t21 = (t29 - t21) * 1.30656296488f;
-	t29 = t09 + t23; t23 = (t09 - t23) * 0.707106781187f;
-	t09 = t31 + t21; t31 = (t31 - t21) * 0.707106781187f;
-	t09 += t31;	t29 += t09;	t09 += t23;	t23 += t31;
-	t17 += t29;	t29 += t25;	t25 += t09;	t09 += t27;
-	t27 += t23;	t23 += t19; t19 += t31;
-	t21 = t02 + t32; t02 = (t02 - t32) * 0.502419286188f;
-	t32 = t04 + t30; t04 = (t04 - t30) * 0.52249861494f;
-	t30 = t06 + t28; t28 = (t06 - t28) * 0.566944034816f;
-	t06 = t08 + t26; t08 = (t08 - t26) * 0.64682178336f;
-	t26 = t10 + t24; t10 = (t10 - t24) * 0.788154623451f;
-	t24 = t12 + t22; t22 = (t12 - t22) * 1.06067768599f;
-	t12 = t14 + t20; t20 = (t14 - t20) * 1.72244709824f;
-	t14 = t16 + t18; t16 = (t16 - t18) * 5.10114861869f;
-	t18 = t21 + t14; t14 = (t21 - t14) * 0.509795579104f;
-	t21 = t32 + t12; t32 = (t32 - t12) * 0.601344886935f;
-	t12 = t30 + t24; t24 = (t30 - t24) * 0.899976223136f;
-	t30 = t06 + t26; t26 = (t06 - t26) * 2.56291544774f;
-	t06 = t18 + t30; t18 = (t18 - t30) * 0.541196100146f;
-	t30 = t21 + t12; t12 = (t21 - t12) * 1.30656296488f;
-	t21 = t06 + t30; t30 = (t06 - t30) * 0.707106781187f;
-	t06 = t18 + t12; t12 = (t18 - t12) * 0.707106781187f;
-	t06 += t12;
-	t18 = t14 + t26; t26 = (t14 - t26) * 0.541196100146f;
-	t14 = t32 + t24; t24 = (t32 - t24) * 1.30656296488f;
-	t32 = t18 + t14; t14 = (t18 - t14) * 0.707106781187f;
-	t18 = t26 + t24; t24 = (t26 - t24) * 0.707106781187f;
-	t18 += t24; t32 += t18;
-	t18 += t14; t26 = t14 + t24;
-	t14 = t02 + t16; t02 = (t02 - t16) * 0.509795579104f;
-	t16 = t04 + t20; t04 = (t04 - t20) * 0.601344886935f;
-	t20 = t28 + t22; t22 = (t28 - t22) * 0.899976223136f;
-	t28 = t08 + t10; t10 = (t08 - t10) * 2.56291544774f;
-	t08 = t14 + t28; t14 = (t14 - t28) * 0.541196100146f;
-	t28 = t16 + t20; t20 = (t16 - t20) * 1.30656296488f;
-	t16 = t08 + t28; t28 = (t08 - t28) * 0.707106781187f;
-	t08 = t14 + t20; t20 = (t14 - t20) * 0.707106781187f;
-	t08 += t20;
-	t14 = t02 + t10; t02 = (t02 - t10) * 0.541196100146f;
-	t10 = t04 + t22; t22 = (t04 - t22) * 1.30656296488f;
-	t04 = t14 + t10; t10 = (t14 - t10) * 0.707106781187f;
-	t14 = t02 + t22; t02 = (t02 - t22) * 0.707106781187f;
-	t14 += t02;	t04 += t14;	t14 += t10;	t10 += t02;
-	t16 += t04;	t04 += t08;	t08 += t14;	t14 += t28;
-	t28 += t10;	t10 += t20;	t20 += t02;	t21 += t16;
-	t16 += t32;	t32 += t04;	t04 += t06;	t06 += t08;
-	t08 += t18;	t18 += t14;	t14 += t30;	t30 += t28;
-	t28 += t26;	t26 += t10;	t10 += t12;	t12 += t20;
-	t20 += t24;	t24 += t02;
-
-	d[dp + 48] = -t33;
-	d[dp + 49] = d[dp + 47] = -t21;
-	d[dp + 50] = d[dp + 46] = -t17;
-	d[dp + 51] = d[dp + 45] = -t16;
-	d[dp + 52] = d[dp + 44] = -t01;
-	d[dp + 53] = d[dp + 43] = -t32;
-	d[dp + 54] = d[dp + 42] = -t29;
-	d[dp + 55] = d[dp + 41] = -t04;
-	d[dp + 56] = d[dp + 40] = -t03;
-	d[dp + 57] = d[dp + 39] = -t06;
-	d[dp + 58] = d[dp + 38] = -t25;
-	d[dp + 59] = d[dp + 37] = -t08;
-	d[dp + 60] = d[dp + 36] = -t11;
-	d[dp + 61] = d[dp + 35] = -t18;
-	d[dp + 62] = d[dp + 34] = -t09;
-	d[dp + 63] = d[dp + 33] = -t14;
-	d[dp + 32] = -t05;
-	d[dp + 0] = t05; d[dp + 31] = -t30;
-	d[dp + 1] = t30; d[dp + 30] = -t27;
-	d[dp + 2] = t27; d[dp + 29] = -t28;
-	d[dp + 3] = t28; d[dp + 28] = -t07;
-	d[dp + 4] = t07; d[dp + 27] = -t26;
-	d[dp + 5] = t26; d[dp + 26] = -t23;
-	d[dp + 6] = t23; d[dp + 25] = -t10;
-	d[dp + 7] = t10; d[dp + 24] = -t15;
-	d[dp + 8] = t15; d[dp + 23] = -t12;
-	d[dp + 9] = t12; d[dp + 22] = -t19;
-	d[dp + 10] = t19; d[dp + 21] = -t20;
-	d[dp + 11] = t20; d[dp + 20] = -t13;
-	d[dp + 12] = t13; d[dp + 19] = -t24;
-	d[dp + 13] = t24; d[dp + 18] = -t31;
-	d[dp + 14] = t31; d[dp + 17] = -t02;
-	d[dp + 15] = t02; d[dp + 16] = 0.0;
+	// (adj_half - s) * (65536 / levels) * scalefactor / 2^24: the ISO 11172-3 requantisation
+	// (2 / levels) * (s - (levels - 1) / 2), sign folded into the output scale. pl_mpeg (and the
+	// integer path below) uses 65536 / (levels + 1), which leaves every subband levels / (levels + 1)
+	// too quiet (-2.5 dB at 3 levels): about 20-30 dB SNR against a reference decode on music.
+	float f = q->fscale * (float)self->scale_factor[ch][sb][part] * (1.0f / 16777216.0f);
+	int ah = q->adj_half;
+	sample[0] = (float)(ah - s0) * f;
+	sample[1] = (float)(ah - s1) * f;
+	sample[2] = (float)(ah - s2) * f;
 }
 
 #endif // PL_MPEG_IMPLEMENTATION
