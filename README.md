@@ -22,6 +22,20 @@ sounding good.
 
 Disclaimer: I’ve validated these encode settings using in-memory playback (romdisk). I haven’t yet verified them with CD streaming, so results may differ. If you see lag/stutter when playing from disc, please let me know.
 
+**Any input, up to 640x480 — `tools/dcencode.sh`:**
+```
+tools/dcencode.sh input.mp4 output.mpg
+```
+The script runs this one ffmpeg command:
+```
+ffmpeg -i input.mp4 -vf "scale=iw*sar:ih,setsar=1,scale='min(640,iw)':'min(480,ih)':force_original_aspect_ratio=decrease:force_divisible_by=16:flags=lanczos:out_color_matrix=bt601,fps='if(lt(source_fps/ceil(source_fps/30.5),23.99),24000/1001,if(lt(source_fps/ceil(source_fps/30.5),24.5),24,if(lt(source_fps/ceil(source_fps/30.5),27),25,if(lt(source_fps/ceil(source_fps/30.5),29.98),30000/1001,30))))',format=yuv420p" -c:v mpeg1video -b:v 1500k -maxrate 1800k -bufsize 500k -g 15 -bf 0 -mbd rd -trellis 1 -c:a mp2 -ar 44100 -ac 2 -b:a 192k -f mpeg output.mpg
+```
+- The picture is fitted inside 640x480 with its shape kept (never enlarged), and frame rates above 30 fps are halved.
+- `-maxrate`/`-bufsize` are what keep decode time in bounds; `-b:v` has little effect.
+- 30 fps video larger than about 640x400 needs the frame queue (`options.frame_queue = 4`) to play without late frames. With the queue off, use `tools/dcencode.sh -l` (`-b:v 1300k -maxrate 1500k -bufsize 400k`).
+- HDR and interlaced sources are not handled (add a deinterlace filter such as `bwdif` in front for interlaced video).
+- Tested in-memory on the console at sizes from 320x176 to 640x480 and 23.976 to 30 fps; from CD only at 640x368.
+
 **320x240 (4:3) — Standard (Recommended Standard):**
 ```
 ffmpeg -i input.mp4 -vf "fps=24,scale=320:240" -c:v mpeg1video -b:v 1500k -minrate 1500k -maxrate 1500k -bufsize 1500k -ac 2 -ar 48000 -c:a mp2 -b:a 128k -f mpeg 320x240.mpg
